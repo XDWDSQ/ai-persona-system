@@ -1,0 +1,26 @@
+# 敏感信息
+.env
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# 运行时数据（会话、音频输出、缓存）
+data/
+
+# 本地大文件（模型、CUDA 运行时、视频）
+llm/bin/
+llm/models/
+大帅音频/
+
+# 临时调试脚本（仅根目录）
+/scripts/
+_preview.jpg
+
+# 工具目录
+.qoder/
+.workbuddy/
+_tmp_ui_check/

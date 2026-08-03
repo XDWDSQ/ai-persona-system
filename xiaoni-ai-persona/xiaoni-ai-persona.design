@@ -1,0 +1,213 @@
+{
+  "data": [
+    {
+      "id": "page-index",
+      "title": "小拟 · AI 拟人系统",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1785668838726,
+      "canvasData": {
+        "x": 36,
+        "y": -60,
+        "group": 0,
+        "layoutSnapshot": {
+          "version": 1,
+          "contentHeight": 900,
+          "viewportWidth": 1440,
+          "sourceHash": "fnv1a-39a3559a",
+          "measuredAt": 1785673718215
+        }
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/index.html",
+        "interactions": [
+          {
+            "domId": "nav-voice",
+            "targetPageId": "page-voice-cloning",
+            "transitionLabel": "声音克隆"
+          },
+          {
+            "domId": "nav-arch",
+            "targetPageId": "page-architecture",
+            "transitionLabel": "技术架构"
+          },
+          {
+            "domId": "hero-start",
+            "targetPageId": "page-chat",
+            "transitionLabel": "开始体验"
+          },
+          {
+            "domId": "nav-start",
+            "targetPageId": "page-chat",
+            "transitionLabel": "开始体验"
+          },
+          {
+            "domId": "cta-start",
+            "targetPageId": "page-chat",
+            "transitionLabel": "开始体验"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-chat",
+      "title": "对话 · 小拟",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1785671600000,
+      "canvasData": {
+        "x": 756,
+        "y": -60,
+        "group": 0,
+        "layoutSnapshot": {
+          "version": 1,
+          "contentHeight": 901,
+          "viewportWidth": 1440,
+          "sourceHash": "fnv1a-239f41f4",
+          "measuredAt": 1785673052618
+        }
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/chat.html",
+        "interactions": [
+          {
+            "domId": "chat-home",
+            "targetPageId": "page-index",
+            "hideEdge": true,
+            "transitionLabel": "返回官网"
+          },
+          {
+            "domId": "chat-home-link",
+            "targetPageId": "page-index",
+            "hideEdge": true,
+            "transitionLabel": "返回官网"
+          },
+          {
+            "domId": "chat-arch",
+            "targetPageId": "page-architecture",
+            "transitionLabel": "技术架构"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-voice-cloning",
+      "title": "声音克隆 · 小拟",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1785669382812,
+      "canvasData": {
+        "x": 36,
+        "y": 900,
+        "group": 1,
+        "layoutSnapshot": {
+          "version": 1,
+          "contentHeight": 900,
+          "viewportWidth": 1440,
+          "sourceHash": "fnv1a-38168f0d",
+          "measuredAt": 1785673718215
+        }
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/voice-cloning.html",
+        "interactions": [
+          {
+            "domId": "nav-home",
+            "targetPageId": "page-index",
+            "hideEdge": true,
+            "transitionLabel": "返回首页"
+          },
+          {
+            "domId": "nav-arch",
+            "targetPageId": "page-architecture",
+            "transitionLabel": "技术架构"
+          },
+          {
+            "domId": "nav-arch-2",
+            "targetPageId": "page-architecture",
+            "hideEdge": true,
+            "transitionLabel": "技术架构"
+          },
+          {
+            "domId": "nav-home-cta",
+            "targetPageId": "page-index",
+            "hideEdge": true,
+            "transitionLabel": "开始体验"
+          },
+          {
+            "domId": "cta-back",
+            "targetPageId": "page-index",
+            "hideEdge": true,
+            "transitionLabel": "返回首页"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-architecture",
+      "title": "技术架构 · 小拟",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1785669382812,
+      "canvasData": {
+        "x": 756,
+        "y": 900,
+        "group": 1,
+        "layoutSnapshot": {
+          "version": 1,
+          "contentHeight": 900,
+          "viewportWidth": 1440,
+          "sourceHash": "fnv1a-acb1bd49",
+          "measuredAt": 1785673718215
+        }
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/architecture.html",
+        "interactions": [
+          {
+            "domId": "nav-home",
+            "targetPageId": "page-index",
+            "hideEdge": true,
+            "transitionLabel": "返回首页"
+          },
+          {
+            "domId": "nav-voice",
+            "targetPageId": "page-voice-cloning",
+            "transitionLabel": "声音克隆"
+          },
+          {
+            "domId": "nav-voice-2",
+            "targetPageId": "page-voice-cloning",
+            "hideEdge": true,
+            "transitionLabel": "声音克隆"
+          },
+          {
+            "domId": "nav-home-cta",
+            "targetPageId": "page-index",
+            "hideEdge": true,
+            "transitionLabel": "开始体验"
+          },
+          {
+            "domId": "cta-back",
+            "targetPageId": "page-index",
+            "hideEdge": true,
+            "transitionLabel": "返回首页"
+          }
+        ]
+      }
+    }
+  ],
+  "config": {
+    "autoLayout": false,
+    "deviceType": "desktop",
+    "projectName": "小拟 · AI 拟人系统官网",
+    "designLibrary": {
+      "name": "Vercel",
+      "id": "dl_builtin_vercel",
+      "version": null,
+      "scope": "built-in-global",
+      "path": "c:\\Users\\31557\\.trae-cn\\design_libraries\\dl_builtin_vercel",
+      "versionSource": "metadata.json"
+    }
+  }
+}
