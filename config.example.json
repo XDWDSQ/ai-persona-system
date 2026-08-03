@@ -1,0 +1,72 @@
+{
+  "provider": "cloud",
+  "local": {
+    "base_url": "http://127.0.0.1:11434/v1",
+    "model": "Qwen3-4B-Q4_K_M",
+    "api_key": "none"
+  },
+  "cloud": {
+    "provider": "mimo",
+    "base_url": "https://api.xiaomimimo.com/v1",
+    "api_key": "",
+    "model": "mimo-v2.5"
+  },
+  "cloud_providers": {
+    "mimo": {
+      "label": "小米 MiMo",
+      "base_url": "https://api.xiaomimimo.com/v1",
+      "model": "mimo-v2.5"
+    },
+    "deepseek": {
+      "label": "深度求索 DeepSeek",
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat"
+    },
+    "ark": {
+      "label": "火山方舟",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "model": "doubao-seed-1-6-250615"
+    },
+    "custom": {
+      "label": "自定义",
+      "base_url": "",
+      "model": ""
+    }
+  },
+  "active_role": "example",
+  "roles": {
+    "example": {
+      "name": "示例角色",
+      "full_name": "示例",
+      "desc": "在这里配置角色简介",
+      "persona": "在这里填写角色人设提示词",
+      "voice": {
+        "provider": "local",
+        "preset": "default",
+        "style": ""
+      }
+    }
+  },
+  "voice": {
+    "language": "Chinese",
+    "provider": "aliyun",
+    "preset": "default",
+    "style": "",
+    "mimo": {
+      "api_key": "",
+      "base_url": "https://api.xiaomimimo.com/v1",
+      "model": "mimo-v2.5-tts",
+      "clone_model": "mimo-v2.5-tts-voiceclone",
+      "voice": "mimo_default",
+      "format": "wav"
+    },
+    "aliyun": {
+      "api_key": "",
+      "base_url": "https://dashscope.aliyuncs.com/api/v1",
+      "model": "qwen3-tts-vc-2026-01-22",
+      "voice": ""
+    },
+    "manual_provider": true
+  },
+  "persona": ""
+}
