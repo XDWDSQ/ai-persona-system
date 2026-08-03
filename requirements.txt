@@ -1,5 +1,6 @@
-fastapi>=0.100,<2.0
-uvicorn>=0.20
-httpx>=0.24,<1.0
-python-multipart>=0.0.5
-pydantic>=2.0
+# 实测环境：Python 3.11.15（2026-08 验证）
+fastapi==0.141.1
+uvicorn==0.52.1
+httpx==0.28.1
+pydantic==2.13.4
+python-multipart==0.0.32

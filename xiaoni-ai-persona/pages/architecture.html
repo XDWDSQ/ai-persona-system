@@ -612,7 +612,7 @@
           <div class="hero-copy">
             <span class="eyebrow reveal"><span class="pip"></span>Architecture</span>
             <h1 class="reveal">每一层都在<span class="grad-text">本机运行</span></h1>
-            <p class="lead reveal">小拟采用本地优先架构，从对话推理到声音合成都可闭环运行。FastAPI 后端、llama.cpp CUDA 推理、Qwen3 系列模型、内置角色系统，并可切换云端 OpenAI 兼容 API，让速度与隐私兼得。</p>
+            <p class="lead reveal">小拟采用本地优先架构，从对话推理到声音合成都可闭环运行。FastAPI 后端、llama.cpp CUDA 推理、Qwen3 系列模型、内置角色系统与角色引擎（记忆/状态/主动问候），并可切换云端 OpenAI 兼容 API，让速度与隐私兼得。</p>
             <div class="hero-cta reveal">
               <a class="btn btn-ghost btn-lg" href="/pages/index.html" data-dom-id="nav-home-cta">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>
@@ -630,6 +630,7 @@
               <span>Qwen3-TTS</span>
               <span>Qwen3-ASR</span>
               <span>内置角色</span>
+              <span>角色引擎</span>
             </div>
           </div>
         </div>
@@ -641,7 +642,7 @@
           <div class="sec-head reveal">
             <span class="eyebrow"><span class="pip"></span>系统分层</span>
             <h2>五层架构，各司其职</h2>
-            <p>从前端界面到语音识别，小拟的五个层次各负其责，数据在层间自上而下流动，默认全部在本机闭环。</p>
+            <p>从前端界面到语音识别，小拟的五个层次各负其责；角色引擎在对话推理前后维护记忆与状态，数据默认全部在本机闭环。</p>
           </div>
           <div class="arch-flow reveal">
             <!-- Layer 1: Frontend -->
@@ -733,7 +734,7 @@
                 </span>
                 <span class="arch-chip">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m7 15 4-6 4 3 5-7"/></svg>
-                  云端 MiMo 切换
+                  云端 API 切换
                 </span>
               </div>
             </div>
@@ -806,8 +807,8 @@
         <div class="wrap">
           <div class="sec-head reveal">
             <span class="eyebrow"><span class="pip"></span>核心组件</span>
-            <h2>三大引擎，驱动拟人体验</h2>
-            <p>对话大脑、声音引擎、听写引擎协同运转，串行调度保障稳定，数据安全贯穿始终。</p>
+            <h2>四大引擎，驱动拟人体验</h2>
+            <p>对话大脑、角色引擎、声音引擎、听写引擎协同运转，串行调度保障稳定，数据安全贯穿始终。</p>
           </div>
           <div class="bento">
             <article class="bcard big reveal">
@@ -817,7 +818,7 @@
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg>
                 </div>
                 <h3>对话大脑</h3>
-                <p>llama.cpp 便携版加载 Qwen3-4B 量化模型，在 GPU（CUDA）上运行 OpenAI 兼容服务。支持切换至云端 MiMo API，回复自动标注朗读风格。</p>
+                <p>llama.cpp 便携版加载 Qwen3-4B 量化模型，在 GPU（CUDA）上运行 OpenAI 兼容服务。支持切换至云端 OpenAI 兼容 API（MiMo/DeepSeek 等）；角色引擎在对话前注入时间、状态与记忆上下文，回复自动标注朗读风格。</p>
               </div>
             </article>
             <article class="bcard med reveal">
@@ -850,7 +851,7 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
               </div>
               <h3>内置角色</h3>
-              <p>小拟、大帅、东北老铁、四川妹儿，一键切换。每个角色独立人设 + 专属音色。</p>
+              <p>小拟、大帅、东北老铁、四川妹儿，一键切换。每个角色独立人设 + 专属音色；大帅带长期记忆、情绪状态与主动问候。</p>
             </article>
             <article class="bcard wide reveal">
               <div class="b-text">
@@ -886,7 +887,7 @@
             <div class="flow-step reveal">
               <div class="f-num"><span class="dot">02</span></div>
               <h4>模型推理</h4>
-              <p>文本送入 LLM，结合角色人设生成回复，并自动标注朗读风格（[style:xxx]），经 FastAPI 返回前端。</p>
+              <p>文本先经角色引擎补充时间、状态与记忆上下文，再送入 LLM 结合人设生成回复，自动标注朗读风格（[style:xxx]），经 FastAPI 返回前端。</p>
             </div>
             <div class="flow-step reveal">
               <div class="f-num"><span class="dot">03</span></div>

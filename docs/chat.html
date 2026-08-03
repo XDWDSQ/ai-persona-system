@@ -498,6 +498,8 @@
         .msg .msg-body{animation-delay:.08s}
         @keyframes msgIn{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
         .msg .avatar{width:34px;height:34px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:650;transition:transform .25s cubic-bezier(.2,.7,.2,1),box-shadow .25s ease}
+        .msg .avatar img{width:100%;height:100%;border-radius:9px;object-fit:cover;display:block}
+        .role-item .r-ava img{width:100%;height:100%;border-radius:7px;object-fit:cover;display:block}
         .msg:hover .avatar{transform:scale(1.06) rotate(-2deg)}
         .msg.ai .avatar{background:linear-gradient(140deg,var(--chart-2),var(--chart-3));color:var(--primary-foreground);box-shadow:0 0 0 1px color-mix(in srgb,var(--chart-2) 45%,transparent)}
         .msg.ai:hover .avatar{box-shadow:0 0 0 1px color-mix(in srgb,var(--chart-2) 45%,transparent),0 6px 18px -6px color-mix(in srgb,var(--chart-2) 55%,transparent)}
@@ -799,6 +801,9 @@
           var $ = function(s){ return document.querySelector(s); };
           var msgsInner = document.querySelector('.msgs-inner');
           var state = { history: [], recording: false, mediaRec: null, recChunks: [], cloudProviders: {}, soundOn: true, speed: 1.0, provider: 'local', voiceProvider: 'local', mimoConfigured: false, aliyunConfigured: false, audioCache: {}, ttsInflight: {}, playing: null, playingBtn: null };
+          /* 当前激活角色 key：同步维护，页面加载即生效（默认与后端 config 一致为大帅），
+             避免头像判断依赖异步的 /api/status 返回导致首帧渲染成首字 */
+          var currentRoleKey = 'dashuai';
 
           /* Auto-grow textarea (max 150px) */
           var ta = document.getElementById('text');
@@ -901,6 +906,11 @@
             document.getElementById('mimo_voice').value = (s.voice_mimo && s.voice_mimo.voice) || 'mimo_default';
             pickProvider(s.provider);
             pickVoiceProvider(s.voice_provider || 'local');
+            var gt = document.getElementById('greeting_toggle');
+            if (gt) {
+              var gv = localStorage.getItem('xiaoni_greeting_enabled');
+              gt.checked = (gv === null ? true : gv === '1');
+            }
           }
           function renderRoles(roles, active) {
             var box = document.getElementById('role-tabs');
@@ -926,14 +936,32 @@
           function renderSideRoles(roles, active) {
             var box = document.getElementById('role-list');
             if (!box) return;
+            currentRoleKey = active || currentRoleKey;
             box.innerHTML = '';
             (roles || []).forEach(function(r, idx){
               var b = document.createElement('button');
               b.className = 'role-item side-in' + (r.key === active ? ' active' : '');
               b.style.animationDelay = Math.min(idx * 40, 280) + 'ms';
               b.title = (r.full_name ? r.full_name + '：' : '') + (r.desc || '');
-              b.innerHTML = '<span class="r-ava">' + r.name.slice(0, 1) + '</span><span class="r-name"></span><span class="r-badge">' + (r.voice_provider === 'mimo' ? 'MiMo' : (r.voice_provider === 'aliyun' ? '阿里云' : '本地')) + '</span>';
-              b.querySelector('.r-name').textContent = r.name;
+              var ava = document.createElement('span');
+              ava.className = 'r-ava';
+              if (r.key === 'dashuai') {
+                var img = document.createElement('img');
+                img.src = 'avatar_dashuai.jpg';
+                img.alt = '大帅';
+                ava.appendChild(img);
+              } else {
+                ava.textContent = r.name.slice(0, 1);
+              }
+              var nm = document.createElement('span');
+              nm.className = 'r-name';
+              nm.textContent = r.name;
+              var badge = document.createElement('span');
+              badge.className = 'r-badge';
+              badge.textContent = r.voice_provider === 'mimo' ? 'MiMo' : (r.voice_provider === 'aliyun' ? '阿里云' : '本地');
+              b.appendChild(ava);
+              b.appendChild(nm);
+              b.appendChild(badge);
               b.addEventListener('click', function(){
                 if (r.key === active) return;
                 api('/api/roles/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: r.key }) })
@@ -985,12 +1013,12 @@
               state.cloudProviders = s.cloud_providers || {};
               var cp = state.cloudProviders[s.cloud.provider];
               var pName = $('.p-name'), pDetail = $('.p-detail'), cSub = $('.c-sub');
-              if (pName) pName.textContent = s.provider === 'local' ? '本地模型' : '云端 · ' + (cp ? cp.label : s.cloud.model);
+              if (pName) pName.textContent = s.provider === 'local' ? '本地语言生成' : '云端语言生成 · ' + (cp ? cp.label : s.cloud.model);
               if (pDetail) pDetail.textContent = s.provider === 'local' ? s.local.model : (s.cloud.model || '');
               if (cSub) cSub.textContent = (s.provider === 'local' ? '本地对话' : '云端对话') + ' · 串行引擎';
               var nextName = s.provider === 'local' ? '云端' : '本地';
               var row = document.querySelector('.provider-row[data-kind="chat"]');
-              if (row) row.title = '当前：' + (s.provider === 'local' ? '本地模型' : '云端 API') + '，点击切换到' + nextName;
+              if (row) row.title = '当前：' + (s.provider === 'local' ? '本地语言生成' : '云端语言生成') + '，点击切换到' + nextName;
               var vRow = document.querySelector('.provider-row[data-kind="voice"]');
               var vName = vRow ? vRow.querySelector('.p-name') : null;
               var vDetail = vRow ? vRow.querySelector('.p-detail') : null;
@@ -1013,11 +1041,19 @@
                 if (lab) lab.textContent = s.voice_registered ? '语音合成已启用' : '语音合成未启用';
               }
               fillConfig(s);
+              state.activeRole = s.active_role;
+              state.roles = s.roles || [];
               renderRoles(s.roles, s.active_role);
               renderSideRoles(s.roles, s.active_role);
               var role = (s.roles || []).find(function(r){ return r.key === s.active_role; });
               var wl = document.querySelector('.welcome .eyebrow');
-              if (wl && role) wl.innerHTML = '<span class="pip"></span>' + role.name + ' · ' + (s.active_online ? '在线' : '离线');
+              if (wl && role) {
+                wl.textContent = '';
+                var pip = document.createElement('span');
+                pip.className = 'pip';
+                wl.appendChild(pip);
+                wl.appendChild(document.createTextNode(role.name + ' · ' + (s.active_online ? '在线' : '离线')));
+              }
             } catch (e) {
               var pn = $('.p-name');
               if (pn) pn.textContent = '后端未连接';
@@ -1034,7 +1070,7 @@
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ provider: target }),
               });
-              toast('已切换到' + (target === 'local' ? '本地模型' : '云端 API') + '，正在检测…');
+              toast('已切换到' + (target === 'local' ? '本地语言生成' : '云端语言生成') + '，正在检测…');
               await refreshStatus();
             } catch (e) {
               toast('切换失败：' + e.message);
@@ -1069,6 +1105,13 @@
           }
 
           /* ---------- 消息渲染 ---------- */
+          function aiAvatarHtml() {
+            if (currentRoleKey === 'dashuai') return '<img src="avatar_dashuai.jpg" alt="大帅">';
+            var r = (state.roles || []).find(function(x){ return x.key === currentRoleKey; });
+            return String((r && r.name ? r.name : 'AI').slice(0, 1))
+              .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+          }
           function scrollBottom(instant){
             var m = document.getElementById('msgs');
             if (!m) return;
@@ -1081,7 +1124,7 @@
             var div = document.createElement('div');
             div.className = 'msg ' + (role === 'assistant' ? 'ai' : role);
             div.dataset.role = role;
-            div.innerHTML = '<div class="avatar">' + (role === 'user' ? '我' : '拟') + '</div><div class="msg-body"><div class="bubble"></div><div class="msg-meta"></div></div>';
+            div.innerHTML = '<div class="avatar">' + (role === 'user' ? '我' : aiAvatarHtml()) + '</div><div class="msg-body"><div class="bubble"></div><div class="msg-meta"></div></div>';
             div.querySelector('.bubble').textContent = text;
             /* 历史渲染的错峰入场：每条延迟一点，封顶 400ms，避免长历史等太久 */
             if (opts.delay) {
@@ -1104,7 +1147,7 @@
           function showTyping() {
             var div = document.createElement('div');
             div.className = 'msg ai'; div.id = 'typing';
-            div.innerHTML = '<div class="avatar">拟</div><div class="msg-body"><div class="bubble typing"><i></i><i></i><i></i></div></div>';
+            div.innerHTML = '<div class="avatar">' + aiAvatarHtml() + '</div><div class="msg-body"><div class="bubble typing"><i></i><i></i><i></i></div></div>';
             msgsInner.appendChild(div);
             scrollBottom();
           }
@@ -1199,7 +1242,10 @@
           }
           function stopAudio() {
             if (state.playing) {
-              try { state.playing.pause(); } catch (e) {}
+              try {
+                state.playing.pause();
+                state.playing.load();
+              } catch (e) {}
               state.playing = null;
             }
             /* 被新播放掐断的旧按钮要复位，否则会永远停在"播放中…" */
@@ -1301,19 +1347,20 @@
           }
           async function regenerate(div, btn) {
             if (btn && btn.disabled) return;
+            if (btn) btn.disabled = true;
             var s = currentSession();
-            if (!s) return;
+            if (!s) { if (btn) btn.disabled = false; return; }
             /* 在会话历史里定位这条回复（按 role+content 匹配），找不到就不动 */
             var content = div.querySelector('.bubble').textContent;
             var idx = -1;
             for (var i = 0; i < s.history.length; i++) {
               if (s.history[i].role === 'assistant' && s.history[i].content === content) { idx = i; break; }
             }
-            if (idx < 0) return;
+            if (idx < 0) { if (btn) btn.disabled = false; return; }
             /* 往前找触发它的那条用户消息；历史里该用户消息之前的部分作为上下文 */
             var u = idx - 1;
             while (u >= 0 && s.history[u].role !== 'user') u--;
-            if (u < 0) return;
+            if (u < 0) { if (btn) btn.disabled = false; return; }
             var userText = s.history[u].content;
             var hist = s.history.slice(0, u);
             s.history.splice(idx); /* 丢掉旧回复及其之后的所有消息 */
@@ -1322,7 +1369,6 @@
             markSessionActivity(s.id);
             showTyping();
             if (btn) {
-              btn.disabled = true;
               var lab = btn.querySelector('span');
               if (lab) lab.textContent = '重新生成中…';
             }
@@ -1366,13 +1412,15 @@
             text = (text || '').trim();
             var sendBtn = document.querySelector('.send-btn');
             if (!text || sendBtn.disabled) return;
-            sendBtn.disabled = true;
-            sendBtn.classList.add('loading');
             var sessionId = currentSessionId;
             var s = findSession(sessionId);
+            if (!s) return;
+            sendBtn.disabled = true;
+            sendBtn.classList.add('loading');
             addMsg('user', text);
             s.history.push({ role: 'user', content: text });
             markSessionActivity(sessionId, text);
+            try { localStorage.setItem('xiaoni_last_chat_time', Date.now().toString()); } catch(e) {}
             showTyping();
             try {
               var r = await api('/api/chat', {
@@ -1480,6 +1528,8 @@
                     aliyun_voice: document.getElementById('aliyun_voice').value,
                   }),
                 });
+                var gt = document.getElementById('greeting_toggle');
+                if (gt) localStorage.setItem('xiaoni_greeting_enabled', gt.checked ? '1' : '0');
                 toast('设置已保存'); closeSettings(); refreshStatus();
               } catch (e) { toast(e.message); }
             });
@@ -1829,6 +1879,46 @@
 
           bindModelSwitch();
           refreshStatus();
+
+          /* ---------- 主动问候：页面加载后按阈值触发 ---------- */
+          var GREETING_KEY = 'xiaoni_greeting_enabled';
+          var GREETING_DATE_KEY = 'xiaoni_last_greeting_date';
+          var LAST_CHAT_KEY = 'xiaoni_last_chat_time';
+
+          function isGreetingEnabled() {
+            var v = localStorage.getItem(GREETING_KEY);
+            return v === null ? true : v === '1';
+          }
+          function todayStr() { return new Date().toISOString().slice(0, 10); }
+          function shouldGreet() {
+            if (!isGreetingEnabled()) return false;
+            if (localStorage.getItem(GREETING_DATE_KEY) === todayStr()) return false;
+            var lastChat = parseInt(localStorage.getItem(LAST_CHAT_KEY) || '0', 10);
+            if (lastChat && (Date.now() - lastChat < 2 * 3600 * 1000)) return false;
+            return true;
+          }
+          async function maybeGreet() {
+            if (!shouldGreet()) return;
+            try {
+              var r = await api('/api/greeting', { method: 'POST' });
+              if (r.reply && r.reply.trim()) {
+                localStorage.setItem(GREETING_DATE_KEY, todayStr());
+                setTimeout(function() {
+                  var div = addMsg('assistant', r.reply);
+                  var meta = div.querySelector('.msg-meta');
+                  var spk = null;
+                  if (meta) {
+                    spk = makeSpeakBtn(r.reply, r.style);
+                    meta.appendChild(spk);
+                    meta.appendChild(makeResynthBtn(r.reply, r.style));
+                    meta.appendChild(makeRegenBtn(div));
+                  }
+                  if (state.soundOn && spk) ttsAndPlay(r.reply, spk, r.style);
+                }, 1500);
+              }
+            } catch(e) { /* 静默失败，不影响使用 */ }
+          }
+          setTimeout(maybeGreet, 2000);
         })();
       </script>
     </main>
@@ -1923,6 +2013,13 @@
             <div class="set-tabs" id="role-tabs" style="flex-wrap:wrap"></div>
           </div>
           <label>人设描述<textarea id="persona" class="set-input set-ta" placeholder="定义小拟的性格、语气、说话方式…"></textarea></label>
+          <div class="set-row" style="margin-top:4px">
+            <span class="set-label">主动问候</span>
+            <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted-foreground)">
+              <input type="checkbox" id="greeting_toggle" style="width:auto">
+              <span>大帅偶尔主动找你说话（每天最多 1 次）</span>
+            </label>
+          </div>
         </div>
         <div class="set-foot">
           <button class="btn-save" id="save-settings">保存设置</button>

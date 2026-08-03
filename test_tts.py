@@ -24,7 +24,7 @@ _load_dotenv()
 KEY = os.getenv("MIMO_API_KEY", "")
 BASE = "https://api.xiaomimimo.com/v1"
 H = {"Authorization": f"Bearer {KEY}", "api-key": KEY}
-REF = Path(r"d:\Users\31557\Desktop-快速访问\AI拟人系统\data\voice_dashuai.wav")
+REF = Path(__file__).resolve().parent / "data" / "voice_dashuai.wav"
 
 style = "用自然松弛的电竞选手语气，但情绪跟随对话内容自动变化"
 text = "兄弟，游走位是我的主场。"

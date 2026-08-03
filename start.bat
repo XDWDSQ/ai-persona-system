@@ -16,13 +16,13 @@ set "INTEL_SKILL_DOG_NO_EVICTION=1"
 REM 启动本地 LLM（本地模式用；若已配置云端 API 可跳过，不影响）
 call "llm\start_llm.bat"
 
-REM 确保后端依赖
-"%PY%" -m pip install -r requirements.txt -q 2>nul
+REM 轻量校验后端依赖（安装已迁移到 setup.bat）
+"%PY%" -c "import fastapi, uvicorn, httpx, pydantic" || (echo 依赖缺失，请先运行 setup.bat & exit /b 1)
 
 echo.
 echo  AI 拟人系统已启动：http://127.0.0.1:8000
 echo  关闭本窗口即停止服务。
 echo.
 start "" http://127.0.0.1:8000
-"%PY%" -m uvicorn server:app --host 127.0.0.1 --port 8000
+"%PY%" -m uvicorn server:app --host 127.0.0.1 --port 8000 --timeout-graceful-period 10
 pause

@@ -9,31 +9,57 @@
     "provider": "mimo",
     "base_url": "https://api.xiaomimimo.com/v1",
     "api_key": "",
-    "model": "mimo-v2.5"
+    "model": "mimo-v2.5",
+    "thinking": true
   },
   "cloud_providers": {
     "mimo": {
       "label": "小米 MiMo",
       "base_url": "https://api.xiaomimimo.com/v1",
-      "model": "mimo-v2.5"
+      "model": "mimo-v2.5",
+      "api_key": "",
+      "thinking": true
     },
     "deepseek": {
       "label": "深度求索 DeepSeek",
       "base_url": "https://api.deepseek.com/v1",
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-flash",
+      "api_key": "",
+      "thinking": true
     },
     "ark": {
       "label": "火山方舟",
       "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-      "model": "doubao-seed-1-6-250615"
+      "model": "doubao-seed-1-6-250615",
+      "api_key": "",
+      "thinking": true
     },
     "custom": {
       "label": "自定义",
       "base_url": "",
-      "model": ""
+      "model": "",
+      "api_key": "",
+      "thinking": true
     }
   },
   "active_role": "example",
+  "role_engine": {
+    "enabled": true,
+    "memory_limit": 200,
+    "top_k": 5
+  },
+  "vision": {
+    "enabled": true,
+    "base_url": "http://127.0.0.1:11435/v1",
+    "model": "Qwen2.5-VL-3B"
+  },
+  "search": {
+    "enabled": true,
+    "provider": "duckduckgo",
+    "max_results": 5,
+    "max_rounds": 2,
+    "timeout": 15
+  },
   "roles": {
     "example": {
       "name": "示例角色",
@@ -52,21 +78,18 @@
     "provider": "aliyun",
     "preset": "default",
     "style": "",
-    "mimo": {
-      "api_key": "",
-      "base_url": "https://api.xiaomimimo.com/v1",
-      "model": "mimo-v2.5-tts",
-      "clone_model": "mimo-v2.5-tts-voiceclone",
-      "voice": "mimo_default",
-      "format": "wav"
-    },
     "aliyun": {
       "api_key": "",
       "base_url": "https://dashscope.aliyuncs.com/api/v1",
-      "model": "qwen3-tts-vc-2026-01-22",
-      "voice": ""
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry"
     },
     "manual_provider": true
+  },
+  "tts_cache": {
+    "max_files": 500,
+    "max_bytes": 8589934592,
+    "clean_interval": 3600
   },
   "persona": ""
 }

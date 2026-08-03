@@ -28,5 +28,5 @@ echo  AI 拟人系统重启中：http://127.0.0.1:8000
 echo  关闭本窗口即停止服务。
 echo.
 start "" http://127.0.0.1:8000
-"%PY%" -m uvicorn server:app --host 127.0.0.1 --port 8000
+"%PY%" -m uvicorn server:app --host 127.0.0.1 --port 8000 --timeout-graceful-period 10
 pause

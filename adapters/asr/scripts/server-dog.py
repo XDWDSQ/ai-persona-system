@@ -192,6 +192,7 @@ def _spawn_server(
                 pipe_address, SERVER_BOOT_TIMEOUT, proc.pid)
     try:
         proc.terminate()
+        proc.wait(timeout=5)
     except Exception:
         pass
     raise RuntimeError(f"server_did_not_start (pipe={pipe_address})")
@@ -322,7 +323,7 @@ def _handle_start_server(state: DogState, request: dict) -> dict:
 
             lru = state.registry.pick_lru(exclude=skill_name)
             if lru is None:
-                break
+                return {"ok": False, "error": "not_enough_memory"}
             
             _evict_record(lru)
             state.registry.pop(lru.skill_name)
@@ -511,6 +512,8 @@ def _accept_loop(listener: Listener, state: DogState) -> None:
             conn.send(reply)
         except (EOFError, OSError) as exc:
             log.info("client disconnected: %s", exc)
+        except Exception as exc:
+            log.warning("client request failed: %s", exc)
         finally:
             try:
                 conn.close()

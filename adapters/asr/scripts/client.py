@@ -201,11 +201,17 @@ def _sync_runtime_scripts(log_path: Path | None) -> None:
         return
 
     _log_message(log_path, "runtime scripts outdated; refreshing")
-    if _try_connect() is not None:
+    conn = _try_connect()
+    if conn is not None:
+        conn.close()
         _log_message(log_path, "shutting down existing server before refresh")
         _cmd_shutdown(DEFAULT_SHUTDOWN_TIMEOUT, log_path)
         deadline = time.time() + DEFAULT_SHUTDOWN_TIMEOUT
-        while time.time() < deadline and _try_connect() is not None:
+        while time.time() < deadline:
+            conn = _try_connect()
+            if conn is None:
+                break
+            conn.close()
             time.sleep(0.2)
     _terminate_legacy_dog(log_path)
 
@@ -472,7 +478,11 @@ def _cmd_request(audio: str, language: str, log_path: Path | None = None) -> int
         print(f"Server init failed (attempt {attempt - 1}/{ERROR_RETRY_MAX}), restarting...", file=sys.stderr)
         _cmd_shutdown(DEFAULT_SHUTDOWN_TIMEOUT, log_path)
         pipe_deadline = min(time.time() + 5.0, deadline)
-        while time.time() < pipe_deadline and _try_connect() is not None:
+        while time.time() < pipe_deadline:
+            conn = _try_connect()
+            if conn is None:
+                break
+            conn.close()
             time.sleep(0.2)
         if time.time() >= deadline:
             outcome = "timeout"
