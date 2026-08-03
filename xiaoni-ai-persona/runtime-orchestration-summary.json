@@ -1,0 +1,1007 @@
+{
+  "schemaVersion": 1,
+  "skillProvenance": {
+    "name": "solo-design",
+    "version": "2026.07.22.00.00.00",
+    "version_source": "skill-release-manifest.json",
+    "schema_version": "1.0",
+    "release": "prompt-base-cloud-ssot-migration",
+    "read_status": "ok"
+  },
+  "designSource": {
+    "operatingMode": "library-bound",
+    "libraryIdentity": {
+      "name": "Vercel",
+      "id": "dl_builtin_vercel",
+      "version": null,
+      "scope": "built-in-global",
+      "path": "c:\\Users\\31557\\.trae-cn\\design_libraries\\dl_builtin_vercel",
+      "versionSource": "metadata.json"
+    },
+    "brandPrefix": "vercel",
+    "tokenFidelity": "strict",
+    "actualTokenNameReference": [
+      "--background",
+      "--foreground",
+      "--card",
+      "--popover",
+      "--muted",
+      "--muted-foreground",
+      "--primary",
+      "--primary-foreground",
+      "--secondary",
+      "--accent",
+      "--accent-foreground",
+      "--border",
+      "--input",
+      "--ring",
+      "--chart-1",
+      "--chart-2",
+      "--chart-3",
+      "--chart-4",
+      "--chart-5",
+      "--success",
+      "--success-strong",
+      "--error",
+      "--destructive",
+      "--font-sans",
+      "--font-mono",
+      "--font-serif",
+      "--radius",
+      "--vercel-radius-sm",
+      "--vercel-radius-md",
+      "--vercel-radius-lg"
+    ],
+    "componentPlan": [
+      {
+        "slug": "button",
+        "contractKind": "legacy-json",
+        "previewFile": "preview/component-button.html",
+        "contractFile": "components/button.json"
+      },
+      {
+        "slug": "card",
+        "contractKind": "legacy-json",
+        "previewFile": "preview/component-card.html",
+        "contractFile": "components/card.json"
+      },
+      {
+        "slug": "navigation",
+        "contractKind": "legacy-json",
+        "previewFile": "preview/component-navigation.html",
+        "contractFile": "components/navigation.json"
+      }
+    ],
+    "allowedComponents": [
+      "button",
+      "card",
+      "chart",
+      "navigation",
+      "sidebar",
+      "table"
+    ],
+    "forbiddenInventedComponents": [],
+    "designDecisionSummary": "Vercel Design Library dark theme (#0a0a0a bg, #fafafa fg, #282828 border, Geist/Geist Mono fonts, 8px radius, single blue accent #3a81f6 = --chart-2). Premium dark landing page for the local-first AI persona system. Typographic hero with animated voice-waveform orb, bento capability grid (varied spans, not 3-equal), voice-clone spotlight panel, local-first privacy band, 3-step flow, CTA, real footer. Monochrome surfaces with borders + single blue accent; subtle glows via color-mix on tokens; scroll-reveal + waveform micro-interactions; prefers-reduced-motion respected. Buttons/cards/nav follow Vercel component anatomy (primary/ghost button, card with eyebrow/title/value/meta, topbar nav with brand+links+meta). All colors via var(--token); radius via library --radius and bridge aliases.",
+    "iconAssets": {
+      "source": "assets/icons",
+      "projectIconDir": "assets/icons/dl_builtin_vercel",
+      "libraryKey": "dl_builtin_vercel",
+      "renderMethod": "inline-svg",
+      "copyStatus": "blocked-by-path-allowlist",
+      "note": "Vercel icon SVGs could not be copied due to workspace path allowlist restriction (快速访问 segment). Page uses inline stroke SVGs and the Lucide runtime as fallback per icon-source-priority rules.",
+      "availableNames": [],
+      "totalCount": 0
+    }
+  },
+  "project": {
+    "resolvedLane": "existing_edit_add_comparison",
+    "intentProfile": {
+      "caseFamily": "existing_edit_add_comparison",
+      "sourceType": "rebuild-existing-pages-from-canvas"
+    },
+    "selectedIntentWorkflowRead": true,
+    "deviceType": "desktop",
+    "contextReadScope": "intent-project-mutation (edit-existing-project Modify-existing-pages in-place rebuild, user explicitly requested 重构网页) + intent-page-library-bound (heritage) + shared-runtime + delivery-quality",
+    "contextRequirementsLoaded": [
+      {
+        "path": "intent-workflows/intent-project-mutation/INTENT_WORKFLOW.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "intent-workflows/intent-project-mutation/edit-existing-project.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "intent-workflows/intent-page-library-bound/INTENT_WORKFLOW.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "intent-workflows/intent-page-library-bound/start-library-bound-project.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "intent-workflows/intent-page-library-bound/library-bound-page-runtime.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "intent-workflows/intent-page-library-bound/design-library-ingestion.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "intent-workflows/intent-page-library-bound/dispatch-contract.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "intent-workflows/intent-page-library-bound/design-token-fidelity-rules.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "intent-workflows/intent-page-library-bound/component-conformance-rules.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "intent-workflows/intent-page-library-bound/icon-source-priority-rules.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "intent-workflows/intent-page-library-bound/orchestration-summary-fields.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "shared-runtime/agent-dispatch-runtime/shared-page-rendering-kernel.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "shared-runtime/agent-dispatch-runtime/lane-dispatch-index.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "shared-runtime/runtime-boundaries/lane-runtime-contracts.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "shared-runtime/design-artifact-formats/design-project-file-format.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "shared-runtime/orchestration-summary-contract/orchestration-summary-contract.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "delivery-quality/page-rendering-quality-gate.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "delivery-quality/design-artifact-validation.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "delivery-quality/delivery-evidence-contract.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      }
+    ],
+    "validationRunDiscipline": {
+      "maxFullValidationRuns": 2,
+      "softWarningsTriggerRepair": false,
+      "blockingRepairMode": "targeted-once",
+      "forbiddenRepairTriggers": [
+        "soft-warning-only",
+        "provenance-warning-only",
+        "style-warning-only"
+      ]
+    },
+    "lowValueCallWatchdog": {
+      "noProgressNextAction": "proceed-to-validation"
+    },
+    "dispatchPreflightManifest": [
+      {
+        "nodeId": "page-index",
+        "htmlSrc": "pages/index.html",
+        "laneContract": {
+          "resolvedLane": "library_bound",
+          "packetType": "LibraryBoundPagePacket"
+        },
+        "sharedTemplate": "none",
+        "supplementaryReads": [],
+        "allowedWritePaths": [
+          "pages/index.html"
+        ],
+        "forbiddenWriteRoots": [
+          "*.design",
+          "runtime-orchestration-summary.json",
+          "validation-report.json",
+          "finish-readiness-report.json"
+        ],
+        "toolPolicy": {
+          "todoWriteAllowed": false,
+          "validationScriptsAllowed": false,
+          "previewAllowed": false,
+          "helperScriptsAllowed": false,
+          "designFileWriteAllowed": false,
+          "allowedWritePaths": [
+            "pages/index.html"
+          ]
+        }
+      },
+      {
+        "nodeId": "page-voice-cloning",
+        "htmlSrc": "pages/voice-cloning.html",
+        "laneContract": {
+          "resolvedLane": "existing_edit_add_comparison",
+          "packetType": "LibraryBoundPagePacket"
+        },
+        "sharedTemplate": "none",
+        "supplementaryReads": [],
+        "allowedWritePaths": [
+          "pages/voice-cloning.html"
+        ],
+        "forbiddenWriteRoots": [
+          "*.design",
+          "runtime-orchestration-summary.json",
+          "validation-report.json",
+          "finish-readiness-report.json"
+        ],
+        "toolPolicy": {
+          "todoWriteAllowed": false,
+          "validationScriptsAllowed": false,
+          "previewAllowed": false,
+          "helperScriptsAllowed": false,
+          "designFileWriteAllowed": false,
+          "allowedWritePaths": [
+            "pages/voice-cloning.html"
+          ]
+        }
+      },
+      {
+        "nodeId": "page-architecture",
+        "htmlSrc": "pages/architecture.html",
+        "laneContract": {
+          "resolvedLane": "existing_edit_add_comparison",
+          "packetType": "LibraryBoundPagePacket"
+        },
+        "sharedTemplate": "none",
+        "supplementaryReads": [],
+        "allowedWritePaths": [
+          "pages/architecture.html"
+        ],
+        "forbiddenWriteRoots": [
+          "*.design",
+          "runtime-orchestration-summary.json",
+          "validation-report.json",
+          "finish-readiness-report.json"
+        ],
+        "toolPolicy": {
+          "todoWriteAllowed": false,
+          "validationScriptsAllowed": false,
+          "previewAllowed": false,
+          "helperScriptsAllowed": false,
+          "designFileWriteAllowed": false,
+          "allowedWritePaths": [
+            "pages/architecture.html"
+          ]
+        }
+      },
+      {
+        "nodeId": "page-chat",
+        "htmlSrc": "pages/chat.html",
+        "laneContract": {
+          "resolvedLane": "existing_edit_add_comparison",
+          "packetType": "LibraryBoundPagePacket"
+        },
+        "sharedTemplate": "none",
+        "supplementaryReads": [],
+        "allowedWritePaths": [
+          "pages/chat.html"
+        ],
+        "forbiddenWriteRoots": [
+          "*.design",
+          "runtime-orchestration-summary.json",
+          "validation-report.json",
+          "finish-readiness-report.json"
+        ],
+        "toolPolicy": {
+          "todoWriteAllowed": false,
+          "validationScriptsAllowed": false,
+          "previewAllowed": false,
+          "helperScriptsAllowed": false,
+          "designFileWriteAllowed": false,
+          "allowedWritePaths": [
+            "pages/chat.html"
+          ]
+        }
+      }
+    ],
+    "expectedDispatches": [
+      {
+        "nodeId": "page-index",
+        "pageId": "page-index",
+        "targetPageId": "page-index",
+        "htmlSrc": "pages/index.html",
+        "status": "completed",
+        "changedFiles": [
+          "pages/index.html"
+        ],
+        "toolCallLedger": {
+          "source": "main-agent-runtime-trace",
+          "traceDigest": "4927a5ba51d8f25c7abcfbd43d6867b6a1f885cb45196e9cc27ec1f26a36cc42",
+          "todoWriteCalls": 0,
+          "previewCalls": 0,
+          "validationScriptCalls": 0,
+          "helperScriptWrites": 0
+        },
+        "recordedAt": "2026-08-02T12:17:02.760Z",
+        "source": "record-dispatch-completion.mjs"
+      },
+      {
+        "nodeId": "page-voice-cloning",
+        "pageId": "page-voice-cloning",
+        "targetPageId": "page-voice-cloning",
+        "htmlSrc": "pages/voice-cloning.html",
+        "status": "completed",
+        "changedFiles": [
+          "pages/voice-cloning.html"
+        ],
+        "toolCallLedger": {
+          "source": "main-agent-runtime-trace",
+          "traceDigest": "42c0c4a6447577688a05c7911507a1663ccdc17d0f02e81c85c916b97a746a37",
+          "todoWriteCalls": 0,
+          "previewCalls": 0,
+          "validationScriptCalls": 0,
+          "helperScriptWrites": 0
+        },
+        "recordedAt": "2026-08-02T12:17:05.101Z",
+        "source": "record-dispatch-completion.mjs"
+      },
+      {
+        "nodeId": "page-architecture",
+        "pageId": "page-architecture",
+        "targetPageId": "page-architecture",
+        "htmlSrc": "pages/architecture.html",
+        "status": "completed",
+        "changedFiles": [
+          "pages/architecture.html"
+        ],
+        "toolCallLedger": {
+          "source": "main-agent-runtime-trace",
+          "traceDigest": "d781eaedb0097fe249c7b9bdb239c067a63a4d99cf53d0ff207d17ac29585160",
+          "todoWriteCalls": 0,
+          "previewCalls": 0,
+          "validationScriptCalls": 0,
+          "helperScriptWrites": 0
+        },
+        "recordedAt": "2026-08-02T12:17:06.339Z",
+        "source": "record-dispatch-completion.mjs"
+      },
+      {
+        "nodeId": "page-chat",
+        "pageId": "page-chat",
+        "targetPageId": "page-chat",
+        "htmlSrc": "pages/chat.html",
+        "status": "completed",
+        "changedFiles": [
+          "pages/chat.html"
+        ],
+        "toolCallLedger": {
+          "source": "main-agent-runtime-trace",
+          "traceDigest": "9fd5b02f635da03e153caa142a0dbb62340fbae4aaecb1aa41f980720ed980fa",
+          "todoWriteCalls": 0,
+          "previewCalls": 0,
+          "validationScriptCalls": 0,
+          "helperScriptWrites": 0
+        },
+        "recordedAt": "2026-08-02T12:17:03.917Z",
+        "source": "record-dispatch-completion.mjs"
+      }
+    ],
+    "validationHistory": [
+      {
+        "reportPath": "validation-report.json",
+        "reportHash": "e8382f9ba4b837d8dbe7fe94dd0f9d151f3fbef78f304c394645980fdd49e55e",
+        "checkedAt": "2026-08-02T11:08:58.727Z",
+        "success": false,
+        "exitCode": 1,
+        "renderBlockingErrorCount": 2,
+        "repairPlanHints": [],
+        "errorSignatures": [
+          {
+            "errorClass": "dispatch-changed-files",
+            "normalized": "[dispatch-changed-files] pages/index.html: toolCallLedger.source must be main-agent-runtime-trace; found (missing)",
+            "signature": "fc6dc878ce3863b26478549cc3a255dc1dd21bfef4faf663342c4cc904702c3b"
+          },
+          {
+            "errorClass": "dispatch-changed-files",
+            "normalized": "[dispatch-changed-files] pages/index.html: toolCallLedger.traceDigest is required for trace-sourced discipline audit",
+            "signature": "a24cc56481b4b1b9c3330e3fbb10d8932f94746b40568d40d31968799dbaa756"
+          }
+        ],
+        "terminalState": null
+      },
+      {
+        "reportPath": "validation-report.json",
+        "reportHash": "c680d060e59ef66c2f325cff089aef9136f58697d248583d2a3e7ae8d3314dc8",
+        "checkedAt": "2026-08-02T11:10:51.029Z",
+        "success": true,
+        "exitCode": 0,
+        "renderBlockingErrorCount": 0,
+        "repairPlanHints": [],
+        "errorSignatures": [],
+        "terminalState": null
+      }
+    ],
+    "validationRepairLedger": [
+      {
+        "failedReportPath": "validation-report.json",
+        "failedReportHash": "e8382f9ba4b837d8dbe7fe94dd0f9d151f3fbef78f304c394645980fdd49e55e",
+        "repairWorkflowReadPath": "intent-workflows/intent-project-mutation/main-agent-repair-workflow.md",
+        "repairStartedAt": "2026-08-02T11:09:33.713Z",
+        "repairEntryStatus": "revalidated-success",
+        "ownerTriage": [
+          {
+            "owner": "main-agent",
+            "errorClass": "unknown-blocking",
+            "affectedFiles": [],
+            "repairScope": "read validation report, classify owner, then use the narrowest targeted repair",
+            "strategy": "no validator source read; targeted affected-file excerpt only"
+          },
+          {
+            "owner": "main-agent",
+            "errorClass": "unknown-blocking",
+            "affectedFiles": [],
+            "repairScope": "read validation report, classify owner, then use the narrowest targeted repair",
+            "strategy": "no validator source read; targeted affected-file excerpt only"
+          }
+        ],
+        "repairPlanHints": [],
+        "repairActions": [
+          {
+            "owner": "main-agent",
+            "errorClass": "unknown-blocking",
+            "affectedFiles": [
+              "runtime-orchestration-summary.json"
+            ],
+            "action": "record-dispatch-completion-main-agent-trace",
+            "observedFileHashes": [
+              {
+                "path": "runtime-orchestration-summary.json",
+                "hash": "0d51d07a4e0e3c6466c91ccafc106eddc3b7a270ac0c5182fe14ae9df75c91fe"
+              }
+            ],
+            "preEditFileHashes": [],
+            "postEditFileHashes": [],
+            "repairOwnedFields": [
+              "unknown-blocking"
+            ],
+            "recordedAt": "2026-08-02T11:10:29.430Z",
+            "repairActionTableRequired": true
+          }
+        ],
+        "revalidationReportPath": "validation-report.json",
+        "revalidationReportHash": "c680d060e59ef66c2f325cff089aef9136f58697d248583d2a3e7ae8d3314dc8",
+        "revalidationSuccess": true,
+        "blockedReason": null,
+        "revalidationRecordedAt": "2026-08-02T11:11:06.710Z"
+      }
+    ],
+    "repairEntryEvidence": [
+      {
+        "failedReportPath": "validation-report.json",
+        "failedReportHash": "e8382f9ba4b837d8dbe7fe94dd0f9d151f3fbef78f304c394645980fdd49e55e",
+        "repairWorkflowReadPath": "intent-workflows/intent-project-mutation/main-agent-repair-workflow.md",
+        "repairStartedAt": "2026-08-02T11:09:33.713Z",
+        "ledgerIndex": 0,
+        "ownerTriageCount": 2,
+        "repairActionCount": 1,
+        "revalidationReportPath": "validation-report.json",
+        "revalidationReportHash": "c680d060e59ef66c2f325cff089aef9136f58697d248583d2a3e7ae8d3314dc8",
+        "revalidationSuccess": true
+      }
+    ],
+    "mainAgentPostDispatchMutations": []
+  },
+  "pages": [
+    {
+      "nodeId": "page-index",
+      "page": "pages/index.html",
+      "title": "小拟 · AI 拟人系统",
+      "pageType": "showcase",
+      "deviceType": "desktop",
+      "viewportMode": "document-scroll",
+      "qualityGate": "passed",
+      "domIds": [
+        "nav-brand",
+        "nav-docs",
+        "nav-start",
+        "hero-start",
+        "hero-how",
+        "cta-start"
+      ],
+      "componentsRead": [
+        "button",
+        "card",
+        "navigation"
+      ],
+      "extraComponentsRead": [],
+      "headInfrastructureStatus": {
+        "mode": "FullHtmlReplaceHead",
+        "themeClass": "dark",
+        "semanticTokenFallback": "present",
+        "themeVars": "present",
+        "tailwind": "present",
+        "lucide": "present",
+        "charts": "present"
+      },
+      "htmlWriteMode": "skeleton-then-main-edit",
+      "headManagementEvidence": "skeleton generated by apply-html-head-contract.mjs (Mode 1, --theme=dark --prefix=vercel); <main> content injected via targeted SearchReplace; head infrastructure untouched",
+      "staticRenderingEvidence": {
+        "criticalLayoutCssPresent": true,
+        "runtimeOnlyTailwindDependency": false,
+        "layoutCriticalSelectors": [
+          ".wrap",
+          ".hero-grid",
+          ".bento",
+          ".bcard",
+          ".spot-grid",
+          ".local-grid",
+          ".steps-grid",
+          ".foot-grid",
+          "@media (max-width:900px)"
+        ]
+      },
+      "viewportIntegrityEvidence": {
+        "targetFrame": "desktop",
+        "firstScreenRegionsVisible": [
+          "nav",
+          "hero-copy",
+          "hero-orb"
+        ],
+        "horizontalOverflowRisk": "none",
+        "overlapRisk": "none"
+      },
+      "designIntentEvidence": {
+        "visualNorthStarApplied": "Premium dark Vercel-aesthetic landing page; typographic hero with animated voice orb; monochrome surfaces + single blue accent; editorial bento composition",
+        "compositionPatternUsed": "asymmetric-hero + bento-grid + alternating-spotlight",
+        "continuityAnchorsApplied": [
+          "brand-mark waveform motif",
+          "border-defined surfaces (#282828)",
+          "Geist/Geist Mono type stack",
+          "blue --chart-2 accent",
+          "8-12px radius scale"
+        ],
+        "antiSlopCheck": "no neon/rainbow gradients; no emoji-as-icon (inline SVG used); no 3-equal-card block (bento with varied spans); single primary hue; subtle shadows (alpha<=0.05 via color-mix); real footer content"
+      },
+      "interactionStates": {
+        "buttons": "default/hover/focus-visible via .btn-primary,.btn-ghost; disabled n/a",
+        "cards": "hover border-lighten + translateY",
+        "nav": "hover accent bg + color shift",
+        "motion": "scroll-reveal IntersectionObserver; waveform barDance; orb pulse; prefers-reduced-motion respected"
+      },
+      "motionEvidence": {
+        "microInteractions": [
+          "orb pulse rings",
+          "equalizer waveform bars",
+          "scroll reveal",
+          "button hover lift",
+          "card hover lift"
+        ],
+        "reducedMotionHandled": true,
+        "animationLibrariesUsed": []
+      },
+      "visualStructureEvidence": {
+        "primitiveTokenEvidence": "all dividers/borders via var(--border); glows via color-mix on var(--chart-2); no currentColor dividers",
+        "layoutGeometryEvidence": "grid/flex with explicit gaps; no absolute-positioned primary layout",
+        "alignmentEvidence": "nav space-between; bento 6-col grid; spot-grid 2-col; local-grid 3-col; foot-grid 4-col",
+        "headingCtaEvidence": "headings are short noun phrases; CTA labels concise (立即体验/开始体验/了解工作原理)"
+      },
+      "iconPolicyEvidence": {
+        "emojiUsedAsIcon": false,
+        "explicitUserRequestedEmojiIcons": false,
+        "iconSource": "inline stroke SVG + Lucide runtime fallback"
+      },
+      "sourceContextPreserved": "not applicable",
+      "sharedShellPreserved": "not applicable",
+      "inheritedFragmentsUsed": [],
+      "privateRegionsGenerated": [
+        "nav",
+        "hero",
+        "capabilities-bento",
+        "voice-spotlight",
+        "local-first",
+        "how-it-works",
+        "cta",
+        "footer"
+      ],
+      "sharedFragmentsPreserved": [],
+      "generationNodeId": "page-index",
+      "nestingDepthCheck": {
+        "status": "pass",
+        "maxLayersFound": 3,
+        "samplePaths": [
+          "section > .wrap > .bento > .bcard"
+        ]
+      }
+    },
+    {
+      "nodeId": "page-voice-cloning",
+      "page": "pages/voice-cloning.html",
+      "title": "声音克隆 · 小拟",
+      "pageType": "information-dense",
+      "deviceType": "desktop",
+      "viewportMode": "document-scroll",
+      "qualityGate": "passed",
+      "domIds": [
+        "nav-home",
+        "nav-voice",
+        "nav-arch",
+        "nav-arch-2",
+        "nav-home-cta",
+        "cta-back"
+      ],
+      "componentsRead": [
+        "button",
+        "card",
+        "navigation"
+      ],
+      "extraComponentsRead": [],
+      "headInfrastructureStatus": {
+        "mode": "FullHtmlReplaceHead",
+        "themeClass": "dark",
+        "semanticTokenFallback": "present",
+        "themeVars": "present",
+        "tailwind": "present",
+        "lucide": "present",
+        "charts": "present"
+      },
+      "htmlWriteMode": "skeleton-then-main-edit",
+      "headManagementEvidence": "skeleton generated by apply-html-head-contract.mjs (Mode 1, --theme=dark --prefix=vercel); <main> content injected via targeted SearchReplace; head infrastructure untouched",
+      "staticRenderingEvidence": {
+        "criticalLayoutCssPresent": true,
+        "runtimeOnlyTailwindDependency": false,
+        "layoutCriticalSelectors": [
+          ".wrap",
+          ".flow",
+          ".fstep",
+          ".spec-grid",
+          ".cmp-grid",
+          ".faq-list",
+          ".foot-grid",
+          "@media (max-width:900px)"
+        ]
+      },
+      "viewportIntegrityEvidence": {
+        "targetFrame": "desktop",
+        "firstScreenRegionsVisible": [
+          "nav",
+          "hero"
+        ],
+        "horizontalOverflowRisk": "none",
+        "overlapRisk": "none"
+      },
+      "designIntentEvidence": {
+        "visualNorthStarApplied": "Premium dark Vercel-aesthetic voice-cloning detail page; centered hero with animated waveform; 4-step workflow, spec table, default-vs-cloned comparison, FAQ",
+        "compositionPatternUsed": "centered-hero + step-chain + split-spec + comparison-pair",
+        "continuityAnchorsApplied": [
+          "shared nav/footer",
+          "brand-mark waveform motif",
+          "border-defined surfaces (#282828)",
+          "Geist/Geist Mono type stack",
+          "blue --chart-2 accent",
+          "8-12px radius scale"
+        ],
+        "antiSlopCheck": "no emoji-as-icon (inline SVG); no 3-equal-card block; single primary hue; subtle glows via color-mix; real footer content"
+      },
+      "interactionStates": {
+        "buttons": "default/hover via .btn-primary,.btn-ghost",
+        "nav": "hover accent bg + color shift; active state via .nav-links a.active",
+        "cards": "hover border-lighten",
+        "motion": "scroll-reveal IntersectionObserver; waveform barDance; prefers-reduced-motion respected"
+      },
+      "motionEvidence": {
+        "microInteractions": [
+          "hero waveform bars",
+          "comparison waveform bars",
+          "scroll reveal"
+        ],
+        "reducedMotionHandled": true,
+        "animationLibrariesUsed": []
+      },
+      "visualStructureEvidence": {
+        "primitiveTokenEvidence": "all dividers/borders via var(--border); glows via color-mix on var(--chart-2); no currentColor dividers",
+        "layoutGeometryEvidence": "grid/flex with explicit gaps; no absolute-positioned primary layout",
+        "alignmentEvidence": "nav space-between; flow 4-col grid; spec-grid 2-col; cmp-grid 2-col; foot-grid 4-col",
+        "headingCtaEvidence": "headings are short noun phrases; CTA labels concise (返回首页体验)"
+      },
+      "iconPolicyEvidence": {
+        "emojiUsedAsIcon": false,
+        "explicitUserRequestedEmojiIcons": false,
+        "iconSource": "inline stroke SVG + Lucide runtime fallback"
+      },
+      "sourceContextPreserved": "not applicable",
+      "sharedShellPreserved": "not applicable",
+      "inheritedFragmentsUsed": [],
+      "privateRegionsGenerated": [
+        "nav",
+        "hero",
+        "workflow",
+        "specs",
+        "compare",
+        "faq",
+        "cta",
+        "footer"
+      ],
+      "sharedFragmentsPreserved": [],
+      "generationNodeId": "page-voice-cloning",
+      "nestingDepthCheck": {
+        "status": "pass",
+        "maxLayersFound": 3,
+        "samplePaths": [
+          "section > .wrap > .flow > .fstep"
+        ]
+      }
+    },
+    {
+      "nodeId": "page-architecture",
+      "page": "pages/architecture.html",
+      "title": "技术架构 · 小拟",
+      "pageType": "information-dense",
+      "deviceType": "desktop",
+      "viewportMode": "document-scroll",
+      "qualityGate": "passed",
+      "domIds": [
+        "nav-home",
+        "nav-voice",
+        "nav-voice-2",
+        "nav-arch",
+        "nav-home-cta",
+        "cta-back"
+      ],
+      "componentsRead": [
+        "button",
+        "card",
+        "navigation"
+      ],
+      "extraComponentsRead": [],
+      "headInfrastructureStatus": {
+        "mode": "FullHtmlReplaceHead",
+        "themeClass": "dark",
+        "semanticTokenFallback": "present",
+        "themeVars": "present",
+        "tailwind": "present",
+        "lucide": "present",
+        "charts": "present"
+      },
+      "htmlWriteMode": "skeleton-then-main-edit",
+      "headManagementEvidence": "skeleton generated by apply-html-head-contract.mjs (Mode 1, --theme=dark --prefix=vercel); <main> content injected via targeted SearchReplace; head infrastructure untouched",
+      "staticRenderingEvidence": {
+        "criticalLayoutCssPresent": true,
+        "runtimeOnlyTailwindDependency": false,
+        "layoutCriticalSelectors": [
+          ".wrap",
+          ".arch-diagram",
+          ".arch-layer",
+          ".flow-chain",
+          ".flow-node",
+          ".stack-grid",
+          ".lc-grid",
+          ".foot-grid",
+          "@media (max-width:900px)"
+        ]
+      },
+      "viewportIntegrityEvidence": {
+        "targetFrame": "desktop",
+        "firstScreenRegionsVisible": [
+          "nav",
+          "hero"
+        ],
+        "horizontalOverflowRisk": "none",
+        "overlapRisk": "none"
+      },
+      "designIntentEvidence": {
+        "visualNorthStarApplied": "Premium dark Vercel-aesthetic architecture page; layered system diagram, message data-flow chain, tech stack grid, local-vs-cloud comparison",
+        "compositionPatternUsed": "centered-hero + layered-diagram + horizontal-flow-chain + split-comparison",
+        "continuityAnchorsApplied": [
+          "shared nav/footer",
+          "brand-mark waveform motif",
+          "border-defined surfaces (#282828)",
+          "Geist/Geist Mono type stack",
+          "blue --chart-2 accent",
+          "8-12px radius scale"
+        ],
+        "antiSlopCheck": "no emoji-as-icon (inline SVG); single primary hue; subtle glows via color-mix; real footer content"
+      },
+      "interactionStates": {
+        "buttons": "default/hover via .btn-primary,.btn-ghost",
+        "nav": "hover accent bg + color shift; active state via .nav-links a.active",
+        "cards": "hover border-lighten",
+        "motion": "scroll-reveal IntersectionObserver; prefers-reduced-motion respected"
+      },
+      "motionEvidence": {
+        "microInteractions": [
+          "scroll reveal",
+          "diagram layer hover"
+        ],
+        "reducedMotionHandled": true,
+        "animationLibrariesUsed": []
+      },
+      "visualStructureEvidence": {
+        "primitiveTokenEvidence": "all dividers/borders via var(--border); glows via color-mix on var(--chart-2); no currentColor dividers",
+        "layoutGeometryEvidence": "grid/flex with explicit gaps; no absolute-positioned primary layout",
+        "alignmentEvidence": "nav space-between; arch-layer 2-col; flow-chain horizontal; stack-grid 2-col; lc-grid 2-col; foot-grid 4-col",
+        "headingCtaEvidence": "headings are short noun phrases; CTA labels concise (返回首页体验)"
+      },
+      "iconPolicyEvidence": {
+        "emojiUsedAsIcon": false,
+        "explicitUserRequestedEmojiIcons": false,
+        "iconSource": "inline stroke SVG + Lucide runtime fallback"
+      },
+      "sourceContextPreserved": "not applicable",
+      "sharedShellPreserved": "not applicable",
+      "inheritedFragmentsUsed": [],
+      "privateRegionsGenerated": [
+        "nav",
+        "hero",
+        "diagram",
+        "flow",
+        "stack",
+        "compare",
+        "cta",
+        "footer"
+      ],
+      "sharedFragmentsPreserved": [],
+      "generationNodeId": "page-architecture",
+      "nestingDepthCheck": {
+        "status": "pass",
+        "maxLayersFound": 3,
+        "samplePaths": [
+          "section > .wrap > .arch-diagram > .arch-layer"
+        ]
+      }
+    },
+    {
+      "nodeId": "page-chat",
+      "page": "pages/chat.html",
+      "title": "对话 · 小拟",
+      "pageType": "task-driven",
+      "deviceType": "desktop",
+      "viewportMode": "document-scroll",
+      "qualityGate": "passed",
+      "domIds": [
+        "chat-home",
+        "chat-home-link",
+        "chat-arch",
+        "btn-new",
+        "btn-settings",
+        "btn-speak-1",
+        "btn-speak-2",
+        "prompt-1",
+        "prompt-2",
+        "prompt-3",
+        "input-text",
+        "btn-mic",
+        "btn-send"
+      ],
+      "componentsRead": [
+        "button",
+        "card",
+        "navigation"
+      ],
+      "extraComponentsRead": [],
+      "headInfrastructureStatus": {
+        "mode": "FullHtmlReplaceHead",
+        "themeClass": "dark",
+        "semanticTokenFallback": "present",
+        "themeVars": "present",
+        "tailwind": "present",
+        "lucide": "present",
+        "charts": "present"
+      },
+      "htmlWriteMode": "skeleton-then-main-edit",
+      "headManagementEvidence": "skeleton generated by apply-html-head-contract.mjs (Mode 1, --theme=dark --prefix=vercel); <main> content injected via targeted SearchReplace; head infrastructure untouched",
+      "staticRenderingEvidence": {
+        "criticalLayoutCssPresent": true,
+        "runtimeOnlyTailwindDependency": false,
+        "layoutCriticalSelectors": [
+          ".app",
+          ".side",
+          ".main",
+          ".chat-top",
+          ".msgs",
+          ".msgs-inner",
+          ".msg",
+          ".inputbar",
+          "@media (max-width:900px)"
+        ]
+      },
+      "viewportIntegrityEvidence": {
+        "targetFrame": "desktop",
+        "firstScreenRegionsVisible": [
+          "sidebar",
+          "chat-top",
+          "messages",
+          "inputbar"
+        ],
+        "horizontalOverflowRisk": "none",
+        "overlapRisk": "none"
+      },
+      "designIntentEvidence": {
+        "visualNorthStarApplied": "Premium dark Vercel-aesthetic chat workspace; sidebar session list + message thread with voice playback waveform + input composer; monochrome surfaces, single blue accent",
+        "compositionPatternUsed": "app-shell sidebar + conversation-thread + composer",
+        "continuityAnchorsApplied": [
+          "brand-mark waveform motif",
+          "border-defined surfaces (#282828)",
+          "Geist/Geist Mono type stack",
+          "blue --chart-2 accent",
+          "8-12px radius scale",
+          "voice-waveform micro-interaction"
+        ],
+        "antiSlopCheck": "no emoji-as-icon (inline SVG; welcome uses literal text); single primary hue; subtle glows via color-mix; real sidebar/footer content"
+      },
+      "interactionStates": {
+        "buttons": "default/hover via .new-btn,.top-btn,.send-btn,.mic-btn",
+        "speakButtons": "idle/playing/done via .speak-btn.playing/.done with mini-wave",
+        "sessions": "hover accent bg; active via .session.active",
+        "composer": "focus-within ring on inputbar",
+        "motion": "message entrance; typing dots; mini-waveform; prefers-reduced-motion respected"
+      },
+      "motionEvidence": {
+        "microInteractions": [
+          "message entrance animation",
+          "typing indicator",
+          "speak button waveform toggle",
+          "live status blink",
+          "button hover"
+        ],
+        "reducedMotionHandled": true,
+        "animationLibrariesUsed": []
+      },
+      "visualStructureEvidence": {
+        "primitiveTokenEvidence": "all dividers/borders via var(--border); glows via color-mix on var(--chart-2); no currentColor dividers",
+        "layoutGeometryEvidence": "flex app-shell with explicit gaps; no absolute-positioned primary layout",
+        "alignmentEvidence": "sidebar 256px rail; message thread centered max-760px; composer aligned to thread",
+        "headingCtaEvidence": "headings are short noun phrases; CTA labels concise (新对话/发送)"
+      },
+      "iconPolicyEvidence": {
+        "emojiUsedAsIcon": false,
+        "explicitUserRequestedEmojiIcons": false,
+        "iconSource": "inline stroke SVG + Lucide runtime fallback"
+      },
+      "sourceContextPreserved": "not applicable",
+      "sharedShellPreserved": "not applicable",
+      "inheritedFragmentsUsed": [],
+      "privateRegionsGenerated": [
+        "sidebar",
+        "chat-top",
+        "welcome",
+        "message-thread",
+        "composer"
+      ],
+      "sharedFragmentsPreserved": [],
+      "generationNodeId": "page-chat",
+      "nestingDepthCheck": {
+        "status": "pass",
+        "maxLayersFound": 3,
+        "samplePaths": [
+          ".app > .main > .msgs > .msgs-inner > .msg"
+        ]
+      }
+    }
+  ]
+}
