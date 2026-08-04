@@ -18,7 +18,7 @@ BASE = Path(__file__).resolve().parent            # llm/
 BIN_DIR = BASE / "bin"
 MODELS_DIR = BASE / "models"
 SERVER_EXE = BIN_DIR / "llama-server.exe"
-MODEL_FILE = MODELS_DIR / "Qwen3-4B-Q4_K_M.gguf"
+MODEL_FILE = MODELS_DIR / "Qwen3.5-4B-Q4_K_M.gguf"
 
 CURL = r"C:\Windows\System32\curl.exe"
 TAR = r"C:\Windows\System32\tar.exe"
@@ -30,11 +30,11 @@ LLAMA_ZIP_URL = (
 # CUDA 版标志文件：bin 里存在 ggml-cuda*.dll 才认为是 GPU 运行时
 CUDA_MARKER = BIN_DIR / "ggml-cuda.dll"
 MODEL_MIRRORS = [
-    "https://hf-mirror.com/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
-    "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
-    "https://modelscope.cn/models/Qwen/Qwen3-4B-GGUF/resolve/master/Qwen3-4B-Q4_K_M.gguf",
+    "https://hf-mirror.com/lmstudio-community/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+    "https://huggingface.co/lmstudio-community/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+    "https://modelscope.cn/models/Qwen/Qwen3.5-4B-GGUF/resolve/master/Qwen3.5-4B-Q4_K_M.gguf",
 ]
-MODEL_MIN_SIZE = 1 << 30          # 模型正常约 2.3GB，低于 1GB 视为未下载完
+MODEL_MIN_SIZE = 2 << 30          # 4B Q4 约 2.6GB，低于 2GB 视为未下载完
 ZIP_MIN_SIZE = 5 << 20            # 运行时 zip 约 17MB
 
 
@@ -97,10 +97,10 @@ def ensure_model() -> bool:
     if MODEL_FILE.exists() and MODEL_FILE.stat().st_size >= MODEL_MIN_SIZE:
         print(f"✅ 模型就绪 ({_human(MODEL_FILE.stat().st_size)})")
         return True
-    print("⬇️  模型缺失或不完整，从上游获取（约 2.3GB）...")
+    print("⬇️  模型缺失或不完整，从上游获取（约 2.6GB）...")
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     for url in MODEL_MIRRORS:
-        if _fetch(url, MODEL_FILE, MODEL_MIN_SIZE, "Qwen3-4B 模型"):
+        if _fetch(url, MODEL_FILE, MODEL_MIN_SIZE, "Qwen3.5-4B 模型"):
             print(f"✅ 模型就绪 ({_human(MODEL_FILE.stat().st_size)})")
             return True
         print("    镜像不可用，切换下一个...")

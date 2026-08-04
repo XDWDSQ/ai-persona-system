@@ -13,6 +13,7 @@ import base64
 import binascii
 import copy
 import hashlib
+import hmac
 import json
 import logging
 import mimetypes
@@ -24,15 +25,19 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 
+import socket as _socket
+
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               RedirectResponse, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -151,8 +156,160 @@ def _refresh_tts_cache_limits() -> None:
     except (TypeError, ValueError) as exc:
         _log.warning("tts_cache config invalid, keep defaults: %s", exc)
 
-# sessions 缓存（和 config 同样 mtime 失效策略）
-_sess_cache: dict = {"_mtime_ns": 0, "_value": []}
+# sessions 缓存（和 config 同样 mtime 失效策略）；值为 {"sessions": [...], "deleted": [...]}
+_sess_cache: dict = {"_mtime_ns": 0, "_value": {"sessions": [], "deleted": []}}
+
+# ---- 多端会话同步 ----
+# /api/sync/stream 的 SSE 订阅者：[(client_id, queue), ...]。
+# PUT /api/sessions 写盘成功后广播给除来源外的其他设备，触发其重新拉取合并。
+_sync_subscribers: list[tuple[str, asyncio.Queue]] = []
+
+# 删除墓碑：某端删掉的会话 id 记入此处（随 sessions.json 的 deleted 字段持久化），
+# 防止另一端旧快照 PUT 时把已删会话"复活"。ts 为毫秒时间戳（与前端 Date.now() 一致）。
+_TOMBSTONE_MAX_AGE_MS = 30 * 86400 * 1000
+_TOMBSTONE_MAX_COUNT = 500
+
+
+def _broadcast_sessions_changed(origin_client: str) -> None:
+    """通知所有同步订阅者 sessions 已变更；跳过来源自身避免回声。
+
+    队列满说明该端消费太慢，丢弃本次通知即可——它还有可见性/兜底轮询补齐。"""
+    if not _sync_subscribers:
+        return
+    payload = json.dumps({"type": "sessions_updated", "ts": round(time.time() * 1000)}, ensure_ascii=False)
+    for cid, q in list(_sync_subscribers):
+        if origin_client and cid == origin_client:
+            continue
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass
+
+
+def _norm_tombstones(items, now_ms: float) -> dict:
+    """规范化墓碑列表为 {id: ts_ms}：丢弃非法/过期/未来时间戳，重复 id 取较新。"""
+    out: dict = {}
+    for t in items or []:
+        if not isinstance(t, dict):
+            continue
+        sid, ts = t.get("id"), t.get("ts")
+        if not isinstance(sid, str) or not sid:
+            continue
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            continue
+        if now_ms - ts > _TOMBSTONE_MAX_AGE_MS or ts > now_ms + 86400000:
+            continue
+        if ts > out.get(sid, 0):
+            out[sid] = ts
+    return out
+
+
+def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
+    """多端合并：按 id 归并（updatedAt 新者胜，平手取 incoming），再按墓碑过滤。
+
+    会话 updatedAt 新于墓碑时间视为"复活"（保留会话并移除墓碑）；
+    返回按 updatedAt 倒序的前 500 条。会就地修改 tombstones（弹出失效项）。"""
+    by_id: dict = {}
+    for s in [*current, *incoming]:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("id")
+        if not isinstance(sid, str) or not sid:
+            continue
+        old = by_id.get(sid)
+        if old is None or (s.get("updatedAt") or 0) >= (old.get("updatedAt") or 0):
+            by_id[sid] = s
+    out = []
+    for sid, s in by_id.items():
+        ts = tombstones.get(sid)
+        if ts is None:
+            out.append(s)
+        elif (s.get("updatedAt") or 0) > ts:
+            tombstones.pop(sid, None)
+            out.append(s)
+        # 其余：最后更新早于删除时间 → 维持删除状态
+    out.sort(key=lambda s: s.get("updatedAt") or 0, reverse=True)
+    return out[:500]
+
+
+# ------------------------------------------------------------------ 会话备份保险 -----
+# 合并前落盘备份：防止多端同步的破坏性合并吞掉本端聊天记录。
+# 最近一次备份时间（按文件路径记），5 分钟内不重复备份，避免频繁写入。
+_sessions_last_backup: dict[str, float] = {}
+
+
+def _sessions_msg_count(sessions: list) -> int:
+    """统计会话列表的总消息数（history 字段）。"""
+    total = 0
+    for s in sessions or []:
+        if not isinstance(s, dict):
+            continue
+        h = s.get("history")
+        if isinstance(h, list):
+            total += len(h)
+    return total
+
+
+def _backup_sessions_before_destructive(current: list, merged: list) -> None:
+    """写盘前检测破坏性合并并备份当前文件。
+
+    触发条件（满足任一）：
+    - 合并后总消息数骤降（较当前减少 >50% 且至少减少 10 条）
+    - 存在某会话 history 从非空变成空（被墓碑/旧快照整体吞掉）
+    命中任一条件且距上次备份 >300s 时，把当前 sessions.json 复制为
+    sessions.json.bak-YYYYMMDD-HHMMSS（UTC 或本地时间均可读）。
+    失败仅告警，不阻断写入（备份是保险，不是门槛）。
+    """
+    if not SESSIONS_PATH.exists():
+        return
+    cur_count = _sessions_msg_count(current)
+    new_count = _sessions_msg_count(merged)
+
+    # 条件 1：总量骤降
+    destructive = False
+    if cur_count > 0 and new_count < cur_count * 0.5 and (cur_count - new_count) >= 10:
+        destructive = True
+        _log.warning(
+            "sessions destructive merge detected: messages %d -> %d, backing up before write",
+            cur_count, new_count,
+        )
+
+    # 条件 2：某会话 history 被整体吞掉（非空 → 空）
+    if not destructive:
+        cur_by_id = {s.get("id"): s for s in current if isinstance(s, dict) and s.get("id")}
+        for s in merged:
+            if not isinstance(s, dict) or not s.get("id"):
+                continue
+            old = cur_by_id.get(s["id"])
+            if old is None:
+                continue
+            old_h = old.get("history")
+            new_h = s.get("history")
+            if isinstance(old_h, list) and len(old_h) > 0 and (not isinstance(new_h, list) or len(new_h) == 0):
+                destructive = True
+                _log.warning(
+                    "sessions destructive merge detected: session %s history %d -> 0, backing up",
+                    s.get("id"), len(old_h),
+                )
+                break
+
+    if not destructive:
+        return
+
+    key = str(SESSIONS_PATH)
+    now = time.time()
+    if now - _sessions_last_backup.get(key, 0) < 300:
+        _log.info("sessions backup skipped (throttled)")
+        return
+    _sessions_last_backup[key] = now
+
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    bak = SESSIONS_PATH.with_name(f"sessions.json.bak-{stamp}")
+    import shutil
+    shutil.copy2(SESSIONS_PATH, bak)
+    _log.warning("sessions backed up to %s before destructive merge", bak.name)
 
 # fire-and-forget 后台任务引用集：asyncio.create_task 的返回值若无人持有会被 GC 提前回收，
 # 导致清理任务中途消失；这里持有强引用，任务结束后自动从集合移除。
@@ -171,15 +328,26 @@ _post_processor: PostProcessor | None = None
 
 
 def _get_role_stores(role: str) -> tuple[MemoryStore, StateStore]:
-    """获取（或创建）指定角色的记忆库+状态库。data/ 下按角色分文件。"""
+    """获取（或创建）指定角色的记忆库+状态库。data/ 下按角色分文件。
+
+    memory_limit 每次调用都从配置同步：此前在 store 懒创建时固化，
+    改配置不重启永远不生效。"""
+    cfg = load_config()
+    engine_cfg = cfg.get("role_engine") or {}
+    try:
+        limit = int(engine_cfg.get("memory_limit", 200))
+    except (TypeError, ValueError):
+        limit = 200
+    if limit <= 0:
+        limit = 200
     pair = _role_stores.get(role)
     if pair is None:
-        cfg = load_config()
-        engine_cfg = cfg.get("role_engine") or {}
-        mem = MemoryStore(DATA_DIR, role, limit=int(engine_cfg.get("memory_limit", 200)))
+        mem = MemoryStore(DATA_DIR, role, limit=limit)
         st = StateStore(DATA_DIR, role)
         pair = (mem, st)
         _role_stores[role] = pair
+    else:
+        pair[0].limit = limit
     return pair
 
 
@@ -213,10 +381,19 @@ _CLOUD_PROVIDER_ENV = {
     "ark": "ARK_API_KEY",
 }
 _ALIYUN_ENV_KEYS = ("ALIYUN_API_KEY", "DASHSCOPE_API_KEY")
+_MINIMAX_ENV_KEYS = ("MINIMAX_API_KEY",)
 
 
 def _env_aliyun_key() -> str:
     for name in _ALIYUN_ENV_KEYS:
+        val = os.getenv(name)
+        if val:
+            return val
+    return ""
+
+
+def _env_minimax_key() -> str:
+    for name in _MINIMAX_ENV_KEYS:
         val = os.getenv(name)
         if val:
             return val
@@ -258,6 +435,9 @@ def _apply_env_overrides(cfg: dict) -> dict:
     aliyun_key = (voice.get("aliyun") or {}).get("api_key") or _env_aliyun_key()
     if aliyun_key:
         voice["aliyun"] = {**voice.get("aliyun", {}), "api_key": aliyun_key}
+    minimax_key = (voice.get("minimax") or {}).get("api_key") or _env_minimax_key()
+    if minimax_key:
+        voice["minimax"] = {**voice.get("minimax", {}), "api_key": minimax_key}
     out["voice"] = voice
     return out
 
@@ -267,7 +447,7 @@ def load_config(with_env: bool = True) -> dict:
     供 update_config/roles_apply 这类「改完要写盘」的路径使用，避免把 env 密钥持久化。"""
     _default_config = {
         "provider": "cloud",
-        "local": {"base_url": "http://localhost:11434/v1", "model": "qwen3-4b"},
+        "local": {"base_url": "http://localhost:11434/v1", "model": "Qwen3.5-4B-Q4_K_M"},
         "cloud": {"base_url": "", "model": "", "api_key": ""},
         "voice": {"provider": "aliyun", "manual_provider": False},
         "roles": {},
@@ -298,19 +478,25 @@ def load_config(with_env: bool = True) -> dict:
     return _apply_env_overrides(cfg) if with_env else cfg
 
 
+async def _save_config_locked(cfg: dict) -> None:
+    """配置写盘实际动作：调用方必须已持有 _io_locks["config"]。
+    原子 replace + 写后直接更新内存缓存，省一次 stat+read。"""
+    data = json.dumps(cfg, ensure_ascii=False, indent=2)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    # 阻塞 IO 丢进线程池，避免事件循环卡住
+    await asyncio.to_thread(tmp.write_text, data, encoding="utf-8")
+    await asyncio.to_thread(tmp.replace, CONFIG_PATH)
+    try:
+        _cfg_cache["_mtime_ns"] = CONFIG_PATH.stat().st_mtime_ns
+    except OSError:
+        _cfg_cache["_mtime_ns"] = 0
+    _cfg_cache["_value"] = cfg
+
+
 async def save_config(cfg: dict) -> None:
-    """并发安全的配置写入：写锁 + 原子 replace + 写后直接更新内存缓存，省一次 stat+read。"""
+    """并发安全的配置写入：写锁 + 原子 replace + 写后直接更新内存缓存。"""
     async with _io_locks["config"]:
-        data = json.dumps(cfg, ensure_ascii=False, indent=2)
-        tmp = CONFIG_PATH.with_suffix(".tmp")
-        # 阻塞 IO 丢进线程池，避免事件循环卡住
-        await asyncio.to_thread(tmp.write_text, data, encoding="utf-8")
-        await asyncio.to_thread(tmp.replace, CONFIG_PATH)
-        try:
-            _cfg_cache["_mtime_ns"] = CONFIG_PATH.stat().st_mtime_ns
-        except OSError:
-            _cfg_cache["_mtime_ns"] = 0
-        _cfg_cache["_value"] = cfg
+        await _save_config_locked(cfg)
 
 
 def current_persona(cfg: dict) -> str:
@@ -343,7 +529,7 @@ async def probe_active_provider(cfg: dict) -> tuple[bool, str]:
     now = time.monotonic()
     cached = _probe_cache.get(ck)
     if cached is not None and now - cached[0] < _PROBE_TTL:
-        _probe_cache.move_to_end(ck)
+        # 注意：_probe_cache 是普通 dict（FIFO 淘汰），没有 move_to_end，命中直接返回
         return cached[1], cached[2]
     if not base_url:
         _probe_cache_put(ck, (now, False, "未配置 API 地址"))
@@ -371,6 +557,830 @@ _STYLE_HINT = (
     "然后写回复正文。示例：[style:自然]今天天气不错。"
 )
 
+# 追加到 persona 末尾的「禁止元话语」约定：防止模型跳出角色追加免责/虚构声明、
+# 系统式提示或面向第三方的总结（/api/chat 与 /api/greeting 共用，内容不得分叉）。
+_META_HINT = (
+    "\n\n【禁止元话语】全程只以角色身份自然说话，把每句回复都当作正在发生的对话台词。"
+    "绝对禁止在回复里出现任何提示语、说明、备注、免责声明或跳出角色的总结性话语，"
+    "包括但不限于：「注：」「备注」「温馨提示」「以上内容为虚构」「请理性看待」"
+    "「作为AI」「仅供参考」「祝大家」「希望大家都能」这类内容。"
+    "不要向屏幕外的第三方喊话，不要解释自己是AI或虚拟角色，不要用『为了大家健康快乐』"
+    "这类广播式口吻收尾。你就是角色本人，把想对对方说的话说完就结束，不加任何注释。"
+)
+
+
+def _time_hint() -> str:
+    """生成「当前真实时间」显式指令，追加到 system prompt 末尾（/api/chat 与 /api/greeting 共用）。
+
+    角色引擎时间层文案埋在 persona 中段的「此刻上下文」里，模型经常视而不见、
+    顺着对话语境编造时间（如用户提过"九点后有时间"，它就猜"现在九点二十"）。
+    在 system 末尾（注意力最高的位置）显式声明唯一可信时间，并要求时间类问题以此为准。
+    """
+    try:
+        line = role_engine.build_time_context().splitlines()[0]
+    except Exception:  # noqa: BLE001
+        from datetime import datetime as _dt
+        now = _dt.now().astimezone()
+        line = f"现在是 {now.strftime('%Y-%m-%d')} {now.strftime('%H:%M')}。"
+    return (
+        f"\n\n【当前真实时间】{line}"
+        "这是系统实时时钟，是唯一可信的时间来源。当用户问任何时间/日期问题——"
+        "「现在几点」「今天几号」「星期几」「现在是白天还是晚上」等——必须严格按这个时间回答"
+        "（口语表达可四舍五入到分钟），禁止根据聊天内容、自己的安排或主观猜测去推断、编造时间；"
+        "聊到「待会儿」「晚上X点」之类的约定时，也以这个真实时间为参照，判断是还没到还是已经到了。"
+    )
+
+
+def _time_anchor(user_content: str) -> str:
+    """把当前真实时间前置到本轮用户消息前（只影响本次 LLM 调用，不动前端历史入库）。
+
+    实测：仅把时间指令放在 system 末尾，模型仍偶发被历史里的时间锚点带跑
+    （用户说过"九点后有时间" → 模型瞎猜"现在九点二十"）。当前消息是注意力
+    最高的位置，把实时时间贴着它钉死，基本杜绝编造时间。
+    """
+    try:
+        line = role_engine.build_time_context().splitlines()[0]
+    except Exception:  # noqa: BLE001
+        from datetime import datetime as _dt
+        line = f"现在是 {_dt.now().astimezone().strftime('%Y-%m-%d %H:%M')}。"
+    return f"(系统提供的当前真实时间：{line})\n{user_content}"
+
+
+# ---------------------------------------------------------------- 位置感知 --------
+# 让角色知道用户当前所在位置，与时间层同思路：系统客观事实 + 高注意力位置显式声明。
+# 位置来源优先级：手动设置（config.location.manual）> GPS 上报 > IP 自动定位（城市级）。
+# 手动设置存在 config.json（用户显式配置，跟随配置管理）；GPS/IP 结果存在 data/location.json
+# （自动/临时数据，不污染 config）。任何一步失败都静默降级，绝不影响对话主链路。
+_LOCATION_FILE = DATA_DIR / "location.json"
+# IP 定位接口（按顺序尝试，全部失败则静默降级为「位置未知」）：
+# 1) ip-api.com：免费无需 key（45 次/分钟），返回中文 regionName（如「台北市」）
+# 2) ip.useragentinfo.com：国内直连友好，返回 province/city
+_IP_LOCATE_URLS = (
+    "http://ip-api.com/json/?lang=zh-CN",
+    "https://ip.useragentinfo.com/json",
+)
+_IP_LOCATE_MAX_AGE_H = 24                              # IP 定位结果 24h 内不重复请求
+_LOCATION_DEFAULT = {
+    "version": 1,
+    "city": "",          # 城市级描述（IP 定位 / 手动补充）
+    "lat": None,         # GPS 经纬度（前端上报）
+    "lng": None,
+    "source": "",        # "ip" | "gps"
+    "ip": "",
+    "updated_at": "",
+}
+
+
+def _load_auto_location() -> dict:
+    """读取 data/location.json（自动定位结果），损坏/缺失返回默认（并尝试重置）。"""
+    try:
+        if _LOCATION_FILE.exists():
+            data = json.loads(_LOCATION_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        _log.warning("location.json load failed (%s), resetting", exc)
+    try:
+        _LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _LOCATION_FILE.write_text(
+            json.dumps(_LOCATION_DEFAULT, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    return dict(_LOCATION_DEFAULT)
+
+
+def _save_auto_location(data: dict) -> bool:
+    """原子写 data/location.json，失败返回 False 不抛异常。"""
+    try:
+        _LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _LOCATION_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(_LOCATION_FILE)
+        return True
+    except OSError as exc:
+        _log.warning("save location failed: %s", exc)
+        return False
+
+
+def _gps_text(lat: float, lng: float) -> str:
+    """经纬度 → 中文方位描述（无逆地理编码时的兜底文案）。"""
+    ns = "北纬" if lat >= 0 else "南纬"
+    ew = "东经" if lng >= 0 else "西经"
+    return f"{ns}{abs(lat):.2f}°、{ew}{abs(lng):.2f}°附近"
+
+
+def _ip_locate() -> dict:
+    """IP 自动定位（城市级）。按 _IP_LOCATE_URLS 顺序尝试，全失败返回空 dict，
+    绝不抛异常（任何主链路都不依赖它）。"""
+    for url in _IP_LOCATE_URLS:
+        try:
+            resp = httpx.get(
+                url, timeout=6.0,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            )
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("IP locate %s failed: %s", url, exc)
+            continue
+        if isinstance(data, dict) and data.get("status") not in (None, "success"):
+            continue  # ip-api 返回 status=success 才算成功
+        if not isinstance(data, dict):
+            continue
+        # 兼容两类接口字段：regionName（ip-api）/ province+city（useragentinfo）
+        region = str(data.get("regionName") or "").strip()
+        province = str(data.get("province") or "").strip()
+        city = str(data.get("city") or "").strip()
+        ip = str(data.get("query") or data.get("ip") or "").strip()
+        text = region or city or province
+        if not text:
+            continue
+        return {"city": text, "source": "ip", "ip": ip}
+    return {}
+
+
+async def _bg_ip_locate(force: bool = False) -> None:
+    """后台触发 IP 定位：已有 24h 内结果且非 force 时直接复用，不重复请求。"""
+    try:
+        if not force:
+            auto = _load_auto_location()
+            if auto.get("source") == "ip" and auto.get("city"):
+                try:
+                    updated = datetime.fromisoformat(auto["updated_at"])
+                    if (datetime.now().astimezone() - updated).total_seconds() < _IP_LOCATE_MAX_AGE_H * 3600:
+                        return  # 24h 内已有结果，不重复定位
+                except (ValueError, TypeError, KeyError):
+                    pass
+        result = await asyncio.to_thread(_ip_locate)
+        if result.get("city"):
+            result["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            _save_auto_location(result)
+            _log.info("IP located: %s", result.get("city"))
+            # 位置变了 → 天气缓存作废，后台重新拉取
+            _spawn_bg(_bg_weather_refresh(force=True))
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("bg ip locate skipped: %s", exc)
+
+
+def _location_summary() -> dict:
+    """汇总当前位置：手动（config.location.manual）优先，其次 GPS/IP 自动定位。"""
+    cfg = load_config()
+    loc_cfg = cfg.get("location") or {}
+    manual = str(loc_cfg.get("manual") or "").strip()
+    auto = _load_auto_location()
+    auto_city = str(auto.get("city") or "").strip()
+    auto_src = str(auto.get("source") or "")
+    # GPS 只有经纬度时，用方位文本兜底；有城市描述则优先城市
+    if not auto_city and auto.get("lat") is not None and auto.get("lng") is not None:
+        auto_city = _gps_text(float(auto["lat"]), float(auto["lng"]))
+        auto_src = "gps"
+    if manual:
+        effective, source = manual, "manual"
+    elif auto_city:
+        effective, source = auto_city, (auto_src or "auto")
+    else:
+        effective, source = "", ""
+    return {
+        "enabled": bool(loc_cfg.get("enabled", True)),
+        "manual": manual,
+        "auto": auto if auto_city else {},
+        "effective": effective,
+        "source": source,
+    }
+
+
+def _location_text() -> str:
+    """返回当前生效的位置描述（空串 = 位置未知，不注入）。"""
+    s = _location_summary()
+    return s["effective"] if s["enabled"] else ""
+
+
+def _location_hint() -> str:
+    """生成「用户当前所在位置」显式指令，追加到 system prompt 末尾。
+
+    与 _time_hint 同思路：位置是系统提供的唯一可信来源，放在注意力最高的位置，
+    避免模型无视中段位置层、凭对话语境瞎猜用户在哪。
+    """
+    s = _location_summary()
+    loc = s["effective"] if s["enabled"] else ""
+    if not loc:
+        return ""
+    src_map = {"manual": "手动设置", "ip": "自动定位（城市级精度）", "gps": "浏览器定位"}
+    src = src_map.get(s["source"], "系统提供")
+    return (
+        f"\n\n【用户当前所在位置】{loc}（系统提供，{src}）。"
+        "这是唯一可信的位置来源。当用户提到任何与位置有关的话题（在哪、天气、通勤、出差、"
+        "旅游、附近有什么等）时，以这个位置为参照自然回应；如果用户明确说自己换了位置，"
+        "以用户说的为准，不要与他争执，并在后续对话中记住新位置。"
+    )
+
+
+# ---------------------------------------------------------------- 天气感知 --------
+# 依赖位置感知：位置未知时不查天气。数据源 Open-Meteo（免费无 key，全球覆盖）：
+#   geocoding: https://geocoding-api.open-meteo.com/v1/search?name=城市名
+#   forecast : https://api.open-meteo.com/v1/forecast?latitude=..&longitude=..
+# 缓存 30 分钟（内存 + data/weather.json）。对话主链路只读缓存，绝不等外部 API；
+# 无缓存/过期时后台刷新，本轮先用旧值或直接不注入，任何失败静默降级。
+_WEATHER_FILE = DATA_DIR / "weather.json"
+_WEATHER_MAX_AGE_S = 30 * 60
+_WEATHER_GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
+_WEATHER_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+_weather_mem: dict = {"text": "", "ts": 0.0, "city": ""}   # 内存缓存（进程内读写快）
+
+# WMO weather code → 中文（Open-Meteo 采用 WMO 4677 编码）
+_WMO_CN = {
+    0: "晴", 1: "晴间多云", 2: "多云", 3: "阴",
+    45: "雾", 48: "雾凇",
+    51: "毛毛雨", 53: "毛毛雨", 55: "毛毛雨",
+    56: "冻毛毛雨", 57: "冻毛毛雨",
+    61: "小雨", 63: "中雨", 65: "大雨",
+    66: "冻雨", 67: "冻雨",
+    71: "小雪", 73: "中雪", 75: "大雪", 77: "雪粒",
+    80: "阵雨", 81: "阵雨", 82: "强阵雨",
+    85: "阵雪", 86: "阵雪",
+    95: "雷阵雨", 96: "雷阵雨伴冰雹", 99: "雷阵雨伴冰雹",
+}
+
+
+def _wmo_to_cn(code) -> str:
+    try:
+        return _WMO_CN.get(int(code), "天气多变")
+    except (TypeError, ValueError):
+        return "天气多变"
+
+
+def _beaufort(kmh: float) -> str:
+    """风速 km/h → 蒲福风级中文（简化分级）。"""
+    if kmh < 1:
+        return "无风"
+    if kmh < 6:
+        return "软风"
+    if kmh < 12:
+        return "轻风"
+    if kmh < 20:
+        return "微风"
+    if kmh < 29:
+        return "和风"
+    if kmh < 39:
+        return "清风"
+    if kmh < 50:
+        return "强风"
+    if kmh < 62:
+        return "疾风"
+    if kmh < 75:
+        return "大风"
+    return "烈风"
+
+
+def _wind_dir(deg) -> str:
+    """风向角度 → 八方位中文。"""
+    dirs = ["北风", "东北风", "东风", "东南风", "南风", "西南风", "西风", "西北风"]
+    try:
+        return dirs[int((float(deg) + 22.5) // 45) % 8]
+    except (TypeError, ValueError):
+        return "风"
+
+
+def _weather_enabled() -> bool:
+    """config.location.weather 开关，默认开启。"""
+    try:
+        cfg = load_config()
+        return bool((cfg.get("location") or {}).get("weather", True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _load_weather_cache() -> dict:
+    try:
+        if _WEATHER_FILE.exists():
+            d = json.loads(_WEATHER_FILE.read_text(encoding="utf-8"))
+            if isinstance(d, dict) and d.get("text"):
+                return d
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        _log.debug("weather.json load failed: %s", exc)
+    return {"text": "", "ts": 0.0, "city": ""}
+
+
+def _save_weather_cache(d: dict) -> None:
+    try:
+        _WEATHER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _WEATHER_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(_WEATHER_FILE)
+    except OSError as exc:
+        _log.debug("weather cache save failed: %s", exc)
+
+
+def _weather_snapshot() -> dict:
+    """读天气缓存：内存优先，miss 读文件。返回 {text, ts, city}。"""
+    if _weather_mem.get("text"):
+        return dict(_weather_mem)
+    d = _load_weather_cache()
+    if d.get("text"):
+        _weather_mem.update(d)
+    return d
+
+
+# 中国主要城市经纬度表（天气查询用，精确到 ~0.01° 足够）。
+# 内置表避免依赖 geocoding 接口对中文名的不稳定匹配（实测 Open-Meteo 对「深圳市」
+# 这类带后缀中文名时有时无）；表外城市再走 geocoding 兜底。
+_CITY_CN: dict[str, tuple[float, float]] = {
+    "北京": (39.90, 116.41), "上海": (31.23, 121.47), "天津": (39.34, 117.36),
+    "重庆": (29.56, 106.55),
+    "深圳": (22.54, 114.06), "广州": (23.13, 113.26), "佛山": (23.02, 113.12),
+    "东莞": (23.02, 113.75), "珠海": (22.27, 113.58), "惠州": (23.11, 114.42),
+    "中山": (22.52, 113.39), "江门": (22.58, 113.08), "肇庆": (23.05, 112.47),
+    "汕头": (23.35, 116.68), "湛江": (21.27, 110.36), "茂名": (21.66, 110.93),
+    "韶关": (24.81, 113.60), "清远": (23.68, 113.06), "梅州": (24.29, 116.12),
+    "河源": (23.74, 114.70), "阳江": (21.86, 111.98), "揭阳": (23.55, 116.37),
+    "潮州": (23.66, 116.62), "汕尾": (22.79, 115.37), "云浮": (22.92, 112.04),
+    "成都": (30.57, 104.07), "绵阳": (31.47, 104.68), "德阳": (31.13, 104.40),
+    "乐山": (29.55, 103.77), "宜宾": (28.75, 104.64), "南充": (30.84, 106.11),
+    "泸州": (28.87, 105.44), "内江": (29.58, 105.06), "自贡": (29.34, 104.78),
+    "达州": (31.21, 107.47), "遂宁": (30.51, 105.57), "眉山": (30.05, 103.85),
+    "广元": (32.44, 105.84), "广安": (30.46, 106.63), "巴中": (31.87, 106.75),
+    "雅安": (30.01, 103.04), "资阳": (30.13, 104.63), "攀枝花": (26.58, 101.72),
+    "武汉": (30.59, 114.31), "宜昌": (30.69, 111.29), "襄阳": (32.01, 112.12),
+    "荆州": (30.33, 112.24), "黄石": (30.20, 115.04), "十堰": (32.63, 110.79),
+    "孝感": (30.92, 113.92), "荆门": (31.04, 112.20), "鄂州": (30.39, 114.89),
+    "黄冈": (30.45, 114.87), "咸宁": (29.84, 114.32), "随州": (31.69, 113.38),
+    "恩施": (30.27, 109.49), "仙桃": (30.36, 113.45), "潜江": (30.40, 112.90),
+    "天门": (30.66, 113.17), "神农架": (31.74, 110.68),
+    "长沙": (28.23, 112.94), "株洲": (27.83, 113.13), "湘潭": (27.83, 112.94),
+    "衡阳": (26.89, 112.57), "岳阳": (29.36, 113.13), "常德": (29.03, 111.70),
+    "郴州": (25.77, 113.01), "娄底": (27.70, 111.99), "邵阳": (27.24, 111.47),
+    "益阳": (28.55, 112.36), "张家界": (29.12, 110.48), "怀化": (27.55, 109.98),
+    "永州": (26.42, 111.61), "湘西": (28.31, 109.74),
+    "杭州": (30.27, 120.16), "宁波": (29.87, 121.54), "温州": (27.99, 120.70),
+    "嘉兴": (30.75, 120.76), "湖州": (30.89, 120.09), "绍兴": (30.03, 120.58),
+    "金华": (29.08, 119.65), "衢州": (28.94, 118.87), "舟山": (30.02, 122.21),
+    "台州": (28.66, 121.42), "丽水": (28.45, 119.92),
+    "南京": (32.06, 118.80), "苏州": (31.30, 120.59), "无锡": (31.49, 120.31),
+    "常州": (31.81, 119.97), "南通": (31.98, 120.89), "扬州": (32.39, 119.41),
+    "镇江": (32.19, 119.42), "泰州": (32.46, 119.92), "盐城": (33.35, 120.16),
+    "淮安": (33.61, 119.02), "连云港": (34.60, 119.22), "徐州": (34.20, 117.28),
+    "宿迁": (33.96, 118.28),
+    "西安": (34.34, 108.94), "咸阳": (34.33, 108.71), "宝鸡": (34.36, 107.24),
+    "渭南": (34.50, 109.51), "延安": (36.59, 109.49), "汉中": (33.07, 107.02),
+    "榆林": (38.29, 109.73), "安康": (32.68, 109.03), "商洛": (33.87, 109.94),
+    "郑州": (34.75, 113.63), "洛阳": (34.62, 112.45), "开封": (34.80, 114.31),
+    "新乡": (35.30, 113.93), "南阳": (33.00, 112.53), "许昌": (34.04, 113.85),
+    "平顶山": (33.77, 113.19), "信阳": (32.15, 114.09), "安阳": (36.10, 114.39),
+    "焦作": (35.22, 113.24), "濮阳": (35.76, 115.03), "漯河": (33.58, 114.02),
+    "商丘": (34.41, 115.66), "周口": (33.63, 114.70), "驻马店": (33.01, 114.02),
+    "济南": (36.65, 117.12), "青岛": (36.07, 120.38), "烟台": (37.46, 121.45),
+    "潍坊": (36.71, 119.16), "淄博": (36.81, 118.05), "济宁": (35.42, 116.59),
+    "临沂": (35.10, 118.36), "泰安": (36.20, 117.09), "威海": (37.51, 122.12),
+    "德州": (37.44, 116.36), "聊城": (36.46, 115.99), "滨州": (37.38, 117.97),
+    "菏泽": (35.23, 115.48), "东营": (37.43, 118.67), "枣庄": (34.81, 117.32),
+    "日照": (35.42, 119.53),
+    "沈阳": (41.81, 123.43), "大连": (38.91, 121.61), "鞍山": (41.11, 122.99),
+    "抚顺": (41.88, 123.96), "本溪": (41.29, 123.77), "丹东": (40.12, 124.38),
+    "锦州": (41.10, 121.13), "营口": (40.67, 122.24), "阜新": (42.02, 121.67),
+    "辽阳": (41.27, 123.24), "盘锦": (41.12, 122.07), "铁岭": (42.22, 123.84),
+    "朝阳": (41.58, 120.45), "葫芦岛": (40.71, 120.84),
+    "长春": (43.82, 125.32), "吉林": (43.84, 126.55), "四平": (43.17, 124.35),
+    "辽源": (42.89, 125.14), "通化": (41.73, 125.94), "白山": (41.94, 126.42),
+    "松原": (45.14, 124.83), "白城": (45.62, 122.84), "延边": (42.89, 129.51),
+    "哈尔滨": (45.80, 126.53), "齐齐哈尔": (47.35, 123.92), "牡丹江": (44.55, 129.63),
+    "佳木斯": (46.80, 130.32), "大庆": (46.59, 125.10), "绥化": (46.65, 126.99),
+    "鸡西": (45.30, 130.97), "双鸭山": (46.64, 131.16), "伊春": (47.73, 128.84),
+    "七台河": (45.77, 131.00), "鹤岗": (47.35, 130.30), "黑河": (50.25, 127.53),
+    "大兴安岭": (51.92, 124.11),
+    "石家庄": (38.04, 114.51), "唐山": (39.63, 118.18), "秦皇岛": (39.94, 119.60),
+    "邯郸": (36.63, 114.54), "邢台": (37.07, 114.50), "保定": (38.87, 115.46),
+    "张家口": (40.77, 114.88), "承德": (40.95, 117.96), "沧州": (38.30, 116.84),
+    "廊坊": (39.54, 116.68), "衡水": (37.74, 115.67),
+    "太原": (37.87, 112.55), "大同": (40.08, 113.30), "阳泉": (37.86, 113.58),
+    "长治": (36.20, 113.12), "晋城": (35.49, 112.85), "朔州": (39.33, 112.43),
+    "晋中": (37.69, 112.75), "运城": (35.03, 111.01), "忻州": (38.42, 112.73),
+    "临汾": (36.09, 111.52), "吕梁": (37.52, 111.14),
+    "呼和浩特": (40.84, 111.75), "包头": (40.66, 109.84), "乌海": (39.65, 106.79),
+    "赤峰": (42.26, 118.89), "通辽": (43.65, 122.24), "鄂尔多斯": (39.61, 109.78),
+    "呼伦贝尔": (49.21, 119.77), "巴彦淖尔": (40.74, 107.39), "乌兰察布": (40.99, 113.13),
+    "兴安盟": (46.08, 122.07), "锡林郭勒": (43.94, 116.05), "阿拉善": (38.85, 105.73),
+    "昆明": (24.88, 102.83), "曲靖": (25.49, 103.80), "玉溪": (24.35, 102.55),
+    "保山": (25.12, 99.17), "昭通": (27.34, 103.72), "丽江": (26.86, 100.23),
+    "普洱": (22.83, 100.97), "临沧": (23.89, 100.09), "楚雄": (25.04, 101.55),
+    "红河": (23.37, 103.38), "文山": (23.37, 104.24), "西双版纳": (22.01, 100.80),
+    "大理": (25.61, 100.27), "德宏": (24.43, 98.59), "怒江": (25.85, 98.85),
+    "迪庆": (27.82, 99.71),
+    "贵阳": (26.65, 106.63), "遵义": (27.73, 106.93), "六盘水": (26.59, 104.83),
+    "安顺": (26.25, 105.95), "毕节": (27.30, 105.28), "铜仁": (27.73, 109.19),
+    "黔西南": (25.09, 104.90), "黔东南": (26.58, 107.98), "黔南": (26.25, 107.52),
+    "南宁": (22.82, 108.37), "柳州": (24.33, 109.43), "桂林": (25.27, 110.29),
+    "梧州": (23.48, 111.28), "北海": (21.48, 109.12), "防城港": (21.69, 108.35),
+    "钦州": (21.98, 108.65), "贵港": (23.11, 109.60), "玉林": (22.63, 110.18),
+    "百色": (23.90, 106.62), "贺州": (24.40, 111.57), "河池": (24.70, 108.09),
+    "来宾": (23.75, 109.22), "崇左": (22.38, 107.36),
+    "海口": (20.04, 110.20), "三亚": (18.25, 109.51), "儋州": (19.52, 109.58),
+    "琼海": (19.26, 110.47), "文昌": (19.61, 110.75), "万宁": (18.80, 110.39),
+    "东方": (19.10, 108.65), "五指山": (18.78, 109.52), "临高": (19.91, 109.69),
+    "澄迈": (19.74, 110.01), "定安": (19.70, 110.36), "屯昌": (19.35, 110.10),
+    "陵水": (18.51, 110.04), "昌江": (19.30, 109.06), "白沙": (19.22, 109.45),
+    "琼中": (19.03, 109.84), "保亭": (18.64, 109.70), "乐东": (18.75, 109.17),
+    "合肥": (31.82, 117.23), "芜湖": (31.35, 118.43), "蚌埠": (32.92, 117.39),
+    "淮南": (32.63, 117.02), "马鞍山": (31.67, 118.51), "淮北": (33.96, 116.80),
+    "铜陵": (30.95, 117.81), "安庆": (30.54, 117.06), "黄山": (29.71, 118.34),
+    "滁州": (32.30, 118.32), "阜阳": (32.89, 115.81), "宿州": (33.65, 116.96),
+    "六安": (31.74, 116.51), "亳州": (33.85, 115.78), "池州": (30.66, 117.49),
+    "宣城": (30.94, 118.76),
+    "福州": (26.07, 119.30), "厦门": (24.48, 118.09), "莆田": (25.45, 119.01),
+    "三明": (26.26, 117.64), "泉州": (24.87, 118.68), "漳州": (24.51, 117.65),
+    "南平": (26.64, 118.18), "龙岩": (25.08, 117.02), "宁德": (26.67, 119.55),
+    "南昌": (28.68, 115.86), "景德镇": (29.27, 117.18), "萍乡": (27.62, 113.85),
+    "九江": (29.71, 116.00), "新余": (27.82, 114.92), "鹰潭": (28.26, 117.07),
+    "赣州": (25.83, 114.94), "吉安": (27.11, 114.99), "宜春": (27.80, 114.42),
+    "抚州": (27.98, 116.36), "上饶": (28.45, 117.94),
+    "兰州": (36.06, 103.83), "嘉峪关": (39.77, 98.29), "金昌": (38.52, 102.19),
+    "白银": (36.55, 104.14), "天水": (34.58, 105.72), "武威": (37.93, 102.64),
+    "张掖": (38.93, 100.45), "平凉": (35.54, 106.66), "酒泉": (39.73, 98.49),
+    "庆阳": (35.71, 107.64), "定西": (35.58, 104.63), "陇南": (33.39, 104.93),
+    "临夏": (35.60, 103.21), "甘南": (34.98, 102.91),
+    "西宁": (36.62, 101.78), "海东": (36.50, 102.10), "海北": (36.95, 100.90),
+    "黄南": (35.52, 102.02), "海南": (36.28, 100.62), "果洛": (34.47, 100.24),
+    "玉树": (33.00, 97.01), "海西": (37.37, 97.37),
+    "银川": (38.49, 106.23), "石嘴山": (38.98, 106.38), "吴忠": (37.99, 106.20),
+    "固原": (36.01, 106.24), "中卫": (37.50, 105.19),
+    "乌鲁木齐": (43.83, 87.62), "克拉玛依": (45.58, 84.89), "吐鲁番": (42.95, 89.19),
+    "哈密": (42.83, 93.51), "昌吉": (44.01, 87.31), "博尔塔拉": (44.91, 82.07),
+    "巴音郭楞": (41.76, 86.15), "阿克苏": (41.17, 80.26), "克孜勒苏": (39.71, 76.17),
+    "喀什": (39.47, 75.99), "和田": (37.11, 79.92), "伊犁": (43.92, 81.28),
+    "塔城": (46.75, 82.98), "阿勒泰": (47.84, 88.14), "石河子": (44.31, 86.08),
+    "拉萨": (29.65, 91.14), "日喀则": (29.27, 88.88), "昌都": (31.14, 97.17),
+    "林芝": (29.65, 94.36), "山南": (29.24, 91.77), "那曲": (31.48, 92.05),
+    "阿里": (32.50, 80.11),
+    "香港": (22.32, 114.17), "澳门": (22.20, 113.54), "台北": (25.03, 121.57),
+    "高雄": (22.62, 120.31), "台中": (24.15, 120.67), "台南": (22.99, 120.21),
+    "新北": (25.01, 121.47), "桃园": (24.99, 121.30), "新竹": (24.81, 120.97),
+    "基隆": (25.13, 121.74), "嘉义": (23.48, 120.45),
+}
+
+
+def _city_candidates(city: str) -> list[str]:
+    """把位置文本拆成 geocoding/内置表候选名（去重保序）：
+    「广东省深圳市南山区」→ [原样, 深圳市南山区, 深圳市南山, 深圳]
+    链式剥离「省」前缀与「市/区/县」等行政后缀，每剥一层生成一个候选，
+    保证「广东省深圳市」这种组合名最终能落到「深圳」这个核心城市名。"""
+    c = (city or "").strip()
+    out: list[str] = []
+
+    def _push(x: str) -> None:
+        x = (x or "").strip()
+        if x and x not in out:
+            out.append(x)
+
+    _push(c)
+    cur = c
+    for _ in range(6):  # 最多链式剥离 6 层，防死循环
+        m = re.search(r"[^省]+省(.+)$", cur)
+        if m:
+            cur = m.group(1)
+            _push(cur)
+            continue
+        changed = False
+        for suf in ("特别行政区", "自治州", "自治县", "地区", "盟", "县", "区", "市"):
+            if cur.endswith(suf) and len(cur) > len(suf):
+                cur = cur[:-len(suf)]
+                _push(cur)
+                changed = True
+                break
+        if not changed:
+            break
+    # 兜底：从省前缀之后的串开头提取「X市」核心名（「深圳市南山区」→「深圳」）。
+    # 用 match 而非 finditer：finditer 会从任意位置抓出「东省深圳」这种垃圾候选。
+    core_src = c
+    m2 = re.search(r"[^省]+省(.+)$", c)
+    if m2:
+        core_src = m2.group(1)
+    m3 = re.match(r"([\u4e00-\u9fff]{2,6}?)(?:市|自治州|地区)", core_src)
+    if m3:
+        _push(m3.group(1))
+    return out
+
+
+def _geo_city(city: str) -> tuple[float, float] | None:
+    """城市名 → (lat, lng)。先查内置城市表（快且稳），未命中再走 Open-Meteo
+    geocoding 兜底（中文匹配不稳，失败返回 None，绝不抛异常）。"""
+    cands = _city_candidates(city)
+    # 1) 内置表：覆盖中国主要城市，瞬间命中，零外部依赖
+    for name in cands:
+        if name in _CITY_CN:
+            return _CITY_CN[name]
+    # 2) geocoding 兜底：依次尝试候选名，网络错误重试一次
+    for name in cands:
+        for _attempt in range(2):
+            try:
+                resp = httpx.get(
+                    _WEATHER_GEO_URL,
+                    params={"name": name, "count": 1, "language": "zh"},
+                    timeout=6.0, headers={"User-Agent": "Mozilla/5.0"},
+                )
+                results = (resp.json() or {}).get("results") or []
+                if results:
+                    return float(results[0]["latitude"]), float(results[0]["longitude"])
+                break  # 接口正常但无结果 → 换下一个候选名
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("geocoding %s failed: %s", name, exc)
+                continue  # 网络抖动 → 重试
+    return None
+
+
+def _fetch_weather(city: str, lat: float | None, lng: float | None) -> str:
+    """同步获取天气文案（如「多云，24°C，体感23°C，东南风3级，湿度65%」）。
+    全失败返回空串，绝不抛异常。"""
+    if lat is None or lng is None:
+        if not city:
+            return ""
+        pos = _geo_city(city)
+        if not pos:
+            return ""
+        lat, lng = pos
+    for _attempt in range(2):  # forecast 网络抖动重试一次
+        try:
+            resp = httpx.get(
+                _WEATHER_FORECAST_URL,
+                params={
+                    "latitude": lat, "longitude": lng,
+                    "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                               "weather_code,wind_speed_10m,wind_direction_10m",
+                    "timezone": "auto",
+                },
+                timeout=8.0, headers={"User-Agent": "Mozilla/5.0"},
+            )
+            cur = (resp.json() or {}).get("current") or {}
+            if not cur:
+                continue
+            parts = [_wmo_to_cn(cur.get("weather_code"))]
+            t = cur.get("temperature_2m")
+            if t is not None:
+                parts.append(f"{t:.0f}°C")
+            at = cur.get("apparent_temperature")
+            if at is not None:
+                parts.append(f"体感{at:.0f}°C")
+            ws = cur.get("wind_speed_10m")
+            if ws is not None:
+                parts.append(f"{_wind_dir(cur.get('wind_direction_10m'))}{_beaufort(ws)}")
+            h = cur.get("relative_humidity_2m")
+            if h is not None:
+                parts.append(f"湿度{h:.0f}%")
+            return "，".join(parts)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("weather fetch failed (attempt %s): %s", _attempt, exc)
+            continue
+    return ""
+
+
+async def _bg_weather_refresh(force: bool = False) -> str:
+    """后台刷新天气缓存。位置未知时跳过。返回新文案（可能为空串）。"""
+    try:
+        if not force:
+            snap = _weather_snapshot()
+            s_loc = _location_summary()
+            cur_city = s_loc["effective"] if s_loc["enabled"] else ""
+            if (snap.get("text") and snap.get("city") == cur_city
+                    and (time.time() - float(snap.get("ts", 0))) < _WEATHER_MAX_AGE_S):
+                return snap["text"]  # 30 分钟内且城市未变 → 直接用缓存
+        if not _weather_enabled():
+            return ""
+        s = _location_summary()
+        city = s["effective"] if s["enabled"] else ""
+        if not city:
+            return ""
+        auto = s.get("auto") or {}
+        text = await asyncio.to_thread(
+            _fetch_weather, city, auto.get("lat"), auto.get("lng"))
+        if text:
+            d = {"text": text, "ts": time.time(), "city": city}
+            _weather_mem.update(d)
+            _save_weather_cache(d)
+        return text
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("bg weather refresh skipped: %s", exc)
+        return ""
+
+
+def _weather_text() -> str:
+    """返回当前天气文案（可能来自过期缓存，绝不阻塞）。无缓存/过期时后台触发刷新。"""
+    if not _weather_enabled():
+        return ""
+    snap = _weather_snapshot()
+    if snap.get("text"):
+        if (time.time() - float(snap.get("ts", 0))) >= _WEATHER_MAX_AGE_S:
+            _spawn_bg(_bg_weather_refresh(force=True))  # 过期 → 后台刷新，本轮先用旧值
+        return snap["text"]
+    _spawn_bg(_bg_weather_refresh())
+    return ""
+
+
+def _weather_hint() -> str:
+    """生成「用户所在位置天气」显式指令，追加到 system prompt 末尾（与位置指令相邻）。"""
+    text = _weather_text()
+    if not text:
+        return ""
+    return (
+        f"\n\n【用户所在位置天气】{text}（系统查询的真实天气，非推测）。"
+        "当用户问天气、要不要带伞、穿什么、冷不冷热不热时，以这个天气为参照自然回答；"
+        "如果用户说自己在别的地方，以用户说的为准。"
+    )
+
+
+# ---------------------------------------------------------------- 角色自况 --------
+# 让角色知道自己「此刻在哪、最近在忙什么」（第一视角，与用户位置方向相反）。
+# 配置在 roles.{key}.self 下：location=角色所在位置，recent=最近动态。
+# 空配置不注入；与时间层日程互补（日程是「今天星期几干什么」，自况是「最近这段时间在忙什么」）。
+def _self_config(cfg: dict) -> tuple[str, str]:
+    """返回当前角色的 (self_location, self_recent)，未配置返回空串。"""
+    role = cfg.get("active_role", "")
+    self_cfg = ((cfg.get("roles") or {}).get(role) or {}).get("self") or {}
+    return (str(self_cfg.get("location") or "").strip(),
+            str(self_cfg.get("recent") or "").strip())
+
+
+def _self_hint() -> str:
+    """生成「你此刻在哪、在忙什么」显式指令，追加到 system prompt 末尾。
+
+    角色容易顺着对话语境瞎编自己的行程（如"我刚打完训练赛"），自况层给出
+    系统配置的唯一可信近况，问「你在哪/最近干嘛」时以此为准。
+    """
+    cfg = load_config()
+    loc, rec = _self_config(cfg)
+    parts = []
+    if loc:
+        parts.append(f"你此刻在{loc}")
+    if rec:
+        parts.append(f"最近在忙：{rec}")
+    if not parts:
+        return ""
+    base = "。".join(parts) + "。"
+    return (
+        f"\n\n【你此刻在哪里、在忙什么】{base}"
+        "这是系统配置的你当前的真实状态。当用户问你在哪、在干嘛、最近忙什么、"
+        "接下来有什么安排时，以这个为准自然回答；用户说了与你相关的安排时，"
+        "以用户说的为准并记住。"
+    )
+
+
+# ---------------------------------------------------------------- 角色现实动态 --------
+# 「现实世界的那种」：不是写死的扮演设定，而是联网搜索到的真实最新动态——
+# 大帅（成都AG超玩会·孟家俊）最近在忙什么、现在可能在哪（比赛/训练/基地）。
+# 流程：web_search 抓取最新资料 → LLM 总结成 2-3 句 → 缓存 12h（data/role_news.json）。
+# 对话主链路只读缓存，刷新全部后台执行；无配置/无结果/任何失败都静默降级，绝不阻塞。
+_ROLE_NEWS_FILE = DATA_DIR / "role_news.json"
+_ROLE_NEWS_MAX_AGE_S = 12 * 3600
+_ROLE_NEWS_DEFAULT = {"version": 1, "role": "", "keyword": "", "text": "", "ts": 0.0}
+
+
+def _role_news_config(cfg: dict | None = None) -> tuple[str, str]:
+    """返回当前角色的 (keyword, role_name)。未配置返回空串。"""
+    cfg = cfg or load_config()
+    role = cfg.get("active_role", "")
+    role_cfg = (cfg.get("roles") or {}).get(role) or {}
+    news = role_cfg.get("news") or {}
+    if not news.get("enabled", True) or not str(news.get("keyword") or "").strip():
+        return "", ""
+    return str(news["keyword"]).strip(), str(role_cfg.get("name") or role)
+
+
+def _load_role_news() -> dict:
+    try:
+        if _ROLE_NEWS_FILE.exists():
+            d = json.loads(_ROLE_NEWS_FILE.read_text(encoding="utf-8"))
+            if isinstance(d, dict) and d.get("text"):
+                return d
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        _log.debug("role_news.json load failed: %s", exc)
+    return dict(_ROLE_NEWS_DEFAULT)
+
+
+def _save_role_news(d: dict) -> None:
+    try:
+        _ROLE_NEWS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _ROLE_NEWS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(_ROLE_NEWS_FILE)
+    except OSError as exc:
+        _log.debug("role_news save failed: %s", exc)
+
+
+def _rule_news_summary(keyword: str, results: list[dict]) -> str:
+    """LLM 不可用时的规则兜底：拼接标题/摘要，最多保留 200 字。"""
+    parts = []
+    for r in results[:5]:
+        t = (r.get("title") or "").strip()
+        s = (r.get("snippet") or "").strip()
+        parts.append(t or s)
+    text = "；".join([p for p in parts if p])
+    return text[:200]
+
+
+async def _summarize_role_news(keyword: str, role_name: str, results: list[dict]) -> str:
+    """用 LLM 把搜索结果总结成 2-3 句现实动态（含位置推断）。失败返回空串走规则兜底。"""
+    try:
+        system = (
+            "你是信息摘要助手。根据下面搜索到的资料，总结这个人/战队「最近在忙什么、"
+            "现在可能在哪里（哪个城市/基地/场馆）」。只输出 2-3 句简洁中文，"
+            "优先使用资料里的最新信息，资料里没有的不要编造，不要罗列链接，不要用\"据报道\"之类套话。"
+        )
+        prompt = f"对象：{role_name}\n搜索关键词：{keyword}\n\n资料：\n{_format_search_feedback(keyword, results)}"
+        raw = await llm_chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": prompt}],
+            temperature=0.3, max_tokens=260, disable_thinking=True,
+        )
+        text = _strip_meta_notes(raw or "").strip().strip("【】\"'「」")
+        return text[:300] if text else ""
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("summarize role news failed: %s", exc)
+        return ""
+
+
+async def _bg_role_news_refresh(force: bool = False) -> str:
+    """后台刷新角色现实动态。返回新文案（可能为空串）。"""
+    try:
+        keyword, role_name = _role_news_config()
+        if not keyword:
+            return ""
+        if not force:
+            snap = _load_role_news()
+            if (snap.get("text") and snap.get("keyword") == keyword
+                    and (time.time() - float(snap.get("ts", 0))) < _ROLE_NEWS_MAX_AGE_S):
+                return snap["text"]  # 12h 内同关键词 → 直接用缓存
+        # 先按「最新动态」搜，再按关键词本身兜底
+        results = await web_search(f"{keyword} 最新 动态 比赛 训练", None)
+        if not results:
+            results = await web_search(keyword, None)
+        if not results:
+            _log.debug("role news search empty: %s", keyword)
+            return ""
+        text = await _summarize_role_news(keyword, role_name, results)
+        if not text:
+            text = _rule_news_summary(keyword, results)
+        if text:
+            d = {"version": 1, "role": role_name, "keyword": keyword,
+                 "text": text, "ts": time.time()}
+            _save_role_news(d)
+        return text
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("bg role news refresh skipped: %s", exc)
+        return ""
+
+
+def _role_news_text() -> str:
+    """返回当前角色现实动态文案（缓存优先，过期后台刷新，绝不阻塞）。"""
+    keyword, _ = _role_news_config()
+    if not keyword:
+        return ""
+    snap = _load_role_news()
+    if snap.get("text") and snap.get("keyword") == keyword:
+        if (time.time() - float(snap.get("ts", 0))) >= _ROLE_NEWS_MAX_AGE_S:
+            _spawn_bg(_bg_role_news_refresh(force=True))
+        return snap["text"]
+    _spawn_bg(_bg_role_news_refresh())
+    return ""
+
+
+def _role_news_hint() -> str:
+    """生成「你最近在忙什么（现实动态）」显式指令，追加到 system prompt 末尾。"""
+    text = _role_news_text()
+    if not text:
+        return ""
+    return (
+        f"\n\n【你最近的现实动态】{text}"
+        "这是通过联网搜索得到的最新真实信息。当用户问你在哪、最近在忙什么、"
+        "比赛/训练/直播近况时，以这个为准自然回答，不要编造动态；"
+        "如果用户提到你更新的消息，以用户说的为准。"
+    )
+
+# 模型偶发在回复里追加「元话语」行（免责/虚构声明、跳出角色的系统式提示、面向第三方的总结），
+# 与正文无关且会被 TTS 朗读，统一按「整行」剥离：行首是 注/备注/温馨提示/提示/说明/PS 的整行，
+# 或包含免责/虚构/跳出角色关键词的短行（≤120 字）。只删整行，绝不动正文，避免误伤台词。
+_META_LINE_START_RE = re.compile(r"^(?:注|备注|温馨提示|提示|说明|PS|p\.s\.)[:：]", re.I)
+_META_LINE_KW_RE = re.compile(
+    r"虚构演绎|虚构内容|纯属虚构|虚拟演绎|理性看待|请理性|免责声明|仅供参考|仅供娱乐|"
+    r"作为AI|作为一个人工智能|作为智能助手|作为虚拟|AI助手|AI 助手|"
+    r"科学作息|健康睡眠|性别认知|的行为准则|希望大家|祝愿大家|祝大家|祝每位|"
+    r"这是我在扮演|扮演.*?提醒自己"
+)
+
+
+def _strip_meta_notes(text: str) -> str:
+    """剥离模型偶发追加的元话语（/api/chat 与 /api/greeting 共用兜底）。"""
+    if not text:
+        return text
+    kept: list[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            kept.append(ln)
+            continue
+        if _META_LINE_START_RE.match(s) or (len(s) <= 120 and _META_LINE_KW_RE.search(s)):
+            continue
+        kept.append(ln)
+    out = "\n".join(kept)
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
 
 def parse_style_prefix(text: str, fallback: str = "") -> tuple[str, str]:
     """从 LLM 输出中拆出 (style, reply)。
@@ -396,11 +1406,14 @@ def parse_style_prefix(text: str, fallback: str = "") -> tuple[str, str]:
     return style, reply.strip()
 
 
-def _clean_history(history: list[dict], current: str) -> list[dict]:
+def _clean_history(history: list[dict], current: str, clip_long_replies: bool = True) -> list[dict]:
     """压缩发送给模型的历史：折叠连续重复、去掉空消息、规整旧回复里的 style 标记。
 
     旧版前端曾把同一条用户消息 push 后整体发送，sessions 里因此残留连续重复；
-    这些重复会让小模型把同一句当成两条输入，更容易机械复读。"""
+    这些重复会让小模型把同一句当成两条输入，更容易机械复读。
+
+    clip_long_replies：是否截断超长的历史 assistant 回复。仅本地模型需要
+    （-c 8192 装不下上万字全文）；云端模型上下文窗口大，全文保留更利于追问。"""
     cleaned: list[dict] = []
     current = (current or "").strip()
     for m in history[-20:]:
@@ -410,6 +1423,10 @@ def _clean_history(history: list[dict], current: str) -> list[dict]:
             continue
         if role == "assistant":
             _, content = parse_style_prefix(content)
+            # 上一轮的长文（2000/10000 字）若全文回填会撑爆上下文（本地仅 -c 8192），
+            # 只保留首尾，让模型知道「上文写过什么」即可；云端窗口大，不截断
+            if clip_long_replies and len(content) > 1600:
+                content = content[:1000] + "\n……（中间内容省略）……\n" + content[-300:]
         if not content:
             continue
         if cleaned and cleaned[-1]["role"] == role and cleaned[-1]["content"] == content:
@@ -523,6 +1540,14 @@ def _voice_fingerprint(cfg: dict) -> str:
         # 阿里云音色/模型在子配置里，必须进 cache_key，否则换音色缓存不失效
         a = voice.get("aliyun", {})
         base_parts += [str(a.get("model", "")), str(a.get("voice", ""))]
+    elif voice.get("provider") == "minimax":
+        a = voice.get("minimax", {})
+        # 采样参数进指纹：调 speed/vol/pitch/sample_rate 后旧缓存自动失效
+        base_parts += [
+            str(a.get("model", "")), str(a.get("voice", "")),
+            str(a.get("speed", "")), str(a.get("vol", "")),
+            str(a.get("pitch", "")), str(a.get("sample_rate", "")),
+        ]
     cache_key = "|".join(base_parts)
 
     # 收集参考文件的 stat 快照，对比缓存看是否命中
@@ -608,6 +1633,48 @@ async def _maybe_cleanup_tts_cache(force: bool = False) -> None:
             _log.info("tts cache cleanup: removed %d files (%d bytes)", removed, bytes_removed)
 
 
+# 上传附件保留天数：att_* 文件没有任何 LRU 清理（TTS 缓存有），
+# 长期运行会无限堆积；超过保留期（按最近访问时间）的附件定期删除。
+_UPLOAD_RETENTION_DAYS = 7.0
+_UPLOAD_CLEAN_INTERVAL = 6 * 3600.0
+
+
+def _scan_expired_uploads() -> list[Path]:
+    """同步扫描过期附件（由 asyncio.to_thread 调用）。"""
+    cutoff = time.time() - _UPLOAD_RETENTION_DAYS * 86400
+    expired: list[Path] = []
+    for p in UPLOAD_DIR.iterdir():
+        if not p.is_file() or not p.name.startswith("att_"):
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        # Windows NTFS 默认不更新 atime，mtime 兜底
+        if max(st.st_atime, st.st_mtime) < cutoff:
+            expired.append(p)
+    return expired
+
+
+async def _uploads_cleanup_loop() -> None:
+    """后台循环：清理长期未访问的上传附件，防止 uploads 目录打满磁盘。"""
+    while True:
+        await asyncio.sleep(_UPLOAD_CLEAN_INTERVAL)
+        try:
+            expired = await asyncio.to_thread(_scan_expired_uploads)
+            removed = 0
+            for p in expired:
+                try:
+                    p.unlink()
+                    removed += 1
+                except OSError as exc:
+                    _log.warning("upload cleanup failed %s: %s", p, exc)
+            if removed:
+                _log.info("upload cleanup: removed %d expired attachments", removed)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("upload cleanup loop error: %s", exc)
+
+
 def tts_cache_path(text: str, style: str, cfg: dict) -> Path:
     """TTS 缓存 key 不含 speed — 语速由前端 Audio.playbackRate 控制，
     原速 1.0 合成一次即可复用所有语速，缓存体积大幅下降。"""
@@ -651,6 +1718,14 @@ async def lifespan(app: FastAPI):
     _refresh_tts_cache_limits()
     # 启动时后台触发一次 TTS 缓存清理（force 跳过间隔检查，不阻塞启动）
     _spawn_bg(_maybe_cleanup_tts_cache(force=True))
+    # 上传附件没有 LRU，靠后台循环按保留天数清理，防磁盘无限增长
+    _spawn_bg(_uploads_cleanup_loop())
+    # 启动时后台自动 IP 定位一次（用户位置供角色感知；失败静默，不影响启动）
+    _spawn_bg(_bg_ip_locate())
+    # 启动时后台预取一次天气（位置未知时自动跳过，等 IP 定位成功后再触发）
+    _spawn_bg(_bg_weather_refresh())
+    # 启动时后台预取一次角色现实动态（有 news 关键词才生效）
+    _spawn_bg(_bg_role_news_refresh())
     yield
     # 关闭：先等后台任务收尾（上限 5s），再关 httpx 连接池
     if _bg_tasks:
@@ -661,15 +1736,238 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="AI 拟人系统", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    # 只放行本服务自身来源（含 file:// 打开页面的 null Origin），不再允许任意跨域
-    allow_origins=["http://127.0.0.1:8000", "http://localhost:8000", "null"],
+    # 已启用访问口令保护（见下方 access_gate 中间件），可安全放开跨域；
+    # 页面与 API 同源访问时不受影响，口令校验兜底。
+    allow_origins=["*"],
     allow_methods=["*"], allow_headers=["*"],
 )
+
+
+# ------------------------------------------------------------ 访问口令 --------
+# 通过 Cloudflare Tunnel / 局域网访问时，所有页面与 API 均需口令。
+# 配置方式（二选一，优先前者）：config.json 顶层 "access_token"，或环境变量 ACCESS_TOKEN。
+# 未配置口令时完全放行（保持纯本机直连的旧行为）。
+
+_COOKIE_NAME = "ai_token"
+
+
+class LoginRequest(BaseModel):
+    token: str
+
+
+def _access_token() -> str | None:
+    """返回当前生效的访问口令；未配置返回 None（表示不启用保护）。"""
+    try:
+        cfg_tok = str(load_config().get("access_token") or "").strip()
+    except Exception:
+        cfg_tok = ""
+    if cfg_tok:
+        return cfg_tok
+    env_tok = str(os.environ.get("ACCESS_TOKEN") or "").strip()
+    return env_tok or None
+
+
+def _auth_ok(request: Request, token: str) -> bool:
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        supplied = auth[len("Bearer "):].strip()
+        if supplied and hmac.compare_digest(supplied, token):
+            return True
+    cookie = request.cookies.get(_COOKIE_NAME) or ""
+    return bool(cookie) and hmac.compare_digest(cookie, token)
+
+
+@app.middleware("http")
+async def access_gate(request: Request, call_next):
+    """全局访问门禁：配置了口令时，除健康检查与登录页外均需通过校验。"""
+    token = _access_token()
+    if not token:
+        return await call_next(request)
+    path = request.url.path
+    if path in ("/api/health", "/api/login", "/login"):
+        return await call_next(request)
+    if _auth_ok(request, token):
+        return await call_next(request)
+    if path.startswith("/api/"):
+        return JSONResponse({"detail": "访问口令无效或未登录"}, status_code=401)
+    return RedirectResponse("/login", status_code=302)
+
+
+_LOGIN_PAGE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 拟人系统 · 访问口令</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    min-height:100vh; display:flex; align-items:center; justify-content:center;
+    background: radial-gradient(1200px 600px at 20% -10%, #1b2a4a 0%, #0b1020 55%, #070a14 100%);
+    font-family: "PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif; color:#e8ecf4;
+  }
+  .card {
+    width:min(92vw,360px); padding:34px 28px 28px; border-radius:18px;
+    background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.09);
+    backdrop-filter:blur(8px); box-shadow:0 24px 60px rgba(0,0,0,.45);
+  }
+  .logo { font-size:22px; font-weight:700; letter-spacing:.5px; margin-bottom:6px; }
+  .logo span { background:linear-gradient(90deg,#6ea8ff,#b388ff); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .sub { font-size:12.5px; color:#8b93a7; margin-bottom:26px; line-height:1.6; }
+  input {
+    width:100%; padding:12px 14px; border-radius:10px; border:1px solid rgba(255,255,255,.14);
+    background:rgba(255,255,255,.06); color:#eef2fa; font-size:15px; outline:none; transition:border-color .2s;
+  }
+  input:focus { border-color:#6ea8ff; }
+  button {
+    width:100%; margin-top:16px; padding:12px; border:0; border-radius:10px; cursor:pointer;
+    font-size:15px; font-weight:600; color:#fff;
+    background:linear-gradient(135deg,#3d7bfd,#7c5cff);
+  }
+  button:disabled { opacity:.55; cursor:default; }
+  .err { min-height:18px; margin-top:12px; font-size:12.5px; color:#ff8f8f; text-align:center; }
+  .tip { margin-top:18px; font-size:11.5px; color:#5f687c; text-align:center; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">AI 拟人系统 <span>· 远程访问</span></div>
+    <div class="sub">请输入访问口令以继续<br>口令在 config.json 的 access_token 中配置</div>
+    <input id="tok" type="password" placeholder="访问口令" autocomplete="current-password" autofocus>
+    <button id="btn">进入系统</button>
+    <div class="err" id="err"></div>
+    <div class="tip">口令用于保护远端访问，本机直连同样生效</div>
+  </div>
+<script>
+(function(){
+  var inp=document.getElementById('tok'), btn=document.getElementById('btn'), err=document.getElementById('err');
+  function go(){
+    var v=inp.value.trim();
+    if(!v){ err.textContent='请输入口令'; return; }
+    btn.disabled=true; err.textContent='';
+    fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:v})})
+      .then(function(r){ if(!r.ok) throw new Error('bad'); return r.json(); })
+      .then(function(){ location.href='/'; })
+      .catch(function(e){ btn.disabled=false; err.textContent='口令错误，请重试'; });
+  }
+  btn.addEventListener('click',go);
+  inp.addEventListener('keydown',function(e){ if(e.key==='Enter') go(); });
+})();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/login")
+async def login_page():
+    return HTMLResponse(_LOGIN_PAGE_HTML)
+
+
+@app.post("/api/login")
+async def login_api(req: Request, payload: LoginRequest):
+    token = _access_token()
+    if not token or not hmac.compare_digest(payload.token.strip(), token):
+        raise HTTPException(401, "访问口令错误")
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(_COOKIE_NAME, token, httponly=True, samesite="lax",
+                    secure=req.url.scheme == "https", max_age=30 * 86400)
+    return resp
+
+
+@app.post("/api/logout")
+async def logout_api():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(_COOKIE_NAME)
+    return resp
 
 
 # ---------------------------------------------------------------- LLM --------
 # 重试间的指数退避（第 1 次重试前 0.5s，第 2 次前 1.5s），避免瞬时重试加重对端限流
 _LLM_RETRY_BACKOFF = (0.5, 1.5)
+
+# 对话输出 token 上限：日常闲聊用默认值；用户明确要长文时由 _estimate_max_tokens 放大。
+# 云端直接给到 MiMo 实测接受的最大值 65536，任何篇幅请求都不会被自家上限卡住；
+# 本地 llama-server 只有 -c 8192（人设+历史已占大半），上限给小些。
+_DEFAULT_MAX_TOKENS = 768
+_MAX_OUTPUT_TOKENS = {"cloud": 65536, "local": 4096}
+# 用户要求的篇幅，如「写一篇2000字」「10000字左右」「来2万字的」「一万字」「俩千字」。
+# 阿拉伯数字与中文数字都支持：实测用户口语里多用中文数字（「一万字」「俩千字」），
+# 只认 \d+ 会全部漏匹配，_estimate_max_tokens 回落默认 768，长文写到一半就被掐断。
+_LENGTH_REQ_RE = re.compile(
+    r"(\d+(?:\.\d+)?|[一二两俩三四五六七八九十百千万亿]+)\s*(万|千)?\s*(?:个|多|来)?\s*(?:字|字符|文字)"
+)
+_CN_DIGIT = {"一": 1, "二": 2, "两": 2, "俩": 2, "三": 3, "四": 4, "五": 5,
+             "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNIT = {"十": 10, "百": 100, "千": 1000, "万": 10000, "亿": 100000000}
+
+
+def _cn_number_to_int(s: str) -> float:
+    """中文数字串转数值：「一万」→10000，「俩千」→2000，「三千五」→3500，
+    「两万五千」→25000，「一万五」→15000（口语省略中间单位时按十进位补足）。"""
+    total = 0.0
+    section = 0.0
+    num = 0.0
+    last_unit = 1.0  # 最近一次出现的大单位；数字本身不改它，供结尾零头按位补足
+    for ch in s:
+        if ch in _CN_DIGIT:
+            num = float(_CN_DIGIT[ch])
+        elif ch in _CN_UNIT:
+            unit = float(_CN_UNIT[ch])
+            if unit >= 10000:  # 万/亿 结算小节（「三万五千」的「万」落在 3*10000 上）
+                cur = section + num
+                total += (cur or 1.0) * unit
+                section = 0.0
+                num = 0.0
+            else:
+                section += (num or 1.0) * unit
+                num = 0.0
+            last_unit = unit
+    if num:
+        # 口语省略中间单位：跟在「千」后是百位（三千五=3500），跟在「万」后是千位（一万五=15000）
+        if last_unit >= 10000:
+            section += num * 1000.0
+        elif last_unit >= 1000:
+            section += num * 100.0
+        elif last_unit >= 100:
+            section += num * 10.0
+        else:
+            section += num
+    return total + section
+
+
+def _requested_char_count(user_text: str) -> float:
+    """从用户消息里提取明确要求的字数（「2000字」「一万字」「俩千字」），没提返回 0。
+
+    出现多个数字时取最大值（「2000字或者10000字」按 10000 算）。"""
+    best = 0.0
+    for m in _LENGTH_REQ_RE.finditer(user_text or ""):
+        raw, unit = m.group(1), m.group(2)
+        try:
+            n = float(raw)
+        except ValueError:
+            n = _cn_number_to_int(raw)
+        if unit == "万":
+            n *= 10000
+        elif unit == "千":
+            n *= 1000
+        best = max(best, n)
+    return best
+
+
+def _estimate_max_tokens(user_text: str, provider: str) -> int:
+    """按用户消息里要求的篇幅估算输出 token 上限。
+
+    没提篇幅要求时返回默认值；检测到「N 字」类要求时按 1 字 ≈ 1.6 token 估算并夹到
+    provider 上限。实测 MiMo 分词器中文仅约 0.8 token/字（950 字正文 757 token），
+    1.6 的系数留了翻倍余量，一万字给 16000 token 足够，不会被上限掐断。
+    修复前对话固定 768 上限，最多出约五六百字，用户要 2000/10000 字时回复写到一半
+    就被掐断（finish_reason=length），表现为「长文直接断开」。"""
+    chars = _requested_char_count(user_text)
+    if chars < 400:  # 「几百字以内」之类的小篇幅不值得放大上限
+        return _DEFAULT_MAX_TOKENS
+    cap = _MAX_OUTPUT_TOKENS.get(provider, _DEFAULT_MAX_TOKENS)
+    return min(int(chars * 1.6), cap)
 
 
 async def llm_chat(messages: list[dict], temperature: float = 0.8, max_tokens: int = 768,
@@ -701,13 +1999,18 @@ async def llm_chat(messages: list[dict], temperature: float = 0.8, max_tokens: i
         "temperature": temperature,
         "max_tokens": max_tokens,  # 512 会截断长回复（sessions.json 里多条回复半句话被掐断），截断的回复进历史更易被模型重复续写
     }
-    # 本地小模型（Qwen3-4B）对长人设+历史很容易机械复读，显式惩罚重复 token；
+    # 本地小模型（Qwen3.5-4B）对长人设+历史容易机械复读，显式惩罚重复 token；
     # 云端 OpenAI 兼容供应商不保证支持 repeat_penalty，因此只在 local 下发送。
+    # ⚠️ 注意：这里发的参数会覆盖 llama-server 命令行同名单参数，必须与 start_llm.bat 对齐
+    # （v7 调优：presence 1.0→0.5 防回复变短干巴；repeat 1.5→1.25 防语气生硬）
     if provider == "local":
-        payload["repeat_penalty"] = 1.5 if anti_repeat else 1.3
-        payload["presence_penalty"] = 1.0 if anti_repeat else 0.6
-        payload["frequency_penalty"] = 0.6 if anti_repeat else 0.3
-        payload["top_p"] = 0.95
+        payload["repeat_penalty"] = 1.4 if anti_repeat else 1.25
+        payload["presence_penalty"] = 0.8 if anti_repeat else 0.5
+        payload["frequency_penalty"] = 0.5 if anti_repeat else 0.3
+        payload["top_p"] = 0.92
+        # Qwen3.5 系列 GGUF 默认开启思考模式：长人设下思考过程会吃光 max_tokens，
+        # 导致 content 为空（finish_reason=length）。llama.cpp 支持 chat_template_kwargs 关闭。
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     # MiMo / DeepSeek v4 实测支持 thinking.type 开关；关闭后不返回 reasoning_content，
     # 正文不再被思考过程挤占，空回复概率大幅下降
     if provider_name in ("mimo", "deepseek"):
@@ -715,8 +2018,10 @@ async def llm_chat(messages: list[dict], temperature: float = 0.8, max_tokens: i
     headers = {"Authorization": f"Bearer {api_key}"}
     if api_key and api_key != "none":
         headers["api-key"] = api_key
-    # 更精确的分阶段超时：connect/write 短，read 留给模型推理
-    timeout = httpx.Timeout(5.0, connect=5.0, write=10.0, read=180.0, pool=15.0)
+    # 更精确的分阶段超时：connect/write 短，read 留给模型推理；
+    # 长文（max_tokens 大）非流式生成几万 token 可能要十几分钟，read 按上限放宽到最多 15 分钟
+    read_to = min(900.0, max(180.0, 120.0 + max_tokens * 0.04))
+    timeout = httpx.Timeout(5.0, connect=5.0, write=10.0, read=read_to, pool=15.0)
     last_err: Exception | None = None
     for attempt in range(3):
         try:
@@ -770,6 +2075,116 @@ async def llm_chat(messages: list[dict], temperature: float = 0.8, max_tokens: i
                 raise HTTPException(502, f"云端 API 连接失败: {exc}")
             last_err = exc
             _log.info("llm retry: attempt=%d transport_err=%s", attempt + 1, exc)
+            await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
+        except (KeyError, IndexError, ValueError) as exc:
+            raise HTTPException(502, f"LLM 响应解析失败: {exc}")
+    raise HTTPException(502, f"LLM 调用失败: {last_err}")
+
+
+async def llm_chat_stream(messages: list[dict], temperature: float = 0.8, max_tokens: int = 768,
+                          model: str | None = None, disable_thinking: bool = False,
+                          thinking: bool | None = None, anti_repeat: bool = False):
+    """流式版 llm_chat：逐个 yield content delta（含最终的空正文 reasoning 兜底）。
+
+    与 llm_chat 共享 payload/超时/错误语义，但 SSE 场景无法撤回已输出的内容，
+    因此重试仅限「尚未输出任何 delta」的阶段；一旦开始输出，中途断流直接抛错，
+    由调用方把已生成部分保留并提示失败。thinking 模型的 reasoning_content 不
+    yield（用户看到的是正文），仅当全文为空时兜底输出一次 reasoning。"""
+    cfg = load_config()
+    provider = cfg.get("provider", "cloud")
+    if provider not in ("local", "cloud"):
+        raise HTTPException(400, f"未知 provider: {provider}")
+    conf = cfg.get(provider) or {}
+    base_url = (conf.get("base_url") or "").rstrip("/")
+    api_key = conf.get("api_key") or "none"
+    model = model or conf.get("model", "")
+    if not base_url or not model:
+        raise HTTPException(400, f"provider 配置不完整: {provider}")
+    provider_name = (conf.get("provider") or "") if provider == "cloud" else "local"
+    use_thinking = bool(conf.get("thinking", True)) if thinking is None else bool(thinking)
+    if disable_thinking:
+        use_thinking = False
+    url = f"{base_url}/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    if provider == "local":
+        payload["repeat_penalty"] = 1.4 if anti_repeat else 1.25
+        payload["presence_penalty"] = 0.8 if anti_repeat else 0.5
+        payload["frequency_penalty"] = 0.5 if anti_repeat else 0.3
+        payload["top_p"] = 0.92
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    if provider_name in ("mimo", "deepseek"):
+        payload["thinking"] = {"type": "enabled" if use_thinking else "disabled"}
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if api_key and api_key != "none":
+        headers["api-key"] = api_key
+    read_to = min(900.0, max(180.0, 120.0 + max_tokens * 0.04))
+    timeout = httpx.Timeout(5.0, connect=5.0, write=10.0, read=read_to, pool=15.0)
+
+    yielded = False  # 一旦输出过 delta，中途失败不再重试（内容无法撤回）
+    last_err: Exception | None = None
+    for attempt in range(3):
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        try:
+            async with httpx_client.stream("POST", url, json=payload, headers=headers, timeout=timeout) as r:
+                if r.status_code >= 400:
+                    await r.aread()
+                    body = (r.text or "")[:300]
+                    if r.status_code == 401:
+                        raise HTTPException(502, "云端 API 鉴权失败：请检查 API Key")
+                    retryable = r.status_code >= 500 or r.status_code == 429
+                    if retryable and not yielded and attempt < 2:
+                        last_err = HTTPException(502, f"LLM 调用失败: {r.status_code} {body}")
+                        continue  # 未输出内容时对 5xx/429 重试
+                    raise HTTPException(502, f"LLM 调用失败: {r.status_code} {body}")
+                async for line in r.aiter_lines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(data)
+                    except ValueError:
+                        continue
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    ch = choices[0]
+                    delta = ch.get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        content_parts.append(piece)
+                        yielded = True
+                        yield piece
+                    rp = delta.get("reasoning_content")
+                    if rp:
+                        reasoning_parts.append(rp)
+            content = "".join(content_parts).strip()
+            if not content and reasoning_parts:
+                # thinking 模型只输出了思考过程没出正文：兜底输出一次
+                yield "".join(reasoning_parts).strip()
+            return
+        except HTTPException:
+            raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401:
+                raise HTTPException(502, "云端 API 鉴权失败：请检查 API Key")
+            raise HTTPException(502, f"LLM 调用失败: {exc}")
+        except httpx.TransportError as exc:
+            if yielded or attempt == 2:
+                if provider == "local":
+                    raise HTTPException(502, "本地模型未启动：请先运行 start_llm.bat 或用云端 API")
+                raise HTTPException(502, f"云端 API 连接中断: {exc}")
+            last_err = exc
+            _log.info("llm_stream retry: attempt=%d transport_err=%s", attempt + 1, exc)
             await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
         except (KeyError, IndexError, ValueError) as exc:
             raise HTTPException(502, f"LLM 响应解析失败: {exc}")
@@ -895,13 +2310,20 @@ async def web_search(query: str, cfg: dict | None = None, max_results: int = 5) 
     if not search_cfg.get("enabled", True):
         return []
     provider = (search_cfg.get("provider") or "duckduckgo").lower()
-    max_results = max(1, min(int(search_cfg.get("max_results", max_results) or max_results), 10))
-    timeout = float(search_cfg.get("timeout", 15) or 15)
+    # 配置容错：非法值回退默认，不让 /api/chat 因配置写错直接 500
+    try:
+        max_results = max(1, min(int(search_cfg.get("max_results", max_results) or max_results), 10))
+    except (TypeError, ValueError):
+        pass
+    try:
+        timeout = float(search_cfg.get("timeout", 15) or 15)
+    except (TypeError, ValueError):
+        timeout = 15.0
     key = f"{provider}\x00{query.strip()[:200].lower()}"
     now = time.time()
     cached = _SEARCH_CACHE.get(key)
     if cached and now - cached[0] < _SEARCH_CACHE_TTL:
-        _SEARCH_CACHE.move_to_end(key)
+        # 缓存里存的是全量结果，返回时按需切片（dict 是 FIFO 淘汰，无需 move_to_end）
         return cached[1][:max_results]
     results: list[dict] = []
     try:
@@ -921,11 +2343,13 @@ async def web_search(query: str, cfg: dict | None = None, max_results: int = 5) 
             results = await _search_duckduckgo(query, timeout)
         except Exception as exc:  # noqa: BLE001
             _log.warning("web_search ddg fallback failed: %s", exc)
-    results = results[:max_results]
-    _SEARCH_CACHE[key] = (now, results)
-    while len(_SEARCH_CACHE) > _SEARCH_CACHE_MAX:
-        _SEARCH_CACHE.pop(next(iter(_SEARCH_CACHE)), None)
-    return results
+    if results:
+        # 只缓存非空结果：网络抖动导致的空结果不该把同一查询冻结 10 分钟「搜不到」；
+        # 缓存全量列表、返回时再切片，先到的调用方 max_results=3 不会把缓存截短
+        _SEARCH_CACHE[key] = (now, results)
+        while len(_SEARCH_CACHE) > _SEARCH_CACHE_MAX:
+            _SEARCH_CACHE.pop(next(iter(_SEARCH_CACHE)), None)
+    return results[:max_results]
 
 
 def _extract_search_query(text: str) -> str:
@@ -962,15 +2386,28 @@ async def _chat_with_search(
     cfg: dict,
     temperature: float = 0.8,
     anti_repeat: bool = False,
+    max_tokens: int | None = None,
+    thinking: bool | None = None,
 ) -> tuple[str, bool]:
-    """对话主循环：模型输出 [search:...] 时自动搜索并回填结果后再次回答。"""
+    """对话主循环：模型输出 [search:...] 时自动搜索并回填结果后再次回答。
+
+    max_tokens/thinking 只在显式传入时透传（长文场景放大输出上限/关思考省预算），
+    缺省保持 llm_chat 自身默认值。"""
     search_cfg = cfg.get("search") or {}
-    max_rounds = int(search_cfg.get("max_rounds", 2) or 2)
+    try:
+        max_rounds = int(search_cfg.get("max_rounds", 2) or 2)
+    except (TypeError, ValueError):
+        max_rounds = 2
     messages = [dict(system)] + [dict(m) for m in history] + [{"role": "user", "content": user_content}]
+    extra: dict = {}
+    if max_tokens is not None:
+        extra["max_tokens"] = max_tokens
+    if thinking is not None:
+        extra["thinking"] = thinking
     searched = False
     last_raw = ""
     for _ in range(max_rounds + 1):
-        last_raw = await llm_chat(messages, temperature=temperature, anti_repeat=anti_repeat)
+        last_raw = await llm_chat(messages, temperature=temperature, anti_repeat=anti_repeat, **extra)
         query = _extract_search_query(last_raw)
         if not query:
             break
@@ -979,6 +2416,60 @@ async def _chat_with_search(
         messages.append({"role": "assistant", "content": last_raw})
         messages.append({"role": "user", "content": _format_search_feedback(query, results)})
     return _strip_search_markers(last_raw), searched
+
+
+# 长文续写轮数上限：单次生成很难写满上万字，模型会自己收尾；还差得多就让它接着写。
+# 每轮约 1 分钟、通常能补几千字；给足 8 轮，保证「要一万字就写满一万字」。
+_MAX_CONTINUE_ROUNDS = 8
+
+
+async def _extend_long_form(
+    raw: str,
+    system: dict,
+    history: list[dict],
+    user_content: str,
+    target_chars: float,
+    max_tokens: int,
+) -> str:
+    """长文续写：回复离用户要求的字数还远时，让模型从上文结尾接着写。
+
+    每轮把已有全文作为 assistant 消息回填，再追加一条「继续写」指令；新段落剥掉
+    可能重复出现的 [style:xxx]/[search:...] 标记后拼接，首段风格标记保留。
+    一直续到写满目标字数（要一万字就写到至少一万字，宁可略多不可短缺）、
+    续写段太短（模型拒绝续写）或轮数用尽才停。
+    返回拼接后的完整 raw 文本（仍以首段的 [style:xxx] 开头，若有）。"""
+    if not raw or target_chars < 400:
+        return raw
+    style, body = parse_style_prefix(raw)
+    body = body.strip()
+    for _ in range(_MAX_CONTINUE_ROUNDS):
+        if len(body) >= target_chars:
+            break
+        messages = (
+            [dict(system)] + [dict(m) for m in history]
+            + [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": body},
+                {"role": "user", "content": (
+                    f"上面才写了{len(body)}字，还没到要求的{int(target_chars)}字。"
+                    "从上文结尾处自然地接着往下写，不要重复已写内容，不要另起开头，"
+                    "不要总结收尾，继续展开细节和情节，把剩下的篇幅写满。"
+                )},
+            ]
+        )
+        try:
+            chunk = await llm_chat(messages, max_tokens=max_tokens, thinking=False)
+        except HTTPException as exc:
+            _log.warning("long-form continuation aborted: %s", exc)
+            break
+        chunk = _strip_search_markers(chunk)
+        _, chunk_body = parse_style_prefix(chunk)
+        chunk_body = chunk_body.strip()
+        if len(chunk_body) < 80:  # 模型不肯续写、只回了一句收尾话，就此打住
+            break
+        body = body.rstrip() + "\n\n" + chunk_body
+    # 重新挂回首段解析出的风格标记，chat() 里 parse_style_prefix 才能照常拆出 style
+    return (f"[style:{style}]\n{body}" if style else body)
 
 
 # ---------------------------------------------------------------- TTS ---------
@@ -1002,11 +2493,97 @@ def _run_sync(*args: str, timeout: float = 660) -> tuple[int, str, str]:
 _tts_inflight: dict[str, asyncio.Future] = {}
 
 
+# ------------------------------------------------------------ 长文本分段 ---------
+# Qwen3-TTS（本地与阿里云 qwen3-tts-vc 同源）存在已知缺陷：长文本自回归解码到
+# 后半段时注意力漂移，语速不受控制地越来越快（实测 3000 字音频前 1/4 约 4.9
+# 音节/秒，后 1/4 飙到 6.9）。工程解法：按句切成短段分别合成，段间插静音拼接，
+# 每段都在模型可控长度内，全程语速均匀。分段不改整段缓存 key（首次合成后缓存
+# 即为完整音频），段级缓存可复用部分重试。
+_TTS_SEG_MAX_CHARS = 260   # 单段最大字符数（中文按字符计），控制在模型稳定区间
+_TTS_SEG_PAUSE_MS = 350    # 段间静音时长（毫秒），模拟自然换气停顿
+
+
+def _split_tts_text(text: str, max_chars: int = _TTS_SEG_MAX_CHARS) -> list[str]:
+    """按句末标点切分朗读文本，每段不超过 max_chars 字符。
+
+    短文本原样返回（保持单段路径不变）；长文本按 。！？ 切句、按
+    ，；、： 切分句、无标点处硬切兜底，保证每段完整成句、长度受控。
+    """
+    text = normalize_tts_text(text)
+    if len(text) <= max_chars:
+        return [text]
+
+    # 第一级：按句末标点切分（保留标点）
+    sentences = [s for s in re.split(r"(?<=[。！？])", text) if s.strip()]
+
+    segments: list[str] = []
+    buf = ""
+    for s in sentences:
+        if len(buf) + len(s) <= max_chars:
+            buf += s
+            continue
+        if buf:
+            segments.append(buf)
+            buf = ""
+        # 单句超长：按句中停顿再切
+        if len(s) > max_chars:
+            clauses = [c for c in re.split(r"(?<=[，；、：])", s) if c.strip()]
+            for c in clauses:
+                if len(buf) + len(c) <= max_chars:
+                    buf += c
+                    continue
+                if buf:
+                    segments.append(buf)
+                    buf = ""
+                # 无标点超长片段硬切兜底
+                for i in range(0, len(c), max_chars):
+                    segments.append(c[i:i + max_chars])
+            continue
+        buf = s
+    if buf:
+        segments.append(buf)
+    return [seg for seg in segments if seg.strip()]
+
+
+def _concat_tts_segments(seg_paths: list[Path], out_path: Path,
+                         pause_ms: int = _TTS_SEG_PAUSE_MS) -> Path:
+    """把多段 WAV 拼接成一条，段间插入 pause_ms 静音。
+
+    各段由同一后端生成，参数（声道/位深/采样率）应一致；若不一致，降级为
+    纯拼接（不插静音）并告警，避免按首段参数写入时静音长度失真。
+    """
+    import wave as _wave
+
+    infos: list[tuple[int, int, int]] = []
+    for p in seg_paths:
+        with _wave.open(str(p), "rb") as w:
+            infos.append((w.getnchannels(), w.getsampwidth(), w.getframerate()))
+    nch, sw, fr = infos[0]
+    uniform = all((c, s, r) == (nch, sw, fr) for c, s, r in infos)
+    if not uniform:
+        _log.warning("tts segment params differ, fallback to plain concat: %s", infos)
+
+    with _wave.open(str(out_path), "wb") as out:
+        out.setnchannels(nch)
+        out.setsampwidth(sw)
+        out.setframerate(fr)
+        pause = b"\x00" * (sw * nch * int(fr * pause_ms / 1000))
+        for idx, p in enumerate(seg_paths):
+            if idx and uniform:
+                out.writeframes(pause)
+            with _wave.open(str(p), "rb") as w:
+                out.writeframes(w.readframes(w.getnframes()))
+    return out_path
+
+
 async def tts_synthesize(text: str, style: str = "", speed: float = 1.0, force: bool = False) -> Path:
     """按 voice.provider 合成语音（原速 1.0）。
 
     speed 参数保留签名以兼容老调用方，但后端不再处理 —— 语速由前端
     Audio.playbackRate 控制，零延迟、不占缓存。原速合成一次即可复用所有语速。
+
+    长文本（> _TTS_SEG_MAX_CHARS）自动分段合成后拼接，规避 Qwen3-TTS
+    长文本后半段语速失控的已知缺陷。
     """
     text = normalize_tts_text(text)
     cfg = load_config()
@@ -1029,17 +2606,42 @@ async def tts_synthesize(text: str, style: str = "", speed: float = 1.0, force: 
     _tts_inflight[cache.name] = fut
     t0 = time.monotonic()
     try:
-        path = await _tts_do_synthesize(text, style, cfg, cache)
+        path = await _tts_do_synthesize_maybe_segmented(text, style, cfg, cache, force)
         if not fut.done():
             fut.set_result(path)
         _log.info("tts synthesized in %.2fs: %s", time.monotonic() - t0, cache.name)
         return path
     except BaseException as exc:
         if not fut.done():
-            fut.set_exception(exc)
+            # owner 被取消（如客户端断开）时，等待方并没有被取消：
+            # 把 CancelledError 转成可重试的错误，避免等待方表现得像自己也中途被掐断
+            if isinstance(exc, asyncio.CancelledError):
+                fut.set_exception(HTTPException(502, "语音合成中断，请重试"))
+            else:
+                fut.set_exception(exc)
         raise
     finally:
         _tts_inflight.pop(cache.name, None)
+
+
+async def _tts_do_synthesize_maybe_segmented(text: str, style: str, cfg: dict,
+                                             cache: Path, force: bool) -> Path:
+    """整段合成或长文本分段合成+拼接，返回最终可服务的音频路径。
+
+    短文本直接走 _tts_do_synthesize（单段，行为与旧版完全一致）；
+    长文本逐段调 tts_synthesize（自动命中段级缓存或合成），拼接后写整段缓存。
+    """
+    segments = _split_tts_text(text)
+    if len(segments) <= 1:
+        return await _tts_do_synthesize(text, style, cfg, cache)
+
+    _log.info("tts segmented: %d chars -> %d segments (max %d)", len(text), len(segments), _TTS_SEG_MAX_CHARS)
+    seg_paths: list[Path] = []
+    for i, seg in enumerate(segments, 1):
+        seg_paths.append(await tts_synthesize(seg, style, force=force))
+    out_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
+    await asyncio.to_thread(_concat_tts_segments, seg_paths, out_path)
+    return await asyncio.to_thread(_save_tts_cache, cache, out_path)
 
 
 async def _tts_do_synthesize(text: str, style: str, cfg: dict, cache: Path) -> Path:
@@ -1048,6 +2650,8 @@ async def _tts_do_synthesize(text: str, style: str, cfg: dict, cache: Path) -> P
         raise HTTPException(400, "MiMo 语音合成已移除，请使用本地合成或阿里云千问")
     elif cfg.get("voice", {}).get("provider") == "aliyun":
         out_path = await aliyun_tts_synthesize(text, style, cfg)
+    elif cfg.get("voice", {}).get("provider") == "minimax":
+        out_path = await minimax_tts_synthesize(text, style, cfg)
     else:
         async with skill_lock:
             out_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
@@ -1072,9 +2676,12 @@ async def _tts_do_synthesize(text: str, style: str, cfg: dict, cache: Path) -> P
             if code == 3:  # 模型下载中，按 client 协议 --continue 续跑
                 code, out, err = await asyncio.to_thread(_run_sync, str(TTS_VENV_PY), str(TTS_SKILL / "scripts" / "client.py"), "--continue")
             if code != 0 or not out_path.exists():
+                # client 可能已写出半个 wav，失败时清掉，避免 OUTPUT_DIR 残留垃圾
+                out_path.unlink(missing_ok=True)
                 detail = re.search(r"❌.*?(?:\n|$)", out + err, re.S)
                 raise HTTPException(500, f"语音合成失败: {(detail.group(0).strip() if detail else (err or out)[-500:])}")
-    return _save_tts_cache(cache, out_path)
+    # 写缓存可能触发整 wav 的跨分区拷贝（数 MB），丢线程池别卡事件循环
+    return await asyncio.to_thread(_save_tts_cache, cache, out_path)
 
 
 async def aliyun_tts_synthesize(text: str, style: str = "", cfg: dict | None = None) -> Path:
@@ -1130,6 +2737,75 @@ async def aliyun_tts_synthesize(text: str, style: str = "", cfg: dict | None = N
     return out_path
 
 
+async def minimax_tts_synthesize(text: str, style: str = "", cfg: dict | None = None) -> Path:
+    """调用 MiniMax（海螺）T2A v2 同步语音合成。
+
+    model 支持 speech-02-hd（音质/复刻相似度最佳）/ speech-02-turbo（更快）/
+    speech-01-hd 等；voice 填系统音色 id（如 male-qn-jingying）或声音复刻
+    返回的 voice_id。返回 wav（非流式接口支持），与长文分段拼接链路兼容。
+    """
+    cfg = cfg or load_config()
+    m = cfg.get("voice", {}).get("minimax", {})
+    api_key = m.get("api_key") or ""
+    if not api_key:
+        raise HTTPException(400, "MiniMax 音色未配置：请在设置里填写 MiniMax API Key")
+    model = m.get("model") or "speech-02-hd"
+    voice = m.get("voice") or "male-qn-jingying"
+    base = (m.get("base_url") or "https://api.minimaxi.com/v1").rstrip("/")
+    # 采样参数从配置读取（前端设置页可调），带范围钳制，改值后缓存指纹联动自动重合成
+    try:
+        speed = float(m.get("speed", 1.0))
+    except (TypeError, ValueError):
+        speed = 1.0
+    try:
+        vol = float(m.get("vol", 1.0))
+    except (TypeError, ValueError):
+        vol = 1.0
+    try:
+        pitch = float(m.get("pitch", 0))
+    except (TypeError, ValueError):
+        pitch = 0
+    try:
+        sample_rate = int(m.get("sample_rate", 32000))
+    except (TypeError, ValueError):
+        sample_rate = 32000
+    speed = min(max(speed, 0.5), 2.0)
+    vol = min(max(int(round(vol)), 0), 10)      # MiniMax vol 要求 int（0~10）
+    pitch = min(max(int(round(pitch)), 0), 10)  # MiniMax pitch 要求 int（0~10）
+    sample_rate = min(max(sample_rate, 8000), 32000)  # speech-02-hd 实测最高 32k，48k 会被 2013 拒绝
+    payload = {
+        "model": model,
+        "text": text,
+        "stream": False,
+        "language_boost": "Chinese",  # 中文发音更稳（专有名词/游戏术语）
+        "voice_setting": {"voice_id": voice, "speed": speed, "vol": vol, "pitch": pitch},
+        "audio_setting": {"sample_rate": sample_rate, "format": "wav", "channel": 1},
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        r = await httpx_client.post(f"{base}/t2a_v2", json=payload, headers=headers, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+    except httpx.HTTPError as exc:
+        detail = exc.response.text[:500] if getattr(exc, "response", None) is not None else str(exc)
+        raise HTTPException(502, f"MiniMax TTS 调用失败: {detail}")
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(502, f"MiniMax TTS 响应解析失败: {exc}")
+    br = data.get("base_resp", {})
+    if br.get("status_code"):
+        raise HTTPException(502, f"MiniMax TTS 错误 {br.get('status_code')}: {br.get('status_msg', '')}")
+    audio_hex = (data.get("data") or {}).get("audio") or ""
+    if not audio_hex:
+        raise HTTPException(502, "MiniMax TTS 未返回音频数据")
+    try:
+        audio_bytes = bytes.fromhex(audio_hex)
+    except ValueError:
+        raise HTTPException(502, "MiniMax TTS 返回的不是有效音频数据")
+    out_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
+    await asyncio.to_thread(out_path.write_bytes, audio_bytes)
+    return out_path
+
+
 # ---------------------------------------------------------------- ASR ---------
 async def asr_transcribe(audio_path: Path) -> str:
     args = [str(ASR_VENV_PY), str(ASR_SKILL / "scripts" / "client.py"),
@@ -1171,9 +2847,15 @@ async def llm_models(req: dict):
             timeout=30,
         )
         r.raise_for_status()
-        models = [m.get("id") for m in r.json().get("data", []) if m.get("id")]
+        data = r.json()
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = []
+        models = [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"获取模型列表失败: {exc}")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(502, f"模型列表响应解析失败: {exc}")
     if req.get("all"):
         # 克隆引擎区：返回全量模型（含 tts/voiceclone 等语音模型）
         return {"models": models}
@@ -1190,6 +2872,7 @@ class ChatRequest(BaseModel):
     message: str = ""
     history: list[dict] = []
     attachments: list[dict] = []
+    stream: bool = False  # True 时返回 SSE 流式输出（逐 delta），False 保持原完整 JSON
 
 
 class SearchRequest(BaseModel):
@@ -1213,8 +2896,14 @@ def _attachment_label(kind: str) -> str:
     return {"image": "图片", "doc": "文档"}.get(kind, "文件")
 
 
-def _attachment_prompt_text(attachments: list[dict], user_text: str = "") -> str:
-    """把附件转成模型能读的文字描述；文本类文档直接带内容片段。"""
+def _read_text_head(path: Path, limit: int = 2000) -> str:
+    """只读文本文件开头 limit 个字符：read_text 会先把整个文件（可能 15MB）读进内存再切片。"""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read(limit)
+
+
+async def _attachment_prompt_text(attachments: list[dict], user_text: str = "") -> str:
+    """把附件转成模型能读的文字描述；文本类文档直接带内容片段（线程池读盘，不阻塞事件循环）。"""
     lines: list[str] = []
     for a in attachments[:8]:
         name = a.get("name") or "附件"
@@ -1223,11 +2912,11 @@ def _attachment_prompt_text(attachments: list[dict], user_text: str = "") -> str
         path = _upload_path_for(a)
         if path and a.get("kind") == "doc" and path.suffix.lower() in _TEXT_DOC_SUFFIXES:
             try:
-                snippet = path.read_text(encoding="utf-8", errors="replace")[:2000]
-                if snippet.strip():
-                    lines.append(f"  <文件内容>{snippet}</文件内容>")
+                snippet = await asyncio.to_thread(_read_text_head, path)
             except OSError:
-                pass
+                snippet = ""
+            if snippet.strip():
+                lines.append(f"  <文件内容>{snippet}</文件内容>")
     if not lines:
         return user_text
     prefix = "用户发送了附件：\n" + "\n".join(lines)
@@ -1277,7 +2966,9 @@ async def _try_vision_chat(system: dict, history: list[dict], req: ChatRequest, 
             continue
         mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
         try:
-            b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+            # 图片单张可达 15MB：读盘+base64 编码放线程池，避免事件循环被同步 IO 卡住
+            img_bytes = await asyncio.to_thread(path.read_bytes)
+            b64 = base64.b64encode(img_bytes).decode("ascii")
         except OSError:
             continue
         content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
@@ -1304,6 +2995,94 @@ def _too_similar_to_last(text: str, history: list[dict]) -> bool:
     if not prev or not text:
         return False
     return role_engine._dup_sim(text, prev) >= 0.8
+
+
+def _fix_addressing(text: str) -> str:
+    """后处理：自动纠正大帅回复中的称呼错误（4B 模型指令遵循弱，需兜底）。
+    1) assistant 自称老公 -> 改为"我"或"老婆"
+    2) 把用户叫老婆 -> 改为"老公"
+    3) 第三人称"他"指代用户 -> 改为"你"
+    4) 女性自称（女人/女孩子/妹子/人家/本宝宝）-> 删除或替换
+    5) 英文夹杂（非赛事术语）-> 删除"""
+    if not text:
+        return text
+    import re as _re
+    # 1) assistant 自称老公（"我是你老公"、"你老公我"、"老公我..."）
+    text = _re.sub(r"我是你老公，不是", "我不是", text)
+    text = _re.sub(r"我是你老公", "我是你老婆", text)
+    text = _re.sub(r"你老公我", "我", text)
+    # "老公我错了" -> "老婆我错了"（自称语境）
+    text = _re.sub(r"(?<![他你])老公我(错了|这就|马上|现在)", r"老婆我\1", text)
+    # 2) 称呼用户为老婆 -> 老公（行首/前导/句中各种模式）
+    text = _re.sub(r"^(\s*)老婆([,，!！~～:：\s])", r"\1老公\2", text)
+    text = _re.sub(r"(?<=[\n。！？～~])\s*老婆([,，!！~～:：\s])", r" 老公\1", text)
+    text = _re.sub(r"老婆大人", "老公大人", text)
+    text = _re.sub(r"老婆你(一大早|这是|也|看)", r"老公你\1", text)
+    text = _re.sub(r"晚安老婆", "晚安老公", text)
+    text = _re.sub(r"晚安，老婆", "晚安，老公", text)
+    text = _re.sub(r"睡吧老婆", "睡吧老公", text)
+    text = _re.sub(r"怎么了老婆", "怎么了老公", text)
+    text = _re.sub(r"看在你是老婆的份上", "看在你是老公的份上", text)
+    text = _re.sub(r"你是老婆", "你是老公", text)
+    text = _re.sub(r"(?<=[\n。！？～~\s])老婆，", "老公，", text)
+    # 3) 第三人称"他"指代用户（在动作描写括号里最常见）
+    for pat in [r"他的手", r"他的脸", r"他的肩", r"他的背", r"他的腰", r"他的腿",
+                r"他靠过来", r"他靠在", r"他靠近", r"靠近他", r"他身边", r"他笑了",
+                r"看着他", r"对他说", r"他在说", r"他坐下", r"他站起来", r"他走过来",
+                r"他搂", r"他抱", r"他亲", r"他摸"]:
+        text = _re.sub(pat, pat.replace("他", "你"), text)
+    # 4) 女性自称替换（覆盖复杂句式：我是/我可不是/我真是...的女人/女孩子/女生）
+    text = text.replace("这是我的女人", "我是你的人")
+    text = _re.sub(r"我是(?:一个|个)?女人", "我是个男生", text)
+    text = _re.sub(r"我是(?:一个|个)?女孩子", "我是个男生", text)
+    text = _re.sub(r"我是(?:一个|个)?女生", "我是个男生", text)
+    # 复杂句式兜底：我是...的女人 / 我可不是...的女人 / 我真是...的女人 -> ...的人
+    text = _re.sub(r"我(?:可|就|也|不|真是|不是|绝对不)[^，。！？\n]{0,18}的女人", lambda m: m.group(0)[:-2] + "的人", text)
+    text = _re.sub(r"我(?:可|就|也|真)?是(?:一个|个)?女孩子", "我是个男生", text)
+    text = _re.sub(r"我(?:可|就|也|真)?是(?:一个|个)?女生", "我是个男生", text)
+    text = _re.sub(r"我的女人", "我的人", text)
+    text = _re.sub(r"的女人", "的人", text)
+    text = _re.sub(r"的女孩子", "的人", text)
+    text = _re.sub(r"的女生", "的人", text)
+    text = _re.sub(r"的的人", "的人", text)
+    text = _re.sub(r"人家可", "我可", text)
+    text = text.replace("小棉袄", "贴心人")
+    text = _re.sub(r"小仙女", "宝贝", text)
+    # 6) Qwen3 thinking 泄漏：模型偶发先输出内部推理（"好的，在处理..."等）再输出回复。
+    # 仅当全文足够长（>200 字，短回复如"首先，生日快乐！"是正常开头）且换行后还有内容时才截断；
+    # 绝不用罐头文案整条替换，避免误伤正常回复
+    for marker in ("好的，在处理", "好的，首先", "作为一个男", "首先，"):
+        if text.startswith(marker) and len(text) > 200:
+            nl = text.find("\n", 200)
+            if nl < 0:
+                nl = text.find("\n")
+            if nl > 0:
+                rest = text[nl:].strip()
+                if rest:
+                    text = rest
+        if text.startswith(marker):
+            break
+    # 5) 英文夹杂（保留 KPL/AG/MVP/BO7/FMVP/KWC/TTG 等大写赛事术语）
+    text = _re.sub(r"(?<![A-Z])(?![A-Z])[a-zA-Z]{2,}(?![A-Z])", "", text)
+    # 6) 残留的风格/状态标记：[:xxx] (:xxx) [state:xxx] 等（8B 模型输出的变体格式）
+    text = _re.sub(r"\[[:：]\s*[^\]\r\n]{0,12}\]", "", text)
+    text = _re.sub(r"\([:：]\s*[^\)\r\n]{0,12}\)", "", text)
+    text = _re.sub(r"\[state:\s*[^\]\r\n]{0,12}\]", "", text)
+    text = _re.sub(r"\(state:\s*[^\)\r\n]{0,12}\)", "", text)
+    # 7) 富文本/HTML 标签泄漏（8B 模型偶发输出 [=#FF5733][/] 或 [="微软雅黑"] 等）
+    text = _re.sub(r"\[=#?[0-9A-Fa-f]{0,8}\]", "", text)
+    text = _re.sub(r"\[=\s*\"[^\]]{0,20}\"\]", "", text)
+    text = _re.sub(r"\[/\s*\]", "", text)
+    # 8) 「人家」变体清理（人家才/人家可/人家家）
+    text = _re.sub(r"人家才", "我才", text)
+    text = _re.sub(r"人家家", "我", text)
+    text = _re.sub(r"人家", "我", text)
+    # 小女生/小女生语气
+    text = _re.sub(r"小女生", "小男生", text)
+    # 清理遗留的空括号、多余空格
+    text = _re.sub(r"\(\s*\)", "", text)
+    text = _re.sub(r"  +", " ", text)
+    return text.strip()
 
 
 def _is_degenerate_reply(text: str) -> bool:
@@ -1357,6 +3136,8 @@ async def status():
         "voice_provider": cfg.get("voice", {}).get("provider", "local"),
         "aliyun_configured": bool(cfg.get("voice", {}).get("aliyun", {}).get("api_key")),
         "voice_aliyun": dict(cfg.get("voice", {}).get("aliyun", {})),
+        "minimax_configured": bool(cfg.get("voice", {}).get("minimax", {}).get("api_key")),
+        "voice_minimax": dict(cfg.get("voice", {}).get("minimax", {})),
         "voice_style": cfg.get("voice", {}).get("style", ""),
         "voice_manual_provider": bool(cfg.get("voice", {}).get("manual_provider")),
     }
@@ -1365,8 +3146,12 @@ async def status():
 @app.get("/api/health")
 async def health():
     """轻量健康检查：只报进程自身状态与缓存概况，不探测外部服务。"""
+
+    def _count_cache() -> int:
+        return sum(1 for p in TTS_CACHE_DIR.iterdir() if p.is_file())
+
     try:
-        cache_files = sum(1 for p in TTS_CACHE_DIR.iterdir() if p.is_file())
+        cache_files = await asyncio.to_thread(_count_cache)
     except OSError:
         cache_files = -1
     return {
@@ -1389,6 +3174,140 @@ async def search_api(req: SearchRequest):
     return {"query": query, "results": results}
 
 
+async def _chat_stream_events(system: dict, history: list[dict], user_content: str,
+                              cfg: dict, out_tokens: int, chat_thinking: bool | None,
+                              req: ChatRequest):
+    """/api/chat?stream 的 SSE 事件生成器。
+
+    事件（data: JSON）：
+      {"d": "增量文本"}   流式 delta，前端逐块追加
+      {"reset": true}     进入搜索轮前清空前端已显示内容（第一轮通常只有 [search:...]）
+      {"done": true, "clean": "...", "style": "...", "searched": bool, "vision_used": bool}
+      {"err": "..."}      生成失败（前端保留已流出的部分并提示）
+    """
+    vision_used = False
+    searched = False
+    full = ""  # 已 emit 给前端的全文（用于长文续写目标判定与 done.clean）
+
+    def ev(obj: dict) -> str:
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    # 有图片附件时走视觉模型（本地/云端均不支持逐字流，一次性给出），失败回退文本流式
+    if req.attachments:
+        raw = await _try_vision_chat(system, history, req, cfg)
+        if raw:
+            vision_used = True
+            raw = _strip_search_markers(raw)
+            full = raw
+            yield ev({"d": raw})
+
+    # 文本流式主循环（含搜索探测与长文续写）
+    search_cfg = cfg.get("search") or {}
+    try:
+        max_rounds = int(search_cfg.get("max_rounds", 2) or 2)
+    except (TypeError, ValueError):
+        max_rounds = 2
+    messages = [dict(system)] + [dict(m) for m in history] + [{"role": "user", "content": user_content}]
+    round_no = 0
+    while True:
+        round_buf = ""
+        query = None
+        buf_d = ""  # SSE 攒批缓冲：合并高频小 delta，把事件频率压到 ~60Hz（帧率上限），前端不卡、移动端省电
+        last_flush = time.monotonic()
+        try:
+            async for piece in llm_chat_stream(
+                messages, max_tokens=out_tokens, thinking=chat_thinking,
+            ):
+                round_buf += piece
+                if round_no == 0:
+                    m = _SEARCH_RE.search(round_buf)
+                    if m:
+                        query = m.group(1).strip()
+                        break  # 第一轮命中 [search:...]，中断本轮（不 emit 标记片段）
+                full += piece
+                buf_d += piece
+                # 攒够 ~12 字符或 ~16ms 一帧才发射；逐 token 直发可达数百 Hz，是渲染卡顿的主因
+                now = time.monotonic()
+                if len(buf_d) >= 12 or now - last_flush >= 0.016:
+                    yield ev({"d": buf_d})
+                    buf_d = ""
+                    last_flush = now
+            if buf_d:  # 本轮自然结束，不足一帧的残余一并发出（搜索 break 场景除外，前端会 reset）
+                yield ev({"d": buf_d})
+        except HTTPException as exc:
+            yield ev({"err": f"生成失败：{exc.detail}"})
+            return
+        if query is None:
+            break
+        # 进入搜索轮：清空前端已显示内容，把搜索结果回填后第二轮全量流式
+        searched = True
+        yield ev({"reset": True})
+        full = ""
+        try:
+            results = await web_search(query, cfg)
+        except HTTPException as exc:
+            yield ev({"err": f"搜索失败：{exc.detail}"})
+            return
+        messages = messages + [
+            {"role": "assistant", "content": round_buf},
+            {"role": "user", "content": _format_search_feedback(query, results)},
+        ]
+        round_no += 1
+        if round_no > max_rounds:
+            break
+
+    # 长文续写：离目标字数还远时继续流式补写（每轮续写段同样逐块 emit）
+    if not vision_used and out_tokens > _DEFAULT_MAX_TOKENS:
+        target = _requested_char_count((req.message or ""))
+        if target >= 400:
+            for _ in range(_MAX_CONTINUE_ROUNDS):
+                _, body = parse_style_prefix(full)
+                if len(body) >= target:
+                    break
+                cont_msgs = (
+                    [dict(system)] + [dict(m) for m in history]
+                    + [
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": body},
+                        {"role": "user", "content": (
+                            f"上面才写了{len(body)}字，还没到要求的{int(target)}字。"
+                            "从上文结尾处自然地接着往下写，不要重复已写内容，不要另起开头，"
+                            "不要总结收尾，继续展开细节和情节，把剩下的篇幅写满。"
+                        )},
+                    ]
+                )
+                chunk_len = 0
+                cbuf_d = ""  # 续写段同样攒批发射，与主循环一致的帧率上限
+                cbuf_t = time.monotonic()
+                try:
+                    async for piece in llm_chat_stream(
+                        cont_msgs, max_tokens=out_tokens, thinking=False,
+                    ):
+                        chunk_len += len(piece)
+                        full += piece
+                        cbuf_d += piece
+                        now = time.monotonic()
+                        if len(cbuf_d) >= 12 or now - cbuf_t >= 0.016:
+                            yield ev({"d": cbuf_d})
+                            cbuf_d = ""
+                            cbuf_t = now
+                    if cbuf_d:
+                        yield ev({"d": cbuf_d})
+                except HTTPException as exc:
+                    _log.warning("stream long-form continuation aborted: %s", exc)
+                    break
+                if chunk_len < 80:  # 模型不肯续写、只回了一句收尾话，就此打住
+                    break
+
+    # 收尾：剥离全部 style 标记与元话语，交给前端入库展示
+    clean = _STYLE_RE.sub("", full).strip()
+    clean = _strip_meta_notes(clean)
+    clean = _fix_addressing(clean)
+    style, _ = parse_style_prefix(full)
+    yield ev({"done": True, "clean": clean, "style": style,
+              "searched": searched, "vision_used": vision_used})
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     user_text = req.message.strip()
@@ -1400,12 +3319,22 @@ async def chat(req: ChatRequest):
     # 角色引擎：启用时把 时间层/状态层/记忆层 上下文注入 system prompt（前端零改动）
     engine_cfg = cfg.get("role_engine") or {}
     engine_on = bool(engine_cfg.get("enabled", True))
+    location_text = _location_text()  # 位置感知：空串 = 位置未知，不注入
+    weather_text = _weather_text()    # 天气感知：依赖位置，空串 = 未获取到，不注入
+    self_loc, self_rec = _self_config(cfg)  # 角色自况：自己此刻在哪、最近在忙什么
+    news_text = _role_news_text()            # 角色现实动态：联网搜索的真实最近消息
     ctx_block = ""
     mem, st = None, None
     if engine_on and active_role:
         try:
             mem, st = _get_role_stores(active_role)
-            ctx = role_engine.build_context(mem, st, user_text or "（附件）", top_k=int(engine_cfg.get("top_k", 5)))
+            # build_context 含磁盘读 + O(n) 记忆打分，属 CPU/IO 工作，丢线程池避免卡事件循环
+            ctx = await asyncio.to_thread(
+                role_engine.build_context, mem, st, user_text or "（附件）",
+                top_k=int(engine_cfg.get("top_k", 5)),
+                location=location_text, weather=weather_text,
+                self_location=self_loc, self_recent=self_rec, news=news_text,
+            )
             ctx_block = role_engine.format_context_block(ctx)
         except Exception as exc:  # noqa: BLE001
             _log.warning("role_engine context build failed: %s", exc)
@@ -1422,8 +3351,39 @@ async def chat(req: ChatRequest):
             "[search:搜索词]，例如 [search:成都AG超玩会 大帅 2026年KPL]。"
             "我会自动搜索并把结果发给你，你再基于结果正常回答；最终回答里不要保留 [search:...]。"
         )
-    system = {"role": "system", "content": persona + ctx_block + style_hint + search_hint}
-    history = _clean_history(req.history, user_text)
+    # 时间指令放 system 末尾：模型对末尾内容注意力最高，避免中段的时间层被忽略、顺着语境编造时间
+    system = {"role": "system",
+              "content": persona + ctx_block + _META_HINT + style_hint + search_hint
+                         + _time_hint() + _self_hint() + _role_news_hint()
+                         + _location_hint() + _weather_hint()}
+    provider = cfg.get("provider", "cloud")
+    # 云端模型上下文窗口大，超长历史回复全文保留利于追问；本地小上下文才截断
+    history = _clean_history(req.history, user_text, clip_long_replies=(provider == "local"))
+    # 附件描述只算一次（含读盘），首次对话与退化重试共用，避免重复 IO
+    user_content = await _attachment_prompt_text(req.attachments, user_text)
+    # 时间锚点紧贴本轮消息：防止模型被历史里的时间表述带跑、编造当前时间
+    user_content = _time_anchor(user_content)
+    # 长文支持：用户明确要「N 字」时相应放大输出上限。默认 768 token 只够出约五六百字，
+    # 2000/10000 字的请求写到一半就被掐断（finish_reason=length），即用户看到的「直接断开」
+    out_tokens = _estimate_max_tokens(user_text, provider)
+    # 思考过程与正文共享 max_tokens 预算，超长文请求临时关思考，把额度全部留给正文
+    chat_thinking: bool | None = False if out_tokens > 4096 else None
+    if out_tokens > _DEFAULT_MAX_TOKENS:
+        # 人设里「简短直接/3-5句」的风格会让模型写几百字就主动收尾，达不到用户要的篇幅，
+        # 显式指令覆盖：这次必须按要求的字数写满、写完整，中途不停
+        system["content"] += (
+            "\n\n【本次特别要求】用户这条消息明确要求了篇幅，这是最高优先级的任务："
+            "必须按用户要求的字数把内容写满、写完整（要求多少字就写多少字），"
+            "一次性写完，中途不许停、不许缩水、不许用「写不下去了」之类的话提前收尾；"
+            "本条回复不受平时简短说话风格的限制。"
+        )
+    if req.stream:
+        # SSE 流式输出：边生成边推送增量，前端逐块渲染（视觉/搜索/长文续写内部处理）
+        return StreamingResponse(
+            _chat_stream_events(system, history, user_content, cfg, out_tokens, chat_thinking, req),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     raw = None
     vision_used = False
     searched = False
@@ -1434,7 +3394,14 @@ async def chat(req: ChatRequest):
             raw = _strip_search_markers(raw)
     if raw is None:
         raw, searched = await _chat_with_search(
-            system, history, _attachment_prompt_text(req.attachments, user_text), cfg
+            system, history, user_content, cfg,
+            max_tokens=out_tokens, thinking=chat_thinking,
+        )
+    # 长文续写：单次生成很难一次写满上万字（模型会自己收尾），离要求字数还远就接着写
+    if out_tokens > _DEFAULT_MAX_TOKENS:
+        raw = await _extend_long_form(
+            raw, system, history, user_content,
+            _requested_char_count(user_text), out_tokens,
         )
     fallback_style = cfg.get("voice", {}).get("style") or "自然"
     style, reply = parse_style_prefix(raw, fallback=fallback_style)
@@ -1454,10 +3421,12 @@ async def chat(req: ChatRequest):
             raw2, _ = await _chat_with_search(
                 retry_system,
                 history,
-                _attachment_prompt_text(req.attachments, user_text),
+                user_content,
                 cfg,
                 temperature=1.0,
                 anti_repeat=True,
+                max_tokens=out_tokens,
+                thinking=chat_thinking,
             )
         style2, reply2 = parse_style_prefix(raw2, fallback=fallback_style)
         if not _is_degenerate_reply(reply2) and (
@@ -1467,9 +3436,13 @@ async def chat(req: ChatRequest):
     post_text = user_text or (
         "用户发送了附件：" + "、".join((a.get("name") or "附件") for a in req.attachments[:8])
     )
+    # 剥离模型偶发追加的元话语（免责/虚构声明、跳出角色的提示），拿到干净文本再入库与展示
+    reply = _strip_meta_notes(reply)
     # 对话后处理（异步，不阻塞）：更新情绪状态 + 抽取长期记忆写回
     if engine_on and mem is not None and st is not None and reply:
         _spawn_bg(_post_process_chat(active_role, post_text, reply))
+    # 称呼纠错兜底：4B 模型偶发自称老公/称用户老婆/用第三人称，返回前自动纠正
+    reply = _fix_addressing(reply)
     return {"reply": reply, "style": style, "vision_used": vision_used, "searched": searched}
 
 
@@ -1478,24 +3451,26 @@ async def _post_process_chat(role: str, user_msg: str, reply: str) -> None:
     任何失败都静默跳过，绝不影响主对话链路。"""
     try:
         mem, st = _get_role_stores(role)
-        state = st.get_decayed()
+        # 记忆/状态的读写（JSON 读盘 + O(n) 相似度打分）全部走线程池，不占事件循环
+        state = await asyncio.to_thread(st.get_decayed)
         # 喂已有最相关记忆给标注器，从源头避免重复事实反复入库
-        existing = [m["text"] for m in mem.search(user_msg, top_k=5)]
+        existing = [m["text"] for m in await asyncio.to_thread(mem.search, user_msg, 5)]
         ann = await _get_post_processor().run(user_msg, reply, state.get("emotion") or {},
                                               existing_memories=existing)
         if not ann:
             return
-        st.update(emotion=ann.get("emotion"), energy_delta=ann.get("energy_delta", 0), intimacy_delta=0.01)
+        await asyncio.to_thread(st.update, emotion=ann.get("emotion"),
+                                energy_delta=ann.get("energy_delta", 0), intimacy_delta=0.01)
         for text in ann.get("memories") or []:
             # 防记忆污染：AI 自己的回复原文/台词不得当成用户事实入库，否则下轮会被注入 system 导致复读。
             if role_engine._dup_sim(text, reply) >= 0.5 or role_engine._dup_sim(text, user_msg) >= 0.5:
                 continue
             # 写前预过滤：与库中最相似记忆重合度高则 touch 旧条目，不新增冗余
-            near = mem.search(text, top_k=1)
+            near = await asyncio.to_thread(mem.search, text, 1)
             if near and role_engine._dup_sim(text, near[0].get("text", "")) >= 0.5:
-                mem.touch(near[0]["id"])
+                await asyncio.to_thread(mem.touch, near[0]["id"])
                 continue
-            mem.add(text, importance=0.6)
+            await asyncio.to_thread(mem.add, text, importance=0.6)
     except Exception as exc:  # noqa: BLE001
         # 后处理失败不影响主链路，但记 warning 便于排查偶发空响应/超时
         _log.warning("post_process_chat skipped for %s: %s: %s", role, type(exc).__name__, exc)
@@ -1510,7 +3485,7 @@ async def role_state():
         return {"enabled": False, "role": role}
     try:
         mem, st = _get_role_stores(role)
-        state = st.get_decayed()
+        state = await asyncio.to_thread(st.get_decayed)
         return {
             "enabled": True,
             "role": role,
@@ -1518,11 +3493,60 @@ async def role_state():
             "energy": state.get("energy"),
             "intimacy": state.get("intimacy"),
             "last_update": state.get("last_update"),
-            "memory_count": mem.count(),
+            "memory_count": await asyncio.to_thread(mem.count),
         }
     except Exception as exc:  # noqa: BLE001
         _log.warning("api/state failed: %s", exc)
         raise HTTPException(500, f"读取状态失败: {exc}")
+
+
+@app.get("/api/roles/memories")
+async def role_memories(role: str = "", top: int = 10):
+    """角色记忆列表（按 importance × 新鲜度降序取 top 条），供角色管理页展示。
+
+    返回每条记忆的 text / importance / created_at / last_hit / hit_count，
+    不暴露内部 id 之外的敏感字段。
+    """
+    role = (role or "").strip()
+    cfg = load_config()
+    if not role:
+        role = cfg.get("active_role", "")
+    if not role:
+        raise HTTPException(400, "未指定角色")
+    if not cfg.get("role_engine", {}).get("enabled", True):
+        return {"enabled": False, "role": role, "memories": []}
+    try:
+        mem, _ = _get_role_stores(role)
+        items = await asyncio.to_thread(mem.load)
+        # 按 importance × 新鲜度 降序（与裁剪分数一致），取前 top 条
+        def _rank(m: dict) -> float:
+            imp = float(m.get("importance", 0.3))
+            last_hit = role_engine._parse_iso(m.get("last_hit"))
+            recency = 1.0
+            if last_hit:
+                age_days = max(0.0, (time.time() - last_hit.timestamp()) / 86400)
+                recency = max(0.0, 1.0 - age_days / 60.0)
+            return imp * 0.6 + recency * 0.4
+        top_n = max(1, min(int(top), 100))
+        items.sort(key=_rank, reverse=True)
+        return {
+            "enabled": True,
+            "role": role,
+            "memories": [
+                {
+                    "id": m.get("id", ""),
+                    "text": m.get("text", ""),
+                    "importance": float(m.get("importance", 0.3)),
+                    "created_at": m.get("created_at", ""),
+                    "last_hit": m.get("last_hit", ""),
+                    "hit_count": int(m.get("hit_count", 1)),
+                }
+                for m in items[:top_n]
+            ],
+        }
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("api/roles/memories failed: %s", exc)
+        raise HTTPException(500, f"读取记忆失败: {exc}")
 
 
 @app.delete("/api/state")
@@ -1533,7 +3557,8 @@ async def role_state_reset():
     if not role:
         raise HTTPException(400, "未激活角色")
     mem, st = _get_role_stores(role)
-    ok1, ok2 = st.reset(), mem.clear()
+    ok1 = await asyncio.to_thread(st.reset)
+    ok2 = await asyncio.to_thread(mem.clear)
     if not (ok1 and ok2):
         raise HTTPException(500, "重置失败，请检查 data/ 目录权限")
     return {"ok": True, "role": role}
@@ -1555,10 +3580,19 @@ async def role_greeting():
     persona = current_persona(cfg)
     # 组装上下文（和 /api/chat 同一套，但不带用户消息 -- 这是主动开口）
     ctx_block = ""
+    location_text = _location_text()
+    weather_text = _weather_text()
+    self_loc, self_rec = _self_config(cfg)
+    news_text = _role_news_text()
     if engine_on:
         try:
             mem, st = _get_role_stores(active_role)
-            ctx = role_engine.build_context(mem, st, "", top_k=int(engine_cfg.get("top_k", 5)))
+            ctx = await asyncio.to_thread(
+                role_engine.build_context, mem, st, "",
+                top_k=int(engine_cfg.get("top_k", 5)),
+                location=location_text, weather=weather_text,
+                self_location=self_loc, self_recent=self_rec, news=news_text,
+            )
             ctx_block = role_engine.format_context_block(ctx)
         except Exception as exc:  # noqa: BLE001
             _log.warning("greeting context build failed: %s", exc)
@@ -1569,11 +3603,15 @@ async def role_greeting():
         "就像真人微信里突然发来一条消息一样自然，1-3 句话，别太长，别像系统通知。"
         "不要用'你好'这种客套开场。"
     )
-    system = {"role": "system", "content": persona + ctx_block + greeting_instruction + style_hint}
+    system = {"role": "system",
+              "content": persona + ctx_block + _META_HINT + greeting_instruction + style_hint
+                         + _time_hint() + _self_hint() + _role_news_hint()
+                         + _location_hint() + _weather_hint()}
     messages = [system, {"role": "user", "content": "（你主动发消息给老公）"}]
     raw = await llm_chat(messages)
     fallback_style = cfg.get("voice", {}).get("style") or "自然"
     style, reply = parse_style_prefix(raw, fallback=fallback_style)
+    reply = _strip_meta_notes(reply)
     if not reply.strip():
         reply = "老公，在忙吗？"
         style = fallback_style
@@ -1599,42 +3637,101 @@ async def tts(req: dict):
 
 class SessionsRequest(BaseModel):
     sessions: list[dict] = []
+    # 删除墓碑 [{id, ts(ms)}]：多端同步时防止已删会话被另一端的旧快照复活
+    deleted: list[dict] = []
 
 
 @app.get("/api/sessions")
 async def get_sessions():
     """读取持久化的会话历史（data/sessions.json），文件不存在或损坏时返回空列表。
-    带 mtime 缓存：不频繁读盘，且并发安全。"""
+    带 mtime 缓存：不频繁读盘，且并发安全。
+    deleted 为删除墓碑列表（多端同步用：任一端删除的会话不应被另一端复活）。"""
     if not SESSIONS_PATH.exists():
-        return {"sessions": []}
+        return {"sessions": [], "deleted": []}
     try:
         mtime = SESSIONS_PATH.stat().st_mtime_ns
     except OSError:
-        return {"sessions": []}
+        return {"sessions": [], "deleted": []}
     if mtime != _sess_cache["_mtime_ns"]:
         try:
             raw = await asyncio.to_thread(SESSIONS_PATH.read_text, encoding="utf-8")
             data = json.loads(raw)
             sessions = data.get("sessions")
-            _sess_cache["_value"] = sessions if isinstance(sessions, list) else []
+            deleted = data.get("deleted")
+            value = {
+                "sessions": sessions if isinstance(sessions, list) else [],
+                "deleted": deleted if isinstance(deleted, list) else [],
+            }
         except (json.JSONDecodeError, OSError, AttributeError):
-            _sess_cache["_value"] = []
-        _sess_cache["_mtime_ns"] = mtime
-    return {"sessions": list(_sess_cache["_value"])}
+            # 读/解析失败不动缓存（可能是瞬时故障），本次返回空即可
+            return {"sessions": [], "deleted": []}
+        # 复核窗口：读盘期间可能有并发 put_sessions 写了新文件。
+        # 持锁后再看 mtime，文件已变就放弃本次缓存更新（下一请求重读），
+        # 避免旧内容覆盖并发写入的新缓存
+        async with _io_locks["sessions"]:
+            try:
+                cur_mtime = SESSIONS_PATH.stat().st_mtime_ns
+            except OSError:
+                cur_mtime = 0
+            if cur_mtime == mtime:
+                _sess_cache["_value"] = value
+                _sess_cache["_mtime_ns"] = mtime
+    value = _sess_cache["_value"]
+    return {"sessions": list(value.get("sessions", [])), "deleted": list(value.get("deleted", []))}
 
 
 @app.put("/api/sessions")
-async def put_sessions(req: SessionsRequest):
-    """覆盖保存会话历史：并发安全写锁 + 原子 replace + 写后更新内存缓存。"""
-    # 单条记录上限 64KB，500 条就是 32MB 上限，防止异常 payload
-    sessions = req.sessions[-500:]
-    try:
-        payload_str = json.dumps({"sessions": sessions}, ensure_ascii=False, indent=2)
-    except (TypeError, ValueError):
-        raise HTTPException(400, "sessions 数据非法，无法序列化")
-    if len(payload_str.encode("utf-8")) > 32 * 1024 * 1024:
-        raise HTTPException(400, "sessions 数据过大")
+async def put_sessions(req: SessionsRequest, client: str = ""):
+    """保存会话历史（多端合并语义）并广播给其他在线设备。
+
+    不做整包覆盖：以现有文件为基底按 id 合并（updatedAt 新者胜）再按墓碑过滤，
+    避免某端的旧快照抹掉另一端刚写入的消息/把已删会话复活。
+    写锁 + 原子 replace + 写后更新缓存。client 为来源设备 id，广播时跳过来源避免回声。"""
+    incoming = req.sessions[-500:]
+
+    def _dump(obj) -> str:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+
     async with _io_locks["sessions"]:
+        current: list = []
+        file_deleted: list = []
+        if SESSIONS_PATH.exists():
+            try:
+                raw = await asyncio.to_thread(SESSIONS_PATH.read_text, encoding="utf-8")
+                data = json.loads(raw)
+                if isinstance(data.get("sessions"), list):
+                    current = data["sessions"]
+                if isinstance(data.get("deleted"), list):
+                    file_deleted = data["deleted"]
+            except (json.JSONDecodeError, OSError, AttributeError):
+                pass  # 文件损坏按空基底处理，本次写入重建
+        now_ms = time.time() * 1000
+        tombstones = _norm_tombstones([*file_deleted, *req.deleted], now_ms)
+        merged = _merge_sessions(current, incoming, tombstones)
+        if len(tombstones) > _TOMBSTONE_MAX_COUNT:
+            tombstones = dict(sorted(tombstones.items(), key=lambda kv: kv[1], reverse=True)[:_TOMBSTONE_MAX_COUNT])
+
+        # ===== 破坏性合并保险：写盘前落盘备份 =====
+        # 多端同步若某端持有旧快照/误删墓碑，可能让本端会话 history 被整体吞掉
+        # （曾发生：手机端测试删除记录覆盖服务端，28 条对话只剩空壳）。
+        # 合并后若出现"消息数骤降"，先把当前文件备份为 .bak-时间戳 再写入，
+        # 保证任何情况下都能从最近的完整快照回滚。备份节流：同文件 5 分钟内至多一次。
+        try:
+            _backup_sessions_before_destructive(current, merged)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("sessions backup skipped: %s", exc)
+
+        payload_obj = {
+            "sessions": merged,
+            "deleted": [{"id": k, "ts": v} for k, v in sorted(tombstones.items(), key=lambda kv: kv[1])],
+        }
+        try:
+            # 序列化可达数十 MB，纯 CPU 工作丢线程池，别卡事件循环
+            payload_str = await asyncio.to_thread(_dump, payload_obj)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "sessions 数据非法，无法序列化")
+        if len(payload_str.encode("utf-8")) > 32 * 1024 * 1024:
+            raise HTTPException(400, "sessions 数据过大")
         tmp = SESSIONS_PATH.with_suffix(".tmp")
         await asyncio.to_thread(tmp.write_text, payload_str, encoding="utf-8")
         await asyncio.to_thread(tmp.replace, SESSIONS_PATH)
@@ -1642,8 +3739,44 @@ async def put_sessions(req: SessionsRequest):
             _sess_cache["_mtime_ns"] = SESSIONS_PATH.stat().st_mtime_ns
         except OSError:
             _sess_cache["_mtime_ns"] = 0
-        _sess_cache["_value"] = sessions
+        _sess_cache["_value"] = payload_obj
+    _broadcast_sessions_changed(client)
     return {"ok": True}
+
+
+@app.get("/api/sync/stream")
+async def sync_stream(request: Request, client: str = ""):
+    """多端会话同步 SSE 推送。
+
+    事件：data: {"type":"sessions_updated","ts":<ms>} —— 其他设备写入了会话，
+    收到方应立即 GET /api/sessions 并与本地合并。
+    每 15s 发一条 ": ping" 注释帧保活（隧道/代理空闲会掐连接）；
+    断线由 EventSource 按 retry 字段自动重连。client 为设备 id，用于跳过回声。"""
+    q: asyncio.Queue = asyncio.Queue(maxsize=64)
+    sub = (client or "", q)
+    _sync_subscribers.append(sub)
+
+    async def events():
+        try:
+            yield "retry: 3000\n\n"
+            while True:
+                try:
+                    payload = await asyncio.wait_for(q.get(), timeout=15)
+                    yield f"data: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                if await request.is_disconnected():
+                    break
+        finally:
+            try:
+                _sync_subscribers.remove(sub)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        events(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/asr")
@@ -1682,7 +3815,9 @@ async def asr(file: UploadFile = File(...)):
 
 
 class ConfigUpdate(BaseModel):
-    provider: str = "local"
+    # provider 默认必须为空串：前端左下角「语音引擎切换」只传 voice_provider，
+    # 若默认值是 "local"，每次切语音都会把 LLM 引擎误切成本地（历史 bug）
+    provider: str = ""
     local_base_url: str = ""
     local_model: str = ""
     cloud_provider: str = ""
@@ -1698,13 +3833,19 @@ class ConfigUpdate(BaseModel):
     aliyun_base_url: str = ""
     aliyun_model: str = ""
     aliyun_voice: str = ""
+    minimax_api_key: str = ""
+    minimax_base_url: str = ""
+    minimax_model: str = ""
+    minimax_voice: str = ""
+    minimax_speed: float | None = None
+    minimax_vol: float | None = None
+    minimax_pitch: float | None = None
+    minimax_sample_rate: int | None = None
+    location_manual: str = ""   # 手动位置（如「广东省深圳市南山区」），非空才写入
 
 
-@app.post("/api/config")
-async def update_config(upd: ConfigUpdate):
-    # with_env=False + deepcopy：在磁盘原值副本上改，避免把 .env 密钥明文写进 config.json；
-    # 副本也避免并发请求在 save_config 等锁期间读到改了一半的缓存。
-    cfg = copy.deepcopy(load_config(with_env=False))
+def _merge_config_update(cfg: dict, upd: ConfigUpdate) -> None:
+    """把 ConfigUpdate 的字段合并进配置副本（读-改-写的「改」），就地修改。"""
     # setdefault 防止手改 config.json 缺 local/cloud 键时 KeyError 500
     local_cfg = cfg.setdefault("local", {})
     cloud_cfg = cfg.setdefault("cloud", {})
@@ -1747,7 +3888,7 @@ async def update_config(upd: ConfigUpdate):
     if upd.voice_language:
         cfg.setdefault("voice", {})["language"] = upd.voice_language
     # 声音克隆引擎（与对话 API 完全独立的另一套配置）
-    if upd.voice_provider in ("local", "aliyun"):
+    if upd.voice_provider in ("local", "aliyun", "minimax"):
         voice_cfg = cfg.setdefault("voice", {})
         voice_cfg["provider"] = upd.voice_provider
         voice_cfg["manual_provider"] = True
@@ -1761,7 +3902,40 @@ async def update_config(upd: ConfigUpdate):
         cfg.setdefault("voice", {}).setdefault("aliyun", {})["model"] = upd.aliyun_model
     if upd.aliyun_voice:
         cfg.setdefault("voice", {}).setdefault("aliyun", {})["voice"] = upd.aliyun_voice
-    await save_config(cfg)
+    if upd.minimax_api_key:
+        cfg.setdefault("voice", {}).setdefault("minimax", {})["api_key"] = upd.minimax_api_key
+    if upd.minimax_base_url:
+        cfg.setdefault("voice", {}).setdefault("minimax", {})["base_url"] = upd.minimax_base_url
+    if upd.minimax_model:
+        cfg.setdefault("voice", {}).setdefault("minimax", {})["model"] = upd.minimax_model
+    if upd.minimax_voice:
+        cfg.setdefault("voice", {}).setdefault("minimax", {})["voice"] = upd.minimax_voice
+    # 采样参数用 is not None 判断（vol=0 是合法值，不能用 truthy 判断）
+    if upd.minimax_speed is not None:
+        cfg.setdefault("voice", {}).setdefault("minimax", {})["speed"] = upd.minimax_speed
+    if upd.minimax_vol is not None:
+        cfg.setdefault("voice", {}).setdefault("minimax", {})["vol"] = upd.minimax_vol
+    if upd.minimax_pitch is not None:
+        cfg.setdefault("voice", {}).setdefault("minimax", {})["pitch"] = upd.minimax_pitch
+    if upd.minimax_sample_rate is not None:
+        cfg.setdefault("voice", {}).setdefault("minimax", {})["sample_rate"] = upd.minimax_sample_rate
+    # 位置感知：手动位置非空才写入（清空走 POST /api/location 的 clear 标记）
+    if upd.location_manual:
+        cfg.setdefault("location", {})["manual"] = upd.location_manual.strip()
+    # location 块不存在时补默认结构，保证前端 /api/location 能正常读
+    cfg.setdefault("location", {})
+
+
+@app.post("/api/config")
+async def update_config(upd: ConfigUpdate):
+    # 读-改-写全程持 config 锁：此前只有写盘段持锁，并发「保存设置 + 切角色」
+    # 会各自读到同一份旧快照，后写覆盖先写导致丢失更新
+    async with _io_locks["config"]:
+        # with_env=False + deepcopy：在磁盘原值副本上改，避免把 .env 密钥明文写进 config.json；
+        # 副本也避免并发请求读到改了一半的缓存。
+        cfg = copy.deepcopy(load_config(with_env=False))
+        _merge_config_update(cfg, upd)
+        await _save_config_locked(cfg)
     return {"ok": True}
 
 
@@ -1784,22 +3958,118 @@ async def roles_list():
 async def roles_apply(req: dict):
     """切换内置角色：应用其人设与音色设置（voice.provider / preset / style）。"""
     key = (req.get("key") or "").strip()
-    # 同 update_config：磁盘原值副本上改，不把 env 密钥持久化
-    cfg = copy.deepcopy(load_config(with_env=False))
-    role = cfg.get("roles", {}).get(key)
-    if not role:
-        raise HTTPException(404, f"未知角色: {key}")
-    cfg["active_role"] = key
-    cfg["persona"] = role.get("persona") or cfg.get("persona", "")
-    v = role.get("voice", {})
-    cfg.setdefault("voice", {})
-    if not cfg["voice"].get("manual_provider"):
-        cfg["voice"]["provider"] = v.get("provider", "local")
-    if v.get("preset"):
-        cfg["voice"]["preset"] = v["preset"]
-    cfg["voice"]["style"] = v.get("style", "")
-    await save_config(cfg)
+    # 同 update_config：读-改-写全程持锁，磁盘原值副本上改，不把 env 密钥持久化
+    async with _io_locks["config"]:
+        cfg = copy.deepcopy(load_config(with_env=False))
+        role = cfg.get("roles", {}).get(key)
+        if not role:
+            raise HTTPException(404, f"未知角色: {key}")
+        cfg["active_role"] = key
+        cfg["persona"] = role.get("persona") or cfg.get("persona", "")
+        v = role.get("voice", {})
+        cfg.setdefault("voice", {})
+        if not cfg["voice"].get("manual_provider"):
+            cfg["voice"]["provider"] = v.get("provider", "local")
+        if v.get("preset"):
+            cfg["voice"]["preset"] = v["preset"]
+        cfg["voice"]["style"] = v.get("style", "")
+        await _save_config_locked(cfg)
+    # 切角色后：角色现实动态缓存属于旧角色，后台重新搜索（不阻塞本次切换）
+    _spawn_bg(_bg_role_news_refresh(force=True))
     return {"ok": True, "role": key, "persona": cfg["persona"]}
+
+
+class LocationUpdate(BaseModel):
+    """位置更新（三选一，可组合）：
+    - manual: 手动位置文本（写入 config.location.manual，最高优先级）
+    - clear:  清除手动位置（回到自动定位）
+    - lat/lng: GPS 经纬度上报（写入 data/location.json，source=gps）
+    - refresh: 强制重新 IP 定位
+    """
+    manual: str | None = None
+    clear: bool = False
+    lat: float | None = None
+    lng: float | None = None
+    refresh: bool = False
+
+
+@app.get("/api/location")
+async def location_get():
+    """查询当前位置（含来源与手动/自动各值），供前端展示。"""
+    return _location_summary()
+
+
+@app.post("/api/location")
+async def location_update(upd: LocationUpdate):
+    """更新位置：手动设置 / GPS 上报 / 重新 IP 定位 / 清除手动。"""
+    if upd.manual is not None or upd.clear:
+        # 手动位置写 config（读-改-写持锁，与保存设置同一套），清空也走这里
+        async with _io_locks["config"]:
+            cfg = copy.deepcopy(load_config(with_env=False))
+            loc = cfg.setdefault("location", {})
+            loc["manual"] = "" if upd.clear else (upd.manual or "").strip()
+            await _save_config_locked(cfg)
+    if upd.lat is not None and upd.lng is not None:
+        _save_auto_location({
+            "version": 1,
+            "city": "",
+            "lat": round(float(upd.lat), 6),
+            "lng": round(float(upd.lng), 6),
+            "source": "gps",
+            "ip": "",
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        })
+    if upd.refresh:
+        await _bg_ip_locate(force=True)
+    # 位置有任何变化 → 天气缓存作废，后台重新拉取（不阻塞本轮返回）
+    if upd.manual is not None or upd.clear or upd.lat is not None \
+            or upd.lng is not None or upd.refresh:
+        _spawn_bg(_bg_weather_refresh(force=True))
+    return _location_summary()
+
+
+@app.get("/api/weather")
+async def weather_get():
+    """查询当前天气（缓存优先，过期自动后台刷新）。"""
+    text = _weather_text()
+    s = _location_summary()
+    snap = _weather_snapshot()
+    return {
+        "enabled": _weather_enabled(),
+        "location": s["effective"] if s["enabled"] else "",
+        "weather": text,
+        "cached_at": snap.get("ts") or 0,
+        "city": snap.get("city") or "",
+    }
+
+
+@app.post("/api/weather/refresh")
+async def weather_refresh():
+    """强制刷新天气（等待新结果）。"""
+    text = await _bg_weather_refresh(force=True)
+    return {"weather": text}
+
+
+@app.get("/api/role-news")
+async def role_news_get():
+    """查询当前角色的现实动态（联网搜索的最近真实消息，缓存优先）。"""
+    cfg = load_config()
+    keyword, role_name = _role_news_config(cfg)
+    snap = _load_role_news()
+    return {
+        "role": role_name,
+        "keyword": keyword,
+        "enabled": bool(keyword),
+        "news": _role_news_text(),
+        "cached_at": snap.get("ts") or 0,
+    }
+
+
+@app.post("/api/role-news/refresh")
+async def role_news_refresh():
+    """强制刷新角色现实动态（等待搜索+总结结果）。"""
+    text = await _bg_role_news_refresh(force=True)
+    return {"news": text}
 
 
 @app.post("/api/upload")
@@ -1810,10 +4080,17 @@ async def upload_files(files: list[UploadFile] = File(...)):
     if len(files) > 8:
         raise HTTPException(400, "一次最多上传 8 个文件")
     results = []
+    written: list[Path] = []  # 本批已落盘文件：中途失败时一并清理，不留孤儿
+
+    def _cleanup_batch() -> None:
+        for w in written:
+            w.unlink(missing_ok=True)
+
     for f in files:
         original = (f.filename or "").strip() or "file"
         suffix = (Path(original).suffix or "").lower()
         if suffix not in _ALLOWED_ATTACH_SUFFIXES:
+            _cleanup_batch()
             raise HTTPException(400, f"不支持的文件类型: {suffix or '无扩展名'}（{original}）")
         stored = f"att_{uuid.uuid4().hex[:12]}{suffix}"
         dest = UPLOAD_DIR / stored
@@ -1832,13 +4109,17 @@ async def upload_files(files: list[UploadFile] = File(...)):
                     fout.write(chunk)
         except HTTPException:
             dest.unlink(missing_ok=True)
+            _cleanup_batch()
             raise
         except OSError as exc:
             dest.unlink(missing_ok=True)
+            _cleanup_batch()
             raise HTTPException(500, f"上传保存失败: {exc}")
         if total == 0:
             dest.unlink(missing_ok=True)
+            _cleanup_batch()
             raise HTTPException(400, f"文件为空: {original}")
+        written.append(dest)
         kind = "image" if suffix in _IMAGE_SUFFIXES else ("doc" if suffix in _DOC_SUFFIXES else "file")
         results.append({
             "name": original,

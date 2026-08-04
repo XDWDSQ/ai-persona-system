@@ -54,6 +54,20 @@ def test_too_similar_to_last():
                                    [{"role": "assistant", "content": prev}]))
 
 
+def test_time_hint():
+    from datetime import datetime
+    hint = server._time_hint()
+    today = datetime.now().strftime("%Y-%m-%d")
+    check("时间指令包含当前真实日期", today in hint, hint[:80])
+    check("时间指令带显式标记", "【当前真实时间】" in hint)
+    check("时间指令禁止编造时间", "禁止" in hint and "编造" in hint)
+    anchored = server._time_anchor("现在几点了")
+    check("时间锚点前置且保留原消息",
+          anchored.startswith("(系统提供的当前真实时间：") and anchored.endswith("现在几点了"),
+          anchored[:80])
+    check("时间锚点包含当前真实日期", today in anchored)
+
+
 def test_retry_guard():
     import copy
     from fastapi.testclient import TestClient
@@ -77,6 +91,9 @@ def test_retry_guard():
         return "[style:自然]好的，这次换个说法。"
 
     server.llm_chat = fake_chat
+    # 访问门禁是后加的，离线测试不测鉴权，临时关掉以免 401
+    orig_token = server._access_token
+    server._access_token = lambda: None
     try:
         with TestClient(server.app) as client:
             r = client.post("/api/chat", json={
@@ -90,12 +107,14 @@ def test_retry_guard():
     finally:
         server.load_config = orig_load
         server.llm_chat = orig_chat
+        server._access_token = orig_token
 
 
 def main():
-    for t in (test_clean_history, test_degenerate_reply, test_too_similar_to_last, test_retry_guard):
+    for t in (test_clean_history, test_degenerate_reply, test_too_similar_to_last,
+              test_time_hint, test_retry_guard):
         t()
-    print(f"\n{'=' * 50}\n共 4 组，失败 {_FAIL} 组")
+    print(f"\n{'=' * 50}\n共 5 组，失败 {_FAIL} 组")
     sys.exit(1 if _FAIL else 0)
 
 

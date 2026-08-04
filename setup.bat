@@ -19,7 +19,7 @@ if exist "%USERPROFILE%\.trae-cn\skills\local-asr\scripts\install-env.ps1" (
     echo [错误] ASR skill 尚未安装，请先从 OpenClaw 安装 local-asr skill
 )
 
-echo === [3/5] 从上游获取本地 LLM（llama.cpp 运行时 + Qwen3-4B 模型）===
+echo === [3/5] 从上游获取本地 LLM（llama.cpp 运行时 + Qwen3.5-4B 模型）===
 if exist "%PY%" (
     "%PY%" "llm\get_llm.py"
 ) else (

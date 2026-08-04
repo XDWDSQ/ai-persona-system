@@ -23,6 +23,9 @@ llm/bin/
 llm/models/
 大帅音频/
 
+# 部署包（含密钥或为构建产物，随用随生成，不入库）
+*.zip
+
 # 临时调试脚本（仅根目录）
 /scripts/
 _preview.jpg

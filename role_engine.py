@@ -393,18 +393,98 @@ def build_time_context(now: datetime | None = None) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- 位置层 --------
+def build_location_context(location_text: str | None = None) -> str:
+    """生成位置层上下文：用户当前所在位置（系统提供）。
+
+    location_text 为空串/None 时返回空串，即不注入任何位置信息。
+    文案刻意用中性表述、不带称呼：不同角色对用户称呼不同（老公/朋友/老铁…），
+    位置属于全局客观事实，把称呼留给 persona 自行处理，避免写死在全局层污染其他角色。
+    """
+    location_text = (location_text or "").strip()
+    if not location_text:
+        return ""
+    return f"对方（用户）当前所在位置：{location_text}。"
+
+
+# ---------------------------------------------------------------- 天气层 --------
+def build_weather_context(weather_text: str | None = None) -> str:
+    """生成天气层上下文：用户所在位置的实时天气（系统查询，非模型编造）。
+
+    weather_text 为空串/None 时返回空串，即不注入。中性表述、不带称呼，与位置层同理。
+    """
+    weather_text = (weather_text or "").strip()
+    if not weather_text:
+        return ""
+    return f"对方（用户）当前所在位置的天气：{weather_text}。"
+
+
+# ---------------------------------------------------------------- 自况层 --------
+def build_self_context(location: str | None = None, recent: str | None = None) -> str:
+    """生成自况层上下文：角色自己此刻的位置与最近在忙的事（第一视角）。
+
+    location/recent 均为空时返回空串（不注入）。这里的「你」指角色自己，
+    与位置层（描述用户）方向相反：自况层告诉角色「你在哪、在忙什么」。
+    """
+    loc = (location or "").strip()
+    rec = (recent or "").strip()
+    parts = []
+    if loc:
+        parts.append(f"你此刻在{loc}")
+    if rec:
+        parts.append(f"最近在忙：{rec}")
+    if not parts:
+        return ""
+    return "。".join(parts) + "。"
+
+
+# ---------------------------------------------------------------- 现实动态层 --------
+def build_news_context(news_text: str | None = None) -> str:
+    """生成现实动态层上下文：角色在现实世界里最近的真实动态（联网搜索所得）。
+
+    news_text 为空串/None 时返回空串（不注入）。与自况层（静态配置）互补：
+    自况是「系统设定的此刻状态」，现实动态是「搜索到的最近真实消息」。"""
+    news_text = (news_text or "").strip()
+    if not news_text:
+        return ""
+    return f"你在现实世界最近的真实动态：{news_text}。"
+
+
 # ---------------------------------------------------------------- 组装上下文 --------
 def build_context(memory_store: MemoryStore, state_store: StateStore, query: str,
-                  top_k: int = _MEMORY_TOP_K_DEFAULT) -> dict:
-    """组装三层上下文，返回 dict：
-    { "time": str, "state": str, "memories": [str, ...] }
+                  top_k: int = _MEMORY_TOP_K_DEFAULT, location: str | None = None,
+                  weather: str | None = None, self_location: str | None = None,
+                  self_recent: str | None = None, news: str | None = None) -> dict:
+    """组装上下文，返回 dict：
+    { "time": str, "state": str, "memories": [str, ...], "location": str,
+      "weather": str, "self": str, "news": str }
+    location/weather：用户位置/天气（调用方提供，空串不注入）。
+    self_location/self_recent：角色自己的位置/最近动态（第一视角，空串不注入）。
+    news：角色现实世界最近真实动态（联网搜索所得，空串不注入）。
     任何一层失败都返回空文案，绝不抛异常。
     """
-    ctx = {"time": "", "state": "", "memories": []}
+    ctx = {"time": "", "state": "", "memories": [], "location": "",
+           "weather": "", "self": "", "news": ""}
     try:
         ctx["time"] = build_time_context()
     except Exception as exc:  # noqa: BLE001
         _log.warning("build_time_context failed: %s", exc)
+    try:
+        ctx["self"] = build_self_context(self_location, self_recent)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("build_self_context failed: %s", exc)
+    try:
+        ctx["news"] = build_news_context(news)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("build_news_context failed: %s", exc)
+    try:
+        ctx["location"] = build_location_context(location)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("build_location_context failed: %s", exc)
+    try:
+        ctx["weather"] = build_weather_context(weather)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("build_weather_context failed: %s", exc)
     try:
         st = state_store.get_decayed()
         emo = st["emotion"]
@@ -428,6 +508,14 @@ def format_context_block(ctx: dict) -> str:
     parts = []
     if ctx.get("time"):
         parts.append(f"【此刻上下文】\n{ctx['time']}")
+    if ctx.get("self"):
+        parts.append(f"【你此刻在哪里、在忙什么】\n{ctx['self']}")
+    if ctx.get("news"):
+        parts.append(f"【你的现实动态】\n{ctx['news']}")
+    if ctx.get("location"):
+        parts.append(f"【用户位置】\n{ctx['location']}")
+    if ctx.get("weather"):
+        parts.append(f"【今日天气】\n{ctx['weather']}")
     if ctx.get("state"):
         parts.append(f"【你的状态】\n{ctx['state']}")
     if ctx.get("memories"):
@@ -492,35 +580,61 @@ class PostProcessor:
             return None
 
     @staticmethod
+    def _iter_json_objects_reverse(raw: str):
+        """从右往左做花括号配平扫描，依次产出文本中每个完整 JSON 对象子串
+        （最后一个对象最先产出）。比正则可靠：嵌套 JSON 用 [^{}] 匹配不到，
+        贪婪 \\{.*\\} 又会在输出含多组花括号时抓错范围。"""
+        depth = 0
+        end = -1
+        for i in range(len(raw) - 1, -1, -1):
+            ch = raw[i]
+            if ch == "}":
+                if depth == 0:
+                    end = i
+                depth += 1
+            elif ch == "{":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and end >= 0:
+                        yield raw[i:end + 1]
+                        end = -1
+
+    @staticmethod
     def _parse(raw: str) -> dict | None:
         if not raw:
             return None
-        # 兼容模型输出带 ```json 围栏 / 前后说明文字 / reasoning 模式
-        # 从后往前找最后一个 JSON 对象（reasoning 模型可能先思考再输出 JSON）
-        matches = list(re.finditer(r'\{[^{}]*"(?:emotion|memories|energy_delta)"[^{}]*\}', raw, re.S))
-        if not matches:
-            # 兜底：找任意 JSON 对象
-            m = re.search(r"\{.*\}", raw, re.S)
-            if not m:
-                return None
-            json_str = m.group(0)
-        else:
-            # 取最后一个匹配（最可能是最终答案而非 reasoning 中的示例）
-            json_str = matches[-1].group(0)
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(data, dict):
+        # 兼容模型输出带 ```json 围栏 / 前后说明文字 / reasoning 模式：
+        # 从后往前逐个尝试完整 JSON 对象，优先采用含标注字段的那个
+        # （reasoning 模型可能先输出示例 JSON，再输出最终答案，最后出现的优先）
+        data: dict | None = None
+        fallback: dict | None = None
+        for candidate in PostProcessor._iter_json_objects_reverse(raw):
+            try:
+                obj = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if fallback is None:
+                fallback = obj
+            if any(k in obj for k in ("emotion", "memories", "energy_delta")):
+                data = obj
+                break
+        if data is None:
+            data = fallback
+        if not data:
             return None
         emo = data.get("emotion")
         if not isinstance(emo, dict):
             emo = {}
+        try:
+            valence = float(emo.get("valence", 0))
+            arousal = float(emo.get("arousal", 0))
+            energy_delta = float(data.get("energy_delta", 0))
+        except (TypeError, ValueError):
+            valence, arousal, energy_delta = 0.0, 0.0, 0.0
         return {
-            "emotion": {
-                "valence": float(emo.get("valence", 0)),
-                "arousal": float(emo.get("arousal", 0)),
-            },
-            "energy_delta": float(data.get("energy_delta", 0)),
+            "emotion": {"valence": valence, "arousal": arousal},
+            "energy_delta": energy_delta,
             "memories": [t for t in (data.get("memories") or []) if isinstance(t, str) and t.strip()][:5],
         }

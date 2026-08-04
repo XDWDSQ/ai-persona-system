@@ -1254,7 +1254,8 @@
             /* 密钥与思考开关直接回填：切换供应商后保存不会串用上一个 key */
             document.getElementById('cloud_api_key').value = s.cloud.api_key || '';
             var ct = document.getElementById('cloud_thinking');
-            if (ct) ct.checked = s.cloud.thinking !== false;
+            /* 仅在后端明确给出布尔值时回填：老配置缺字段时保留用户当前选择，不强制改回开启 */
+            if (ct && s.cloud && typeof s.cloud.thinking === 'boolean') ct.checked = s.cloud.thinking;
             document.getElementById('persona').value = s.persona;
             var va = s.voice_aliyun || {};
             document.getElementById('aliyun_api_key').value = va.api_key || '';
@@ -1375,10 +1376,16 @@
             dot.classList.toggle('offline', !ok);
             dot.classList.add(state.voiceProvider === 'local' ? 'local' : 'cloud');
           }
+          /* refreshStatus 竞态保护：页面加载/打开设置/保存后等多处都会触发刷新，
+             手机弱网或隧道延迟下旧请求可能晚于新请求返回，若不丢弃过期响应，
+             fillConfig 会把刚保存的思考模式等设置回填成旧值（关了又自动开启） */
+          var _statusSeq = 0;
           async function refreshStatus() {
+            var seq = ++_statusSeq;
             setDotsChecking();
             try {
               var s = await api('/api/status');
+              if (seq !== _statusSeq) return;  /* 过期响应：丢弃，不覆盖新状态 */
               state.provider = s.provider;
               state.voiceProvider = s.voice_provider || 'local';
               state.aliyunConfigured = !!s.aliyun_configured;
@@ -1426,6 +1433,7 @@
                 wl.appendChild(document.createTextNode(role.name + ' · ' + (s.active_online ? '在线' : '离线')));
               }
             } catch (e) {
+              if (seq !== _statusSeq) return;  /* 过期错误同样丢弃 */
               var pn = $('.p-name');
               if (pn) pn.textContent = '后端未连接';
               var pd = $('.p-detail');

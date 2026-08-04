@@ -21,8 +21,9 @@ REM 轻量校验后端依赖（安装已迁移到 setup.bat）
 
 echo.
 echo  AI 拟人系统已启动：http://127.0.0.1:8000
+echo  远程访问（Cloudflare Tunnel / 局域网）需先配置访问口令。
 echo  关闭本窗口即停止服务。
 echo.
 start "" http://127.0.0.1:8000
-"%PY%" -m uvicorn server:app --host 127.0.0.1 --port 8000 --timeout-graceful-period 10
+"%PY%" -m uvicorn server:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 10
 pause

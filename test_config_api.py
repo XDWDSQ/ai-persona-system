@@ -38,7 +38,7 @@ def check(name: str, cond: bool, detail: str = ""):
 def _seed_config() -> dict:
     return {
         "provider": "local",
-        "local": {"base_url": "http://localhost:11434/v1", "model": "qwen3-4b"},
+        "local": {"base_url": "http://localhost:11434/v1", "model": "Qwen3.5-4B-Q4_K_M"},
         "cloud": {"base_url": "", "model": "", "api_key": ""},
         "voice": {"provider": "local"},
         "roles": {},

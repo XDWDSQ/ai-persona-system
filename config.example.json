@@ -1,8 +1,9 @@
 {
   "provider": "cloud",
+  "access_token": "",
   "local": {
     "base_url": "http://127.0.0.1:11434/v1",
-    "model": "Qwen3-4B-Q4_K_M",
+    "model": "Qwen3.5-4B-Q4_K_M",
     "api_key": "none"
   },
   "cloud": {
@@ -48,6 +49,11 @@
     "memory_limit": 200,
     "top_k": 5
   },
+  "location": {
+    "enabled": true,
+    "manual": "",
+    "weather": true
+  },
   "vision": {
     "enabled": true,
     "base_url": "http://127.0.0.1:11435/v1",
@@ -70,6 +76,10 @@
         "provider": "local",
         "preset": "default",
         "style": ""
+      },
+      "news": {
+        "enabled": true,
+        "keyword": "角色的现实关键词（用于联网搜索其最新动态，如战队名+ID；无现实身份可不配）"
       }
     }
   },
@@ -83,6 +93,16 @@
       "base_url": "https://dashscope.aliyuncs.com/api/v1",
       "model": "qwen3-tts-flash",
       "voice": "Cherry"
+    },
+    "minimax": {
+      "api_key": "",
+      "base_url": "https://api.minimaxi.com/v1",
+      "model": "speech-02-hd",
+      "voice": "male-qn-jingying",
+      "speed": 1.0,
+      "vol": 2,
+      "pitch": 0,
+      "sample_rate": 32000
     },
     "manual_provider": true
   },

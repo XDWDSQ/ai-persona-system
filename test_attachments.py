@@ -3,6 +3,7 @@
 
 运行：python test_attachments.py
 """
+import asyncio
 import copy
 import sys
 import time
@@ -132,21 +133,27 @@ def test_text_doc_prompt():
     path = server.UPLOAD_DIR / "att_test_readme.txt"
     path.write_text(txt, encoding="utf-8")
     try:
-        prompt = server._attachment_prompt_text(
+        prompt = asyncio.run(server._attachment_prompt_text(
             [{"kind": "doc", "name": "readme.txt", "url": f"/uploads/{path.name}"}],
             "帮我看看",
-        )
+        ))
         check("文本文档内容片段进入提示词", "本周会议纪要" in prompt and "帮我看看" in prompt, prompt)
     finally:
         path.unlink(missing_ok=True)
 
 
 def main():
-    with TestClient(server.app) as client:
-        test_upload(client)
-        test_chat_vision(client)
-        test_chat_attachment_fallback(client)
-        test_text_doc_prompt()
+    # 访问门禁是后加的，离线测试不测鉴权，临时关掉以免全部 401
+    orig_token = server._access_token
+    server._access_token = lambda: None
+    try:
+        with TestClient(server.app) as client:
+            test_upload(client)
+            test_chat_vision(client)
+            test_chat_attachment_fallback(client)
+            test_text_doc_prompt()
+    finally:
+        server._access_token = orig_token
     for p in _UPLOAD_CLEANUP:
         for _ in range(5):
             try:

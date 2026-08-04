@@ -142,7 +142,8 @@ def test_chat_searched_flag(client):
     cfg["cloud"] = {"base_url": "http://fake/v1", "model": "fake", "api_key": "none"}
     server.load_config = lambda with_env=True: cfg
 
-    async def fake_chat_search(system, history, user_content, cfg, temperature=0.8, anti_repeat=False):
+    async def fake_chat_search(system, history, user_content, cfg, temperature=0.8, anti_repeat=False,
+                               max_tokens=None, thinking=None):
         return "[style:自然]查到了", True
 
     server._chat_with_search = fake_chat_search
@@ -160,12 +161,18 @@ def test_chat_searched_flag(client):
 
 
 def main():
-    with TestClient(server.app) as client:
-        test_marker_parse()
-        test_ddg_parser()
-        test_chat_search_loop()
-        test_api_search(client)
-        test_chat_searched_flag(client)
+    # 访问门禁是后加的，离线测试不测鉴权，临时关掉以免全部 401
+    orig_token = server._access_token
+    server._access_token = lambda: None
+    try:
+        with TestClient(server.app) as client:
+            test_marker_parse()
+            test_ddg_parser()
+            test_chat_search_loop()
+            test_api_search(client)
+            test_chat_searched_flag(client)
+    finally:
+        server._access_token = orig_token
     print(f"\n{'=' * 50}\n搜索测试完成，失败 {_FAIL} 组")
     sys.exit(1 if _FAIL else 0)
 
