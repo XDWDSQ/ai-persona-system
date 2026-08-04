@@ -3,6 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0a0a0a">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <title>小拟 · AI 拟人系统</title>
     <style id="theme-vars">
 /* Source: Vercel Design Library (dl_builtin_vercel) — verbatim tokens.
@@ -226,49 +228,11 @@
 }
 
     </style>
-    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.3.1/dist/index.global.js"></script>
-    <style type="text/tailwindcss">
-  @theme inline {
-    --color-background: var(--vercel-background);
-    --color-foreground: var(--vercel-foreground);
-    --color-card: var(--vercel-card);
-    --color-card-foreground: var(--vercel-card-foreground);
-    --color-popover: var(--vercel-popover);
-    --color-popover-foreground: var(--vercel-popover-foreground);
-    --color-primary: var(--vercel-primary);
-    --color-primary-foreground: var(--vercel-primary-foreground);
-    --color-secondary: var(--vercel-secondary);
-    --color-secondary-foreground: var(--vercel-secondary-foreground);
-    --color-muted: var(--vercel-muted);
-    --color-muted-foreground: var(--vercel-muted-foreground);
-    --color-accent: var(--vercel-accent);
-    --color-accent-foreground: var(--vercel-accent-foreground);
-    --color-destructive: var(--vercel-destructive);
-    --color-destructive-foreground: var(--vercel-destructive-foreground);
-    --color-border: var(--vercel-border);
-    --color-input: var(--vercel-input);
-    --color-ring: var(--vercel-ring);
-    --color-chart-1: var(--vercel-chart-1);
-    --color-chart-2: var(--vercel-chart-2);
-    --color-chart-3: var(--vercel-chart-3);
-    --color-chart-4: var(--vercel-chart-4);
-    --color-chart-5: var(--vercel-chart-5);
-    --color-sidebar: var(--vercel-sidebar);
-    --color-sidebar-foreground: var(--vercel-sidebar-foreground);
-    --color-sidebar-primary: var(--vercel-sidebar-primary);
-    --color-sidebar-primary-foreground: var(--vercel-sidebar-primary-foreground);
-    --color-sidebar-accent: var(--vercel-sidebar-accent);
-    --color-sidebar-accent-foreground: var(--vercel-sidebar-accent-foreground);
-    --radius-sm: var(--vercel-radius-sm);
-    --radius-md: var(--vercel-radius-md);
-    --radius-lg: var(--vercel-radius-lg);
-  }
-  @layer base {
-    body { background: var(--vercel-background); color: var(--vercel-foreground); }
-    td, th { @apply break-words; word-break: break-all; word-break: auto-phrase; }
-    th { @apply whitespace-nowrap; }
-  }
-    </style>
+    <!-- 字体：Geist / Geist Mono（font-display:swap，加载失败自动回落系统字体）。
+         原 Tailwind 浏览器运行时（~500KB JIT）只服务三个工具类，已由兜底样式覆盖，移除 -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style id="semantic-token-fallback">
       .bg-background { background-color: var(--vercel-background); }
       .text-background { color: var(--vercel-background); }
@@ -394,6 +358,10 @@
     <style>
       .no-scrollbar::-webkit-scrollbar { display: none; }
       .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+      /* Tailwind 运行时兜底：CDN 不可达时这三个工具类仍有效（页面仅 body 用到） */
+      .min-h-screen { min-height: 100vh; }
+      .font-sans { font-family: var(--font-sans); }
+      .antialiased { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
       [data-icon] {
         display: inline-flex;
         align-items: center;
@@ -428,6 +396,9 @@
         .nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);background:color-mix(in srgb,var(--background) 72%,transparent);border-bottom:1px solid var(--border)}
         .nav-inner{display:flex;align-items:center;justify-content:space-between;height:64px}
         .brand{display:flex;align-items:center;gap:11px}
+        /* 品牌名与副标题纵向堆叠：原先两个 inline span 挤在一行，margin-top 对 inline 无效 */
+        .brand > span:not(.brand-mark){display:flex;flex-direction:column;min-width:0}
+        a:focus-visible,.btn:focus-visible{outline:2px solid color-mix(in srgb,var(--chart-2) 70%,transparent);outline-offset:2px}
         .brand-mark{width:30px;height:30px;border-radius:8px;background:var(--foreground);display:flex;align-items:center;justify-content:center;color:var(--background);box-shadow:0 0 0 1px var(--border)}
         .brand-mark svg{width:17px;height:17px}
         .brand-name{font-size:15px;font-weight:600;letter-spacing:-.01em;line-height:1}
@@ -455,8 +426,10 @@
         .hero{position:relative;padding:96px 0 84px;overflow:hidden}
         .hero::before{content:"";position:absolute;top:-180px;left:50%;transform:translateX(-50%);width:900px;height:560px;background:radial-gradient(ellipse at center,color-mix(in srgb,var(--chart-2) 22%,transparent),transparent 68%);pointer-events:none;z-index:0;animation:glowDrift 14s ease-in-out infinite alternate}
         @keyframes glowDrift{0%{transform:translateX(-54%) translateY(0);opacity:.78}50%{transform:translateX(-46%) translateY(-12px);opacity:1}100%{transform:translateX(-48%) translateY(6px);opacity:.82}}
-        .hero::after{content:"";position:absolute;inset:0;background-image:radial-gradient(color-mix(in srgb,var(--muted-foreground) 22%,transparent) 1px,transparent 1px);background-size:26px 26px;mask-image:radial-gradient(ellipse 80% 60% at 50% 35%,var(--foreground),transparent);-webkit-mask-image:radial-gradient(ellipse 80% 60% at 50% 35%,var(--foreground),transparent);opacity:.5;pointer-events:none;z-index:0;animation:dotDrift 38s linear infinite}
-        @keyframes dotDrift{0%{background-position:0 0}100%{background-position:52px 52px}}
+        /* 点阵背景漂移改为 transform 驱动：原 background-position 动画每帧重绘整个 hero，
+           是首页掉帧主因之一；现在伪元素四边各多铺 52px，位移走合成器，零重绘 */
+        .hero::after{content:"";position:absolute;inset:-52px;background-image:radial-gradient(color-mix(in srgb,var(--muted-foreground) 22%,transparent) 1px,transparent 1px);background-size:26px 26px;mask-image:radial-gradient(ellipse 80% 60% at 50% 38%,var(--foreground),transparent);-webkit-mask-image:radial-gradient(ellipse 80% 60% at 50% 38%,var(--foreground),transparent);opacity:.5;pointer-events:none;z-index:0;animation:dotDrift 38s linear infinite;will-change:transform}
+        @keyframes dotDrift{0%{transform:translate3d(0,0,0)}100%{transform:translate3d(26px,26px,0)}}
         .hero-grid{position:relative;z-index:1;display:grid;grid-template-columns:1.04fr .96fr;gap:56px;align-items:center}
         .hero h1{font-size:clamp(40px,5.6vw,68px);line-height:1.04;letter-spacing:-.035em;font-weight:600;margin:22px 0 0;color:var(--foreground)}
         .hero h1 span{display:block}
@@ -472,16 +445,22 @@
         .orb-ring{position:absolute;inset:0;border-radius:50%;border:1px solid var(--border)}
         .orb-ring.r2{inset:13%;border-color:color-mix(in srgb,var(--border) 80%,transparent)}
         .orb-ring.r3{inset:27%;border-color:color-mix(in srgb,var(--chart-2) 30%,transparent)}
+        /* orb 呼吸拆两层：核心球只做 transform 缩放；光晕是独立层做 opacity/scale 呼吸。
+           原 box-shadow 动画每帧重绘大范围模糊，是首页另一掉帧主因 */
         .orb-core{position:absolute;inset:36%;border-radius:50%;background:radial-gradient(circle at 35% 30%,var(--chart-1),var(--chart-3) 70%);box-shadow:0 0 60px color-mix(in srgb,var(--chart-2) 55%,transparent),0 0 120px color-mix(in srgb,var(--chart-2) 30%,transparent);animation:orbBreath 4.6s ease-in-out infinite}
-        @keyframes orbBreath{0%,100%{box-shadow:0 0 56px color-mix(in srgb,var(--chart-2) 50%,transparent),0 0 108px color-mix(in srgb,var(--chart-2) 26%,transparent);transform:scale(1)}50%{box-shadow:0 0 96px color-mix(in srgb,var(--chart-2) 64%,transparent),0 0 200px color-mix(in srgb,var(--chart-2) 42%,transparent);transform:scale(1.04)}}
+        @keyframes orbBreath{0%,100%{transform:scale(1)}50%{transform:scale(1.04)}}
+        .orb-glow{position:absolute;inset:24%;border-radius:50%;background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--chart-2) 42%,transparent),transparent 66%);pointer-events:none;animation:orbGlow 4.6s ease-in-out infinite;will-change:transform,opacity}
+        @keyframes orbGlow{0%,100%{opacity:.55;transform:scale(1)}50%{opacity:1;transform:scale(1.1)}}
         .orb-pulse{position:absolute;inset:36%;border-radius:50%;border:1px solid color-mix(in srgb,var(--chart-2) 45%,transparent);animation:orbPulse 3.4s cubic-bezier(.2,.7,.2,1) infinite}
         .orb-pulse.d2{animation-delay:1.1s}
         .orb-pulse.d3{animation-delay:2.2s}
         @keyframes orbPulse{0%{transform:scale(1);opacity:.72}100%{transform:scale(2.15);opacity:0}}
         .orb-wave{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:5px}
-        .orb-wave i{display:block;width:4px;border-radius:4px;background:linear-gradient(180deg,var(--chart-1),var(--chart-3));transform-origin:center;animation:barDance 1.5s ease-in-out infinite;box-shadow:0 0 8px color-mix(in srgb,var(--chart-2) 50%,transparent)}
+        /* 发光从「每根条带 box-shadow」改为容器级静态光晕：42 根条带阴影+动画每帧重绘太贵 */
+        .orb-wave::before{content:"";position:absolute;inset:22% 18%;border-radius:50%;background:radial-gradient(ellipse at center,color-mix(in srgb,var(--chart-2) 26%,transparent),transparent 70%);pointer-events:none}
+        .orb-wave i{position:relative;display:block;width:4px;border-radius:4px;background:linear-gradient(180deg,var(--chart-1),var(--chart-3));transform-origin:center;animation:barDance 1.5s ease-in-out infinite}
         @keyframes barDance{0%,100%{transform:scaleY(.18)}50%{transform:scaleY(1)}}
-        .orb-chip{position:absolute;bottom:6%;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;background:color-mix(in srgb,var(--card) 88%,transparent);border:1px solid var(--border);padding:7px 13px;border-radius:999px;font-family:var(--font-mono);font-size:11px;color:var(--muted-foreground);letter-spacing:.05em;backdrop-filter:blur(8px);white-space:nowrap;animation:chipFloat 5.2s ease-in-out infinite}
+        .orb-chip{position:absolute;bottom:6%;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;background:color-mix(in srgb,var(--card) 96%,transparent);border:1px solid var(--border);padding:7px 13px;border-radius:999px;font-family:var(--font-mono);font-size:11px;color:var(--muted-foreground);letter-spacing:.05em;white-space:nowrap;animation:chipFloat 5.2s ease-in-out infinite}
         @keyframes chipFloat{0%,100%{transform:translateX(-50%) translateY(0)}50%{transform:translateX(-50%) translateY(-5px)}}
         .orb-chip .live{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 8px var(--success);animation:liveBlink 1.6s ease-in-out infinite}
         @keyframes liveBlink{0%,100%{opacity:1}50%{opacity:.4}}
@@ -521,7 +500,7 @@
         .spot-panel{position:relative;background:var(--card);border:1px solid var(--border);border-radius:16px;padding:38px;overflow:hidden;min-height:360px;display:flex;flex-direction:column;justify-content:space-between}
         .spot-panel::before{content:"";position:absolute;top:-40%;right:-20%;width:70%;height:120%;background:radial-gradient(circle,color-mix(in srgb,var(--chart-2) 26%,transparent),transparent 65%);pointer-events:none}
         .spot-wave{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:4px;height:120px;margin:10px 0}
-        .spot-wave i{width:5px;border-radius:4px;background:linear-gradient(180deg,var(--chart-1),var(--chart-3));transform-origin:center;animation:barDance 1.6s ease-in-out infinite;box-shadow:0 0 6px color-mix(in srgb,var(--chart-2) 40%,transparent)}
+        .spot-wave i{width:5px;border-radius:4px;background:linear-gradient(180deg,var(--chart-1),var(--chart-3));transform-origin:center;animation:barDance 1.6s ease-in-out infinite}
         .spot-meta{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--border);padding-top:22px}
         .spot-meta .label{font-family:var(--font-mono);font-size:11px;color:var(--muted-foreground);letter-spacing:.08em;text-transform:uppercase}
         .spot-meta .val{font-size:14px;color:var(--foreground);font-weight:500;margin-top:4px}
@@ -531,7 +510,7 @@
 
         /* ===== Local band ===== */
         .tech-row{display:flex;align-items:center;gap:0;margin-top:34px;flex-wrap:wrap}
-        .tech-row span{font-family:var(--font-mono);font-size:11.5px;color:var(--muted-foreground);letter-spacing:.04em;padding:0 14px;border-right:1px solid var(--border);transition:color .2s ease;will-change:transform}
+        .tech-row span{font-family:var(--font-mono);font-size:11.5px;color:var(--muted-foreground);letter-spacing:.04em;padding:0 14px;border-right:1px solid var(--border);transition:color .2s ease}
         .tech-row span:first-child{padding-left:0}
         .tech-row span:last-child{border-right:none}
         .tech-row span:hover{color:var(--chart-2)}
@@ -658,7 +637,7 @@
               <a class="btn btn-ghost btn-lg" href="#how" data-dom-id="hero-how">了解工作原理</a>
             </div>
             <div class="tech-row reveal">
-              <span>Qwen3-4B</span>
+              <span>Qwen3.5-4B</span>
               <span>llama.cpp</span>
               <span>Qwen3-TTS</span>
               <span>本地 ASR</span>
@@ -668,6 +647,7 @@
           </div>
           <div class="hero-visual reveal">
             <div class="orb-wrap" aria-hidden="true">
+              <div class="orb-glow"></div>
               <div class="orb-ring r1"></div>
               <div class="orb-ring r2"></div>
               <div class="orb-ring r3"></div>
@@ -698,7 +678,7 @@
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 10h.01M12 10h.01M16 10h.01"/></svg>
                 </div>
                 <h3>拟人对话</h3>
-                <p>本地 Qwen3-4B 经 llama.cpp GPU 加速，或接入云端 OpenAI 兼容 API。内置小拟、大帅、东北老铁、四川妹儿四个角色，一键切换人设；角色引擎记住聊过的事、维护情绪状态，还会偶尔主动开口。回复自动标注朗读风格，情绪随内容自然变化。</p>
+                <p>本地 Qwen3.5-4B 经 llama.cpp GPU 加速，或接入云端 OpenAI 兼容 API。内置小拟、大帅、东北老铁、四川妹儿四个角色，一键切换人设；角色引擎记住聊过的事、维护情绪状态，还会偶尔主动开口。回复自动标注朗读风格，情绪随内容自然变化。</p>
               </div>
               <div class="b-visual" id="bigWave"></div>
             </article>
@@ -829,7 +809,7 @@
             </div>
             <div class="foot-col">
               <h5>技术栈</h5>
-              <a href="#how">Qwen3-4B</a>
+              <a href="#how">Qwen3.5-4B</a>
               <a href="#how">llama.cpp</a>
               <a href="#how">Qwen3-TTS</a>
               <a href="#local">本地 ASR</a>

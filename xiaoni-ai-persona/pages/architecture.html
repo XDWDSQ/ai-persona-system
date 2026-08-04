@@ -3,6 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0a0a0a">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <title>技术架构 · 小拟</title>
     <style id="theme-vars">
 /* Source: Vercel Design Library (dl_builtin_vercel) — verbatim tokens.
@@ -226,51 +228,12 @@
 }
 
     </style>
-    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.3.1/dist/index.global.js"></script>
-    <script src="https://unpkg.com/lucide@1.8.0/dist/umd/lucide.min.js"></script>
-    <!-- Chart.js 从未被本页使用（无 new Chart/getContext 调用），已移除以省 ~200KB 下载与解析 -->
-    <style type="text/tailwindcss">
-  @theme inline {
-    --color-background: var(--vercel-background);
-    --color-foreground: var(--vercel-foreground);
-    --color-card: var(--vercel-card);
-    --color-card-foreground: var(--vercel-card-foreground);
-    --color-popover: var(--vercel-popover);
-    --color-popover-foreground: var(--vercel-popover-foreground);
-    --color-primary: var(--vercel-primary);
-    --color-primary-foreground: var(--vercel-primary-foreground);
-    --color-secondary: var(--vercel-secondary);
-    --color-secondary-foreground: var(--vercel-secondary-foreground);
-    --color-muted: var(--vercel-muted);
-    --color-muted-foreground: var(--vercel-muted-foreground);
-    --color-accent: var(--vercel-accent);
-    --color-accent-foreground: var(--vercel-accent-foreground);
-    --color-destructive: var(--vercel-destructive);
-    --color-destructive-foreground: var(--vercel-destructive-foreground);
-    --color-border: var(--vercel-border);
-    --color-input: var(--vercel-input);
-    --color-ring: var(--vercel-ring);
-    --color-chart-1: var(--vercel-chart-1);
-    --color-chart-2: var(--vercel-chart-2);
-    --color-chart-3: var(--vercel-chart-3);
-    --color-chart-4: var(--vercel-chart-4);
-    --color-chart-5: var(--vercel-chart-5);
-    --color-sidebar: var(--vercel-sidebar);
-    --color-sidebar-foreground: var(--vercel-sidebar-foreground);
-    --color-sidebar-primary: var(--vercel-sidebar-primary);
-    --color-sidebar-primary-foreground: var(--vercel-sidebar-primary-foreground);
-    --color-sidebar-accent: var(--vercel-sidebar-accent);
-    --color-sidebar-accent-foreground: var(--vercel-sidebar-accent-foreground);
-    --radius-sm: var(--vercel-radius-sm);
-    --radius-md: var(--vercel-radius-md);
-    --radius-lg: var(--vercel-radius-lg);
-  }
-  @layer base {
-    body { background: var(--vercel-background); color: var(--vercel-foreground); }
-    td, th { @apply break-words; word-break: break-all; word-break: auto-phrase; }
-    th { @apply whitespace-nowrap; }
-  }
-    </style>
+    <!-- 字体：Geist / Geist Mono（font-display:swap，加载失败回落系统字体）。
+         已移除：Tailwind 浏览器运行时（阻塞渲染，页面实际未使用其生成的类）、
+         lucide（页面无 data-lucide 元素，尾部 createIcons 空跑）、@theme 块 -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style id="semantic-token-fallback">
       .bg-background { background-color: var(--vercel-background); }
       .text-background { color: var(--vercel-background); }
@@ -410,7 +373,7 @@
       }
     </style>
 </head>
-<body class="min-h-screen font-sans antialiased">
+<body>
     <main>
       <style id="critical-layout">
         /* ===== Base ===== */
@@ -428,6 +391,9 @@
         .nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);background:color-mix(in srgb,var(--background) 72%,transparent);border-bottom:1px solid var(--border)}
         .nav-inner{display:flex;align-items:center;justify-content:space-between;height:64px}
         .brand{display:flex;align-items:center;gap:11px}
+        /* 品牌名与副标题纵向堆叠：原先两个 inline span 挤在一行 */
+        .brand > span:not(.brand-mark){display:flex;flex-direction:column;min-width:0}
+        a:focus-visible,.btn:focus-visible{outline:2px solid color-mix(in srgb,var(--chart-2) 70%,transparent);outline-offset:2px}
         .brand-mark{width:30px;height:30px;border-radius:8px;background:var(--foreground);display:flex;align-items:center;justify-content:center;color:var(--background);box-shadow:0 0 0 1px var(--border)}
         .brand-mark svg{width:17px;height:17px}
         .brand-name{font-size:15px;font-weight:600;letter-spacing:-.01em;line-height:1}
@@ -601,7 +567,7 @@
           </nav>
           <div class="nav-cta">
             <a class="btn btn-ghost" href="/pages/index.html" data-dom-id="nav-home-cta">返回首页</a>
-            <a class="btn btn-primary" href="/pages/index.html">开始体验</a>
+            <a class="btn btn-primary" href="/pages/chat.html" data-dom-id="nav-start-cta">开始体验</a>
           </div>
         </div>
       </header>
@@ -626,7 +592,7 @@
             <div class="tech-row reveal">
               <span>FastAPI</span>
               <span>llama.cpp</span>
-              <span>Qwen3-4B</span>
+              <span>Qwen3.5-4B</span>
               <span>Qwen3-TTS</span>
               <span>Qwen3-ASR</span>
               <span>内置角色</span>
@@ -722,7 +688,7 @@
                 </span>
                 <span class="arch-chip">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg>
-                  Qwen3-4B GGUF
+                  Qwen3.5-4B GGUF
                 </span>
                 <span class="arch-chip">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg>
@@ -818,7 +784,7 @@
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg>
                 </div>
                 <h3>对话大脑</h3>
-                <p>llama.cpp 便携版加载 Qwen3-4B 量化模型，在 GPU（CUDA）上运行 OpenAI 兼容服务。支持切换至云端 OpenAI 兼容 API（MiMo/DeepSeek 等）；角色引擎在对话前注入时间、状态与记忆上下文，回复自动标注朗读风格。</p>
+                <p>llama.cpp 便携版加载 Qwen3.5-4B 量化模型，在 GPU（CUDA）上运行 OpenAI 兼容服务。支持切换至云端 OpenAI 兼容 API（MiMo/DeepSeek 等）；角色引擎在对话前注入时间、状态与记忆上下文，回复自动标注朗读风格。</p>
               </div>
             </article>
             <article class="bcard med reveal">
@@ -967,7 +933,7 @@
             </div>
             <div class="foot-col">
               <h5>技术栈</h5>
-              <a href="#stack">Qwen3-4B</a>
+              <a href="#stack">Qwen3.5-4B</a>
               <a href="#stack">llama.cpp</a>
               <a href="#stack">Qwen3-TTS</a>
               <a href="#stack">FastAPI</a>
@@ -1071,6 +1037,5 @@
         })();
       </script>
     </main>
-    <script>lucide.createIcons();</script>
 </body>
 </html>
