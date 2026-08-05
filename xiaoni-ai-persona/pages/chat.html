@@ -3388,9 +3388,10 @@
       #settings .set-close:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--destructive) 40%,transparent);background:color-mix(in srgb,var(--destructive) 10%,transparent);transform:translateY(-1px)}
       #settings .set-close:active{transform:scale(.96)}
       #settings .set-body{padding:20px 22px;display:flex;flex-direction:column;gap:16px;font-size:13px}
-      #settings .set-row{display:flex;align-items:center;gap:12px}
-      #settings .set-row .set-label{width:76px;flex:none;color:var(--muted-foreground)}
-      #settings .set-tabs{display:flex;gap:8px}
+      #settings .set-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+      #settings .set-row > *{min-width:0}
+      #settings .set-row .set-label{width:84px;flex:none;color:var(--muted-foreground);font-size:12.5px;white-space:nowrap}
+      #settings .set-tabs{display:flex;gap:8px;flex:1;min-width:0}
       #settings .set-tab{padding:7px 16px;border-radius:9px;border:1px solid var(--border);background:var(--background);color:var(--muted-foreground);font-size:12.5px;cursor:pointer;transition:background-color .2s ease,color .2s ease,border-color .2s ease,transform .18s ease,box-shadow .2s ease}
       #settings .set-tab:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--muted-foreground) 38%,transparent);transform:translateY(-1px)}
       #settings .set-tab.active{background:var(--foreground);color:var(--background);border-color:var(--foreground);box-shadow:0 6px 18px -10px rgba(0,0,0,.4)}
@@ -3522,11 +3523,13 @@
           <label>人设描述<textarea id="persona" class="set-input set-ta" placeholder="定义小拟的性格、语气、说话方式…"></textarea></label>
           <div class="set-row" style="margin-top:4px">
             <span class="set-label">角色现实动态</span>
-            <div style="flex:1;display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0">
-              <button type="button" class="set-mini-btn" id="role-news-btn" style="padding:4px 10px" title="联网搜索该角色最近真实动态">🔄 搜索动态</button>
-              <span id="role-news-status" style="font-size:12px;color:#8a93a6;line-height:1.5;flex:1;min-width:180px">获取中…</span>
+            <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0">
+                <button type="button" class="set-mini-btn" id="role-news-btn" style="padding:4px 10px" title="联网搜索该角色最近真实动态">🔄 搜索动态</button>
+                <span id="role-news-status" style="font-size:12px;color:#8a93a6;line-height:1.5;flex:1;min-width:0">获取中…</span>
+              </div>
+              <div style="font-size:12px;color:#8a93a6">联网搜索角色在现实世界的最新动态（比赛/训练/近况），角色自己也会知道；12 小时内自动复用缓存</div>
             </div>
-            <div style="font-size:12px;color:#8a93a6;margin-top:2px">联网搜索角色在现实世界的最新动态（比赛/训练/近况），角色自己也会知道；12 小时内自动复用缓存</div>
           </div>
           <div class="set-row" style="margin-top:4px">
             <span class="set-label">我的位置</span>
