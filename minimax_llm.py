@@ -41,6 +41,11 @@ MINIMAX_MAX_OUTPUT_TOKENS = 65536
 # 重试间的指数退避（与 server.py _LLM_RETRY_BACKOFF 一致），避免瞬时重试加重对端限流
 _LLM_RETRY_BACKOFF = (0.5, 1.5)
 
+# M3 思考模式（thinking=adaptive）会先输出一段长推理再出正文；
+# 默认 768 max_tokens 会被思考吃光导致正文为空（finish=length），
+# 开启思考时把输出预算至少放大到该值，保证「思考 + 正文」都能完整输出。
+_THINKING_MIN_TOKENS = 4096
+
 # MiniMax base_resp.status_code 错误码 → (是否可重试, 提示模板)
 # 官方错误码表：platform.minimaxi.com/docs/api-reference/errorcode
 _MINIMAX_ERROR_CODES = {
@@ -308,6 +313,9 @@ async def chat(conf: MiniMaxConf, messages: list[dict], temperature: float = 0.8
     own_client = client is None  # 未传入时自建并负责关闭
     client = httpx.AsyncClient() if own_client else client
     url = f"{conf.base_url}/chat/completions"
+    # M3 思考模式（adaptive）会先输出一段长推理，默认 768 预算会被思考吃光、
+    # 正文为空（finish=length）；开启思考时放大预算，保证思考+正文都能输出。
+    max_tokens = max(max_tokens, _THINKING_MIN_TOKENS) if use_thinking else max_tokens
     payload = build_payload(messages, conf.model, temperature, max_tokens, use_thinking, stream=False)
     timeout = timeout or _timeout(max_tokens)
     last_err: Exception | None = None
@@ -395,6 +403,8 @@ async def chat_stream(conf: MiniMaxConf, messages: list[dict], temperature: floa
     own_client = client is None
     client = httpx.AsyncClient() if own_client else client
     url = f"{conf.base_url}/chat/completions"
+    # 同 chat()：M3 思考模式需预留思考+正文预算，否则思考吃光 max_tokens 正文为空
+    max_tokens = max(max_tokens, _THINKING_MIN_TOKENS) if use_thinking else max_tokens
     payload = build_payload(messages, conf.model, temperature, max_tokens, use_thinking, stream=True)
     timeout = timeout or _timeout(max_tokens)
     yielded = False
