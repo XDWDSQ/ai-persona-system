@@ -637,6 +637,16 @@ _META_HINT = (
     "这类广播式口吻收尾。你就是角色本人，把想对对方说的话说完就结束，不加任何注释。"
 )
 
+# 视觉链路全部不可用（云端多模态 + 本地 VL 都失败）时的诚实降级提示：
+# 文本模型看不到图片内容，必须如实说明，禁止假装看到/编造图片内容
+#（此前模型会瞎编「图片已生效」之类的确认话术糊弄用户）。
+_VISION_FALLBACK_HINT = (
+    "\n\n【重要】用户还发送了图片，但你（当前模型）看不到图片内容。"
+    "请用一两句话如实告诉用户：图片收到了，但你现在看不到图片内容，让他用文字描述一下；"
+    "然后根据他的留言正常聊天。绝对禁止假装自己看到了图片，"
+    "禁止编造图片内容，禁止回复「图片已生效」「图片已收到」「图片已发送成功」之类的敷衍确认话术。"
+)
+
 
 def _time_hint() -> str:
     """生成「当前真实时间」显式指令，追加到 system prompt 末尾（/api/chat 与 /api/greeting 共用）。
@@ -3130,11 +3140,66 @@ async def _attachment_prompt_text(attachments: list[dict], user_text: str = "") 
     return prefix
 
 
-async def _call_vision(messages: list[dict], cfg: dict) -> str | None:
-    """调用本地/云端视觉模型；失败或空回复返回 None 交给普通文本模型兜底。"""
+def _vision_mode(cfg: dict) -> str:
+    """视觉链路模式：auto（云端多模态优先，本地 VL 兜底）| cloud | local | off。"""
+    vcfg = cfg.get("vision") or {}
+    if not vcfg.get("enabled", True):
+        return "off"
+    mode = str(vcfg.get("provider") or "auto").strip().lower()
+    if mode == "off":
+        return "off"
+    if mode not in ("auto", "cloud", "local"):
+        mode = "auto"
+    return mode
+
+
+async def _call_cloud_vision(messages: list[dict], cfg: dict) -> str | None:
+    """把图片直接送入云端多模态模型（OpenAI 兼容 image_url 格式）。
+
+    MiMo mimo-v2.5 等云端模型原生支持图片理解，走当前 provider 的
+    base_url/api_key/model（含 .env 密钥回退），失败返回 None 交给兜底链。"""
+    cloud = cfg.get("cloud") or {}
+    base_url = (cloud.get("base_url") or "").rstrip("/")
+    model = cloud.get("model") or ""
+    if not base_url or not model:
+        return None
+    api_key = cloud.get("api_key") or "none"
+    provider_name = (cloud.get("provider") or "") if cfg.get("provider") == "cloud" else ""
+    payload: dict = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.8,
+        "max_tokens": 1024,
+        "top_p": 0.95,
+    }
+    # 视觉回复要求直接出正文：mimo/deepseek 支持 thinking 开关，关掉避免思考过程
+    # 挤占 max_tokens 或拖慢首字；其他 provider 不传该参数（不保证兼容）
+    if provider_name in ("mimo", "deepseek"):
+        payload["thinking"] = {"type": "disabled"}
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if api_key and api_key != "none":
+        headers["api-key"] = api_key
+    timeout = httpx.Timeout(5.0, connect=5.0, write=10.0, read=240.0, pool=15.0)
+    try:
+        r = await httpx_client.post(
+            f"{base_url}/chat/completions", json=payload, headers=headers, timeout=timeout
+        )
+        r.raise_for_status()
+        choices = r.json().get("choices") or []
+        if not choices:
+            return None
+        content = (choices[0].get("message") or {}).get("content") or ""
+        return content.strip() or None
+    except (httpx.HTTPError, KeyError, ValueError, OSError):
+        return None
+
+
+async def _call_local_vision(messages: list[dict], cfg: dict) -> str | None:
+    """调用本地视觉模型（llm/start_vl.bat 的 Qwen2.5-VL，端口 11435）；失败返回 None。"""
     vision_cfg = cfg.get("vision") or {}
-    base_url = (vision_cfg.get("base_url") or "http://127.0.0.1:11435/v1").rstrip("/")
-    model = vision_cfg.get("model") or "Qwen2.5-VL-3B"
+    base_url = (vision_cfg.get("local_base_url") or vision_cfg.get("base_url")
+                or "http://127.0.0.1:11435/v1").rstrip("/")
+    model = vision_cfg.get("local_model") or vision_cfg.get("model") or "Qwen2.5-VL-3B"
     payload = {
         "model": model,
         "messages": messages,
@@ -3143,7 +3208,7 @@ async def _call_vision(messages: list[dict], cfg: dict) -> str | None:
         "repeat_penalty": 1.3,
         "top_p": 0.95,
     }
-    timeout = httpx.Timeout(5.0, connect=5.0, write=10.0, read=240.0, pool=15.0)
+    timeout = httpx.Timeout(5.0, connect=2.0, write=10.0, read=240.0, pool=15.0)
     try:
         r = await httpx_client.post(
             f"{base_url}/chat/completions", json=payload, timeout=timeout
@@ -3159,8 +3224,16 @@ async def _call_vision(messages: list[dict], cfg: dict) -> str | None:
 
 
 async def _try_vision_chat(system: dict, history: list[dict], req: ChatRequest, cfg: dict) -> str | None:
-    """有图片附件时把图片以 data URI 送入视觉模型；不可用则返回 None。"""
-    if not (cfg.get("vision") or {}).get("enabled", True):
+    """有图片附件时把图片以 data URI 送入视觉模型；全部不可用则返回 None。
+
+    链路（vision.provider）：
+      auto   云端多模态优先（MiMo 等原生看图），失败回退本地 VL，再失败 None
+      cloud  只走云端多模态
+      local  只走本地 VL（Qwen2.5-VL@11435）
+      off    禁用，直接 None
+    """
+    mode = _vision_mode(cfg)
+    if mode == "off":
         return None
     content: list[dict] = []
     for a in req.attachments[:4]:
@@ -3185,7 +3258,14 @@ async def _try_vision_chat(system: dict, history: list[dict], req: ChatRequest, 
     text = req.message.strip() or "（用户发送了图片）"
     content.append({"type": "text", "text": text})
     messages = [dict(system)] + [dict(m) for m in history] + [{"role": "user", "content": content}]
-    return await _call_vision(messages, cfg)
+    if mode in ("auto", "cloud"):
+        raw = await _call_cloud_vision(messages, cfg)
+        if raw:
+            return raw
+        if mode == "cloud":
+            return None
+    # auto 的本地兜底 / local 模式
+    return await _call_local_vision(messages, cfg)
 
 
 def _last_assistant_content(history: list[dict]) -> str:
@@ -3413,7 +3493,8 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
     def ev(obj: dict) -> str:
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
-    # 有图片附件时走视觉模型（本地/云端均不支持逐字流，一次性给出），失败回退文本流式
+    # 有图片附件时走视觉模型（云端多模态/本地 VL 均不支持逐字流，一次性给出），
+    # 全部不可用则回退文本流式，并注入「看不到图片内容」指令防止模型编造
     if req.attachments:
         raw = await _try_vision_chat(system, history, req, cfg)
         if raw:
@@ -3431,6 +3512,8 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
             yield ev({"done": True, "clean": clean, "style": style,
                       "searched": False, "vision_used": True})
             return
+        if any(a.get("kind") == "image" for a in req.attachments):
+            user_content = user_content + _VISION_FALLBACK_HINT
 
     # 文本流式主循环（含搜索探测与长文续写）
     search_cfg = cfg.get("search") or {}
@@ -3627,6 +3710,9 @@ async def chat(req: ChatRequest):
         vision_used = raw is not None
         if raw is not None:
             raw = _strip_search_markers(raw)
+        elif any(a.get("kind") == "image" for a in req.attachments):
+            # 视觉全不可用：注入「看不到图片内容」指令，防止文本模型编造（如"图片已生效"）
+            user_content = user_content + _VISION_FALLBACK_HINT
     if raw is None:
         raw, searched = await _chat_with_search(
             system, history, user_content, cfg,
