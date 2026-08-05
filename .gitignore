@@ -40,3 +40,12 @@ _pet_preview/
 
 # 本次桌宠画质优化临时脚本（v3 对比图等正式产物不入库位置）
 .pet_tmp/
+
+# 根目录临时调试产物（不入库）
+/_cfg.json
+/_openapi.json
+/_role_news_payload.json
+/_st.json
+/_t.out
+/_t2.out
+/_tts_test.json
