@@ -31,12 +31,19 @@
 # 2. 单段重跑（覆盖 pages/pet/<state>.webp）：
 python ../pet_process.py 本目录/新视频.mp4 --name <state>
 
-# 批量重新处理全部：
-python ../pet_process.py --all --in-dir 本目录 --out-dir ../xiaoni-ai-persona/pages/pet
+# 批量重新处理全部（v2 默认 256px/10fps/q70，单段约 1 分钟）：
+python ../pet_process.py --all
 
-# 3. 重新打包：
+# 3. 重要：把 pages/pet.js 里的 ASSET_VERSION 加 1
+#    （webp 走 7 天长缓存，不 bump 版本号用户会一直看到旧素材）
+
+# 4. 重新打包：
 python ../deploy/pack_update.py && python ../deploy/pack_update.py --public
 ```
+
+v2 脚本说明：不依赖 rembg/cv2，用 onnxruntime 直跑 ~/.u2net/u2net.onnx
+（PyAV 解码 + PIL/numpy 合成）。常用调参：--size 320（更清晰但更大）、
+--alpha-lo/--alpha-hi（边缘松紧）、--feather（羽化）、--quality。
 
 ## 状态名中英文映射（处理脚本内置）
 

@@ -4132,6 +4132,22 @@ async def upload_files(files: list[UploadFile] = File(...)):
     return {"files": results}
 
 
+# 静态资源缓存策略：html/js/css 体积小走 no-cache（每次协商 304）；
+# webp/图片/字体等大资产走 7 天长缓存，素材更新靠 pet.js 的 ASSET_VERSION 换 URL 刷新
+_LONG_CACHE_EXT = (".webp", ".avif", ".jpg", ".jpeg", ".png", ".svg", ".woff2", ".woff", ".mp3")
+
+
+@app.middleware("http")
+async def static_cache_headers(request, call_next):
+    response = await call_next(request)
+    p = request.url.path
+    if p == "/" or p.endswith((".html", ".js", ".css")):
+        response.headers["Cache-Control"] = "no-cache"
+    elif p.endswith(_LONG_CACHE_EXT):
+        response.headers["Cache-Control"] = "public, max-age=604800, immutable"
+    return response
+
+
 # 静态托管新前端（挂在所有 API 路由之后，/api/* 优先匹配，其余走静态文件）
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR)), name="site")

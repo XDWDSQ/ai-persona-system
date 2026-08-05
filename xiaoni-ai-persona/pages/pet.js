@@ -357,7 +357,9 @@
       popBubble(pool[Math.floor(Math.random() * pool.length)]);
     });
     makeDraggable();
-    applyState(_current);
+    var initial = _current;
+    _current = '';                // 初始状态强制加载（applyState 对相同状态去重）
+    applyState(initial);
     preloadRest();
   }
 

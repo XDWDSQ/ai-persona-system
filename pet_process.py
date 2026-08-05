@@ -11,13 +11,13 @@ v2 相对 v1 的改进：
 - 去掉 rembg/cv2 依赖：onnxruntime 直接推理（PyAV 解码 + PIL/numpy），环境更轻
 - 软 alpha：不再二值化硬边，曲线+羽化让发丝/肩部边缘自然
 - 时域平滑：低分辨率 mask 做 3 帧加权平均，抑制逐帧抠像抖动
-- 默认模型 isnet-general-use（边缘更干净），u2net 可回退
-- WebP 编码 method=6 + 质量可调，同尺寸体积通常比 v1 小一半以上
+- WebP 编码 method=4（method=6 在本素材上编码 324s，method=4 仅 2s 且体积几乎不变）
+- 默认 256px/10fps/q70：单段约 600KB（v1 为 1.2MB），7 段全量约 4MB（v1 8.3MB）
 
 用法：
   python pet_process.py --all                          # 批量处理 桌面宠素材/大帅*.mp4
   python pet_process.py 输入.mp4 --name happy          # 单段
-  python pet_process.py --all --model u2net --size 256 # 调参
+  python pet_process.py --all --model isnet --size 320 # 调参
 """
 import argparse, glob, os, sys, time
 import numpy as np
@@ -99,31 +99,34 @@ def parse_name(filename: str) -> str:
 
 
 def process_one(in_path, name, out_dir, session,
-                target_size=320, target_fps=12, margin=1.05,
-                alpha_lo=0.30, alpha_hi=0.80, feather=0.8, quality=80):
+                target_size=256, target_fps=10, margin=1.05,
+                alpha_lo=0.45, alpha_hi=0.90, feather=0.8, quality=70):
     print(f'\n[{name}] 读取: {os.path.basename(in_path)}', flush=True)
+
+    # ---- 第一遍：只保留低分辨率 mask（内存 ~0.4MB/帧），算全局 bbox ----
     container = av.open(in_path)
     stream = container.streams.video[0]
-    src_fps = float(stream.average_rate or 24)
-    step = max(round(src_fps / target_fps), 1)
-
-    # ---- 第一遍：抽帧 + 低分辨率 mask + 时域平滑 ----
-    rgb_list, mask_list = [], []
-    idx = 0
+    W, H = stream.width, stream.height
+    tb = stream.time_base          # 必须在 close 前缓存（close 后旧 stream 属性失效）
+    interval = 1.0 / target_fps
+    next_t, mask_list, k = 0.0, [], 0
     t0 = time.time()
     for frame in container.decode(video=0):
-        if idx % step == 0:
-            rgb_list.append(frame.to_image().convert('RGB'))
-            mask_list.append(session.mask(rgb_list[-1]))
-        idx += 1
+        t = float(frame.pts * tb) if frame.pts is not None else k / target_fps
+        if t < next_t - 1e-6:
+            continue
+        mask_list.append(session.mask(frame.to_image().convert('RGB')))
+        k += 1
+        while next_t <= t + 1e-6:
+            next_t += interval
     container.close()
     n = len(mask_list)
     if n == 0:
         print('  × 没读到帧', flush=True)
         return None
-    print(f'  抽帧 {n} 张, 推理 {time.time()-t0:.0f}s', flush=True)
+    print(f'  抽帧 {n} 张 ({W}x{H}), 推理 {time.time()-t0:.0f}s', flush=True)
 
-    # 时域平滑（3 帧加权），只在模型分辨率上做，内存小
+    # 时域平滑（3 帧加权），只在模型分辨率上做
     if n >= 3:
         sm = [mask_list[0]]
         for i in range(1, n - 1):
@@ -131,42 +134,54 @@ def process_one(in_path, name, out_dir, session,
         sm.append(mask_list[-1])
         mask_list = sm
 
-    # ---- 全分辨率软 alpha + 全局 bbox ----
+    # 低分辨率 bbox → 换算到全分辨率，取全局并集
+    mh, mw = mask_list[0].shape
+    sx, sy = W / mw, H / mh
     bboxes = []
-    alpha_full = []
-    for rgb, m in zip(rgb_list, mask_list):
-        w, h = rgb.size
-        full = np.asarray(Image.fromarray((m * 255).astype(np.uint8)).resize((w, h), Image.BILINEAR),
-                          dtype=np.float32) / 255.0
-        a = refine_alpha(full, alpha_lo, alpha_hi, feather)
-        alpha_full.append(a)
-        bb = get_bbox(a)
+    for m in mask_list:
+        bb = get_bbox(m)
         if bb:
-            bboxes.append(bb)
+            bboxes.append((bb[0] * sx, bb[1] * sy, bb[2] * sx, bb[3] * sy))
     if not bboxes:
         print('  × 全程没抠到人', flush=True)
         return None
-
-    x0 = min(b[0] for b in bboxes); y0 = min(b[1] for b in bboxes)
-    x1 = max(b[2] for b in bboxes); y1 = max(b[3] for b in bboxes)
+    x0 = int(min(b[0] for b in bboxes)); y0 = int(min(b[1] for b in bboxes))
+    x1 = int(max(b[2] for b in bboxes)); y1 = int(max(b[3] for b in bboxes))
     cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
     half = int(max(x1 - x0, y1 - y0) // 2 * margin)
     print(f'  全局 bbox=({x0},{y0})-({x1},{y1}) half={half}', flush=True)
 
-    # ---- 1:1 裁切（边界不足补透明）→ 缩放 ----
+    # ---- 第二遍：重解码，逐帧精修 alpha + 裁切 + 缩放（内存恒定） ----
     pil_frames = []
-    for rgb, a in zip(rgb_list, alpha_full):
-        w, h = rgb.size
-        xs, ys = max(cx - half, 0), max(cy - half, 0)
-        xe, ye = min(cx + half, w), min(cy + half, h)
-        cw, ch = xe - xs, ye - ys
-        rgba = np.zeros((half * 2, half * 2, 4), dtype=np.uint8)
-        px, py = (half * 2 - cw) // 2, (half * 2 - ch) // 2
-        region = np.asarray(rgb, dtype=np.uint8)[ys:ye, xs:xe]
-        rgba[py:py + ch, px:px + cw, :3] = region
-        rgba[py:py + ch, px:px + cw, 3] = (a[ys:ye, xs:xe] * 255).astype(np.uint8)
-        pil_frames.append(Image.fromarray(rgba, 'RGBA').resize(
-            (target_size, target_size), Image.LANCZOS))
+    container = av.open(in_path)
+    next_t, k = 0.0, 0
+    for frame in container.decode(video=0):
+        t = float(frame.pts * tb) if frame.pts is not None else k / target_fps
+        if t < next_t - 1e-6:
+            continue
+        if k < n:
+            m = mask_list[k]
+            full = np.asarray(
+                Image.fromarray((m * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR),
+                dtype=np.float32) / 255.0
+            a = refine_alpha(full, alpha_lo, alpha_hi, feather)
+            rgb = frame.to_image().convert('RGB')
+            xs, ys = max(cx - half, 0), max(cy - half, 0)
+            xe, ye = min(cx + half, W), min(cy + half, H)
+            cw, ch = xe - xs, ye - ys
+            rgba = np.zeros((half * 2, half * 2, 4), dtype=np.uint8)
+            px, py = (half * 2 - cw) // 2, (half * 2 - ch) // 2
+            rgba[py:py + ch, px:px + cw, :3] = np.asarray(rgb, dtype=np.uint8)[ys:ye, xs:xe]
+            rgba[py:py + ch, px:px + cw, 3] = (a[ys:ye, xs:xe] * 255).astype(np.uint8)
+            pil_frames.append(Image.fromarray(rgba, 'RGBA').resize(
+                (target_size, target_size), Image.LANCZOS))
+        k += 1
+        while next_t <= t + 1e-6:
+            next_t += interval
+    container.close()
+    if not pil_frames:
+        print('  × 第二遍没产出帧', flush=True)
+        return None
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f'{name}.webp')
@@ -175,10 +190,10 @@ def process_one(in_path, name, out_dir, session,
     pil_frames[0].save(
         out_path, 'WEBP', save_all=True, append_images=pil_frames[1:],
         duration=duration, loop=0, disposal=2, lossless=False,
-        quality=quality, method=6,
+        quality=quality, method=4,   # method=6 编码极慢（324s vs 2s），体积几乎无差
     )
     sz = os.path.getsize(out_path) // 1024
-    print(f'  ✓ {n} 帧, {duration}ms/帧, {sz}KB, 编码 {time.time()-t0:.0f}s → {out_path}', flush=True)
+    print(f'  ✓ {len(pil_frames)} 帧, {duration}ms/帧, {sz}KB, 编码 {time.time()-t0:.0f}s → {out_path}', flush=True)
     return out_path
 
 
@@ -189,15 +204,15 @@ def main():
     ap.add_argument('--all', action='store_true', help='批量处理 in-dir/大帅*.mp4')
     ap.add_argument('--in-dir', default=IN_DIR)
     ap.add_argument('--out-dir', default=OUT_DIR)
-    ap.add_argument('--model', choices=sorted(MODELS), default='isnet',
-                    help='抠像模型（默认 isnet，边缘更干净）')
-    ap.add_argument('--fps', type=int, default=12)
-    ap.add_argument('--size', type=int, default=320)
+    ap.add_argument('--model', choices=sorted(MODELS), default='u2net',
+                    help='抠像模型（默认 u2net；isnet 对亮肤色易误判，慎用）')
+    ap.add_argument('--fps', type=int, default=10)
+    ap.add_argument('--size', type=int, default=256)
     ap.add_argument('--margin', type=float, default=1.05)
-    ap.add_argument('--alpha-lo', type=float, default=0.30, help='alpha 曲线下限（去雾边）')
-    ap.add_argument('--alpha-hi', type=float, default=0.80, help='alpha 曲线上限')
+    ap.add_argument('--alpha-lo', type=float, default=0.45, help='alpha 曲线下限（去雾边）')
+    ap.add_argument('--alpha-hi', type=float, default=0.90, help='alpha 曲线上限')
     ap.add_argument('--feather', type=float, default=0.8, help='边缘羽化半径(px)')
-    ap.add_argument('--quality', type=int, default=80, help='WebP 质量')
+    ap.add_argument('--quality', type=int, default=70, help='WebP 质量')
     args = ap.parse_args()
 
     tasks = []
