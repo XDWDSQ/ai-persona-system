@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
@@ -164,21 +165,79 @@ def build_payload(messages: list[dict], model: str, temperature: float, max_toke
 
     - 计费：普通付费模式无需额外参数（服务端按 key 自动计费），流式请求带
       stream_options.include_usage 让最后一个 chunk 返回 usage，便于解析本次用量；
-    - 思考：与 mimo/deepseek 相同的 thinking 开关格式（不支持时 2013 会降级重试）。
+    - 思考：官方取值 adaptive（开启）/ disabled（跳过思考直接回答），仅 MiniMax-M3
+      支持关闭（M2.x 接受参数但仍保持开启，由 reasoning_split + <think> 剥离兜底）；
+    - reasoning_split：把 thinking 内容拆分到 reasoning_content 字段，正文保持干净
+      （M2.x 不拆分会把思考内嵌在 content 的 <think> 标签里）。
     """
     payload: dict = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "reasoning_split": True,
     }
     if stream:
         payload["stream"] = True
         # OpenAI 标准计费参数：流式结束 chunk 携带 usage（prompt/completion/total tokens）
         payload["stream_options"] = {"include_usage": True}
     if use_thinking is not None:
-        payload["thinking"] = {"type": "enabled" if use_thinking else "disabled"}
+        payload["thinking"] = {"type": "adaptive" if use_thinking else "disabled"}
     return payload
+
+
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+_THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
+
+
+def strip_think(text: str) -> tuple[str, str]:
+    """剥离 content 里的 <think>...</think> 块（M2.x 未拆分时思考内嵌在此），
+    返回 (正文, 思考内容)。带标签但标签不闭合时整体视作思考（保险处理）。"""
+    if not text:
+        return "", ""
+    if "<think" not in text.lower():
+        return text.strip(), ""
+    parts: list[str] = []
+    think_parts: list[str] = []
+    pos = 0
+    for m in _THINK_RE.finditer(text):
+        parts.append(text[pos:m.start()])
+        think_parts.append(m.group(0)[len(_THINK_OPEN):-len(_THINK_CLOSE)].strip())
+        pos = m.end()
+    parts.append(text[pos:])
+    content = "".join(parts).strip()
+    if not think_parts and content.lower().startswith(_THINK_OPEN):
+        # 只有开标签没有闭标签：整段视为思考（异常响应兜底）
+        return "", text[len(_THINK_OPEN):].strip()
+    return content, " ".join(t for t in think_parts if t).strip()
+
+
+def _stream_split_think(piece: str, in_think: bool, think_buf: list[str],
+                        on_text) -> bool:
+    """流式处理单个 content delta：维护 <think> 跨 chunk 状态。
+
+    返回新的 in_think；正文部分回调 on_text；think 内容累计到 think_buf。"""
+    while piece:
+        if in_think:
+            idx = piece.lower().find(_THINK_CLOSE)
+            if idx < 0:
+                think_buf.append(piece)
+                return True
+            think_buf.append(piece[:idx])
+            piece = piece[idx + len(_THINK_CLOSE):]
+            in_think = False
+            continue
+        idx = piece.lower().find(_THINK_OPEN)
+        if idx < 0:
+            on_text(piece)
+            return False
+        before = piece[:idx]
+        if before:
+            on_text(before)
+        piece = piece[idx + len(_THINK_OPEN):]
+        in_think = True
+    return in_think
 
 
 def parse_usage(data: dict) -> LLMUsage:
@@ -277,9 +336,11 @@ async def chat(conf: MiniMaxConf, messages: list[dict], temperature: float = 0.8
                     raise HTTPException(502, f"MiniMax 响应缺少 choices（model={conf.model}），请检查云端模型配置")
                 choice = choices[0]
                 msg = choice.get("message") or {}
-                content = (msg.get("content") or "").strip()
+                content, think_text = strip_think((msg.get("content") or ""))
+                finish_reason = choice.get("finish_reason") or ""
+                # reasoning_split 生效时思考在 reasoning_content；未生效时内嵌 <think> 已剥离
                 if not content:
-                    reasoning = (msg.get("reasoning_content") or "").strip()
+                    reasoning = (msg.get("reasoning_content") or "").strip() or think_text
                     if reasoning:
                         content = reasoning
                 if not content:
@@ -290,7 +351,9 @@ async def chat(conf: MiniMaxConf, messages: list[dict], temperature: float = 0.8
                         _log.info("minimax retry: attempt=%d reason=empty_content", attempt + 1)
                         await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
                         continue
-                    detail = f"model={conf.model}, finish_reason={choice.get('finish_reason') or ''}"
+                    detail = f"model={conf.model}"
+                    if finish_reason:
+                        detail += f", finish_reason={finish_reason}"
                     raise HTTPException(502, f"MiniMax 返回了空回复，请重试；若持续失败请检查模型配置（{detail}）")
                 usage = parse_usage(data)
                 _accumulate_usage(usage)
@@ -340,6 +403,8 @@ async def chat_stream(conf: MiniMaxConf, messages: list[dict], temperature: floa
         for attempt in range(3):
             content_parts: list[str] = []
             reasoning_parts: list[str] = []
+            think_parts: list[str] = []
+            in_think = False  # 流式 <think> 标签跨 chunk 状态（M2.x 未按 reasoning_split 拆分时）
             usage = LLMUsage()
             try:
                 async with client.stream(
@@ -386,15 +451,25 @@ async def chat_stream(conf: MiniMaxConf, messages: list[dict], temperature: floa
                         delta = choices[0].get("delta") or {}
                         piece = delta.get("content")
                         if piece:
-                            content_parts.append(piece)
-                            yielded = True
-                            yield piece
+                            # M2.x 未按 reasoning_split 拆分时思考内嵌 <think>：状态机剥离，
+                            # 正文部分收集后统一 yield（避免生成器跨 yield 挂起导致状态错乱）
+                            body_parts: list[str] = []
+
+                            def _emit(t):
+                                body_parts.append(t)
+
+                            in_think = _stream_split_think(piece, in_think, think_parts, _emit)
+                            for t in body_parts:
+                                content_parts.append(t)
+                                yielded = True
+                                yield t
                         rp = delta.get("reasoning_content")
                         if rp:
                             reasoning_parts.append(rp)
                 content = "".join(content_parts).strip()
-                if not content and reasoning_parts:
-                    yield "".join(reasoning_parts).strip()
+                if not content and (reasoning_parts or think_parts):
+                    # thinking 模型只输出了思考没出正文：兜底输出一次
+                    yield "".join(reasoning_parts + think_parts).strip()
                 if usage.total_tokens:
                     _accumulate_usage(usage)
                 return

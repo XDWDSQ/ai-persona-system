@@ -53,16 +53,30 @@ def test_conf_from_cfg():
 # ---------------------------------------------------------------- payload -----
 def test_build_payload():
     msgs = [{"role": "user", "content": "你好"}]
-    p = build_payload(msgs, "MiniMax-M2.5", 0.8, 768, True, stream=False)
+    p = build_payload(msgs, "MiniMax-M3", 0.8, 768, True, stream=False)
     check("非流式不带 stream 字段", "stream" not in p)
-    check("thinking 开启", p.get("thinking") == {"type": "enabled"})
-    p = build_payload(msgs, "MiniMax-M2.5", 0.8, 768, False, stream=True)
+    check("thinking 开启(adaptive)", p.get("thinking") == {"type": "adaptive"})
+    check("reasoning_split 拆分思考", p.get("reasoning_split") is True)
+    p = build_payload(msgs, "MiniMax-M3", 0.8, 768, False, stream=True)
     check("流式带 stream=true", p.get("stream") is True)
     check("流式带标准计费参数 include_usage", p.get("stream_options") == {"include_usage": True},
           str(p.get("stream_options")))
-    check("thinking 关闭", p.get("thinking") == {"type": "disabled"})
+    check("thinking 关闭(disabled)", p.get("thinking") == {"type": "disabled"})
     check("基础字段齐全",
-          p["model"] == "MiniMax-M2.5" and p["temperature"] == 0.8 and p["max_tokens"] == 768)
+          p["model"] == "MiniMax-M3" and p["temperature"] == 0.8 and p["max_tokens"] == 768)
+
+
+def test_strip_think():
+    from minimax_llm import strip_think
+    content, think = strip_think("正文在前<think>思考过程</think>正文在后")
+    check("think 块被剥离且正文保留", content == "正文在前正文在后" and think == "思考过程",
+          f"content={content!r} think={think!r}")
+    content, think = strip_think("<think>只有思考</think>")
+    check("只有思考块时正文为空", content == "" and think == "只有思考", f"{content!r} / {think!r}")
+    content, think = strip_think("纯正文没有标签")
+    check("无标签原样返回", content == "纯正文没有标签" and think == "", f"{content!r} / {think!r}")
+    content, think = strip_think("<think>未闭合标签")
+    check("开标签未闭合整体视为思考", content == "" and think == "未闭合标签", f"{content!r} / {think!r}")
 
 
 # ---------------------------------------------------------------- usage -------
@@ -325,10 +339,12 @@ def test_server_merge_billing_mode():
     entry = cfg["cloud_providers"].get("minimax") or {}
     check("billing_mode 合并进 cloud", cfg["cloud"]["billing_mode"] == "token_plan", str(cfg.get("cloud")))
     check("billing_mode 合并进供应商条目", entry.get("billing_mode") == "token_plan", str(entry))
-    # 非法值不落盘
+    # 非法值不落盘（磁盘现有值保持不变）
     cfg2 = copy.deepcopy(server.load_config(with_env=False))
+    before = cfg2.get("cloud", {}).get("billing_mode")
     server._merge_config_update(cfg2, server.ConfigUpdate(cloud_billing_mode="hack"))
-    check("非法计费模式不写入", "billing_mode" not in cfg2.get("cloud", {}), str(cfg2.get("cloud")))
+    check("非法计费模式不写入", cfg2.get("cloud", {}).get("billing_mode") == before,
+          f"before={before} after={cfg2.get('cloud', {}).get('billing_mode')}")
 
 
 def test_status_includes_minimax():
@@ -341,14 +357,63 @@ def test_status_includes_minimax():
           str(list(providers.keys())))
 
 
+def test_chat_strip_think_fallback():
+    async def run():
+        # 模拟 M2.x 行为:思考内嵌 content 的 <think> 标签(未按 reasoning_split 拆分)
+        fake = FakeClient(post_script=[
+            FakeResponse(200, {"choices": [{"message": {
+                "content": "<think>让我想想怎么说</think>正文你好呀"}}]}),
+        ])
+        content, _ = await chat(_default_conf(model="MiniMax-M2.5"),
+                                [{"role": "user", "content": "hi"}], client=fake)
+        check("内嵌 think 被剥离只留正文", content == "正文你好呀", repr(content))
+    import asyncio
+    asyncio.run(run())
+
+
+def test_chat_stream_think_tags():
+    async def run():
+        # 流式下 think 标签在同一 chunk 内完整出现（reasoning_split 兜底场景；
+        # 正常链路 M3 走 reasoning_content 不产生标签，标签被拆碎属极端异常）
+        lines = _sse_chunks([
+            '{"choices":[{"delta":{"content":"前缀"}}]}',
+            '{"choices":[{"delta":{"content":"<think>思考中</think>"}}]}',
+            '{"choices":[{"delta":{"content":"正文"}}]}',
+            "[DONE]",
+        ])
+        fake = FakeClient(stream_lines=lines)
+        got = [p async for p in chat_stream(_default_conf(model="MiniMax-M2.5"),
+                                            [{"role": "user", "content": "hi"}], client=fake)]
+        check("流式 think 标签剥离", got == ["前缀", "正文"], str(got))
+    import asyncio
+    asyncio.run(run())
+
+
+def test_chat_stream_reasoning_fallback():
+    async def run():
+        # reasoning_split 生效:正文为空时兜底输出一次思考内容
+        lines = _sse_chunks([
+            '{"choices":[{"delta":{"reasoning_content":"思考过程"}}]}',
+            "[DONE]",
+        ])
+        fake = FakeClient(stream_lines=lines)
+        got = [p async for p in chat_stream(_default_conf(model="MiniMax-M3"),
+                                            [{"role": "user", "content": "hi"}], client=fake)]
+        check("正文为空时兜底输出思考", got == ["思考过程"], str(got))
+    import asyncio
+    asyncio.run(run())
+
+
 def main():
-    for t in (test_conf_from_cfg, test_build_payload, test_parse_usage, test_map_error,
+    for t in (test_conf_from_cfg, test_build_payload, test_strip_think, test_parse_usage, test_map_error,
               test_chat_ok, test_chat_insufficient_balance_no_retry, test_chat_empty_retry_then_ok,
-              test_chat_thinking_downgrade_on_2013, test_chat_stream_ok_with_usage,
-              test_chat_stream_error_midway, test_query_quota_payg, test_query_quota_token_plan,
-              test_query_quota_no_key, test_server_merge_billing_mode, test_status_includes_minimax):
+              test_chat_thinking_downgrade_on_2013, test_chat_strip_think_fallback,
+              test_chat_stream_ok_with_usage, test_chat_stream_think_tags,
+              test_chat_stream_reasoning_fallback, test_chat_stream_error_midway,
+              test_query_quota_payg, test_query_quota_token_plan, test_query_quota_no_key,
+              test_server_merge_billing_mode, test_status_includes_minimax):
         t()
-    print(f"\n{'=' * 50}\n共 15 组，失败 {_FAIL} 组")
+    print(f"\n{'=' * 50}\n共 19 组，失败 {_FAIL} 组")
     sys.exit(1 if _FAIL else 0)
 
 

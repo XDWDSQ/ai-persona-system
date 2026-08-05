@@ -3,9 +3,8 @@
   "access_token": "",
   "vision": {
     "enabled": true,
-    "provider": "auto",
-    "local_base_url": "http://127.0.0.1:11435/v1",
-    "local_model": "Qwen2.5-VL-3B"
+    "base_url": "http://127.0.0.1:11435/v1",
+    "model": "Qwen2.5-VL-3B"
   },
   "local": {
     "base_url": "http://127.0.0.1:11434/v1",
@@ -44,7 +43,7 @@
     "minimax": {
       "label": "MiniMax",
       "base_url": "https://api.minimaxi.com/v1",
-      "model": "MiniMax-M2.5",
+      "model": "MiniMax-M3",
       "api_key": "",
       "thinking": true,
       "billing_mode": "payg"
@@ -67,11 +66,6 @@
     "enabled": true,
     "manual": "",
     "weather": true
-  },
-  "vision": {
-    "enabled": true,
-    "base_url": "http://127.0.0.1:11435/v1",
-    "model": "Qwen2.5-VL-3B"
   },
   "search": {
     "enabled": true,
