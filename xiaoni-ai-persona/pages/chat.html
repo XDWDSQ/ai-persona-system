@@ -1140,6 +1140,16 @@
                 addFailureMsg(sessionId, '模型没有返回内容', snap);
                 return;
               }
+              /* 流式期间 syncSessionsFromServer 的多端合并可能已把 sessions 数组里的
+                 会话对象整体替换（旧对象脱离数组）——入库前必须重新取最新引用，
+                 否则 push 进旧对象 = 这条回复永久丢失。 */
+              var fresh = findSession(sessionId);
+              if (!fresh) {
+                if (div && div.parentNode) div.remove();
+                addFailureMsg(sessionId, '会话已被删除', snap);
+                return;
+              }
+              s = fresh;
               s.history.push({ role: 'assistant', content: clean, style: style });
               markSessionActivity(sessionId);
               if (currentSessionId === sessionId) {
@@ -2063,14 +2073,17 @@
           function markAwaiting(sessionId, on) {
             if (!sessionId) return;
             state.awaiting[sessionId] = Math.max(0, (state.awaiting[sessionId] || 0) + (on ? 1 : -1));
-            /* 桌宠联动：生成中 → thinking（结束不直接回 idle，等 TTS 事件收尾） */
-            if (on) {
-              try {
-                window.dispatchEvent(new CustomEvent('pet:state', {
-                  detail: { state: 'thinking' }
-                }));
-              } catch (e) {}
-            }
+            var n = state.awaiting[sessionId];
+            if (n === 0) delete state.awaiting[sessionId]; /* 计数归零即清理键，防无界残留 */
+            /* 桌宠联动：生成中 → thinking；全部结束 → idle。
+               旧实现只在 on 时派发 thinking、off 时等 TTS 事件收尾，
+               但生成失败/用户切会话的路径没有 TTS 收尾 → 桌宠永久卡在思考动画。
+               生成成功且 TTS 正在播放的场景，TTS 自己的状态事件会覆盖/收尾，idle 无害。 */
+            try {
+              window.dispatchEvent(new CustomEvent('pet:state', {
+                detail: { state: on ? 'thinking' : 'idle' }
+              }));
+            } catch (e) {}
           }
           function makeRetryBtn(sessionId, snap) {
             var b = document.createElement('button');
@@ -2112,8 +2125,20 @@
             var userMsg = s.history[u];
             var userText = userMsg.content || ((userMsg.attachments && userMsg.attachments.length) ? '（发送了附件）' : '');
             var userAtts = userMsg.attachments || snap.atts || [];
+            /* 防数据丢失：只有该消息是历史最后一条时才允许重试。
+               若失败后用户又发了新消息并成功（u 之后还有内容），splice(u+1)
+               会把后续成功对话全部删掉——此时拒绝重试，提示用户。 */
+            if (u < s.history.length - 1) {
+              if (btn) {
+                btn.disabled = false;
+                var l0 = btn.querySelector('span');
+                if (l0) l0.textContent = '重试';
+              }
+              toast('这条消息之后还有新对话，无法重试（避免删除已成功的消息）');
+              return;
+            }
             var hist = s.history.slice(0, u);
-            s.history.splice(u + 1); /* 丢弃该用户消息之后的残留（失败轮次不会产生助手消息，这里只是防御） */
+            s.history.splice(u + 1); /* 丢弃该用户消息之后的残留（u 已是末尾，安全） */
             state.history = s.history;
             var failDiv = btn ? btn.closest('.msg') : null;
             if (failDiv) failDiv.remove();
@@ -3126,13 +3151,16 @@
           }
           /* 把会话整理成可读文本（复制/导出共用） */
           function sessionTranscript(sess){
+            /* 角色名动态取：切到大帅等角色后导出不再显示"小妮" */
+            var _r = (state.roles || []).find(function(x){ return x.key === currentRoleKey; });
+            var _roleName = (_r && _r.name) || '小妮';
             var lines = [
-              '小妮对话记录：' + (sess.title || '未命名会话'),
+              _roleName + '对话记录：' + (sess.title || '未命名会话'),
               '时间：' + new Date(sess.updatedAt || Date.now()).toLocaleString('zh-CN'),
               '——————————————'
             ];
             (sess.history || []).forEach(function(m){
-              var who = m.role === 'assistant' ? '小妮' : '我';
+              var who = m.role === 'assistant' ? _roleName : '我';
               lines.push('【' + who + '】');
               lines.push(m.content || '');
               (m.attachments || []).forEach(function(a){

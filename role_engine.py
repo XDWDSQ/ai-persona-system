@@ -134,6 +134,10 @@ def _dup_sim(a: str, b: str) -> float:
 class MemoryStore:
     def __init__(self, data_dir: Path, role: str, limit: int = _MEMORY_LIMIT_DEFAULT):
         self.path = data_dir / "memory" / f"{role}.json"
+        # 路径穿越双保险：role 若含 ../ 或绝对路径，resolve 后必然越出 memory 目录
+        root = (data_dir / "memory").resolve()
+        if not self.path.resolve().is_relative_to(root):
+            raise ValueError(f"illegal role path: {self.path}")
         self.limit = limit
         self._lock = threading.RLock()
 
@@ -270,6 +274,9 @@ class MemoryStore:
 class StateStore:
     def __init__(self, data_dir: Path, role: str):
         self.path = data_dir / "state" / f"{role}.json"
+        root = (data_dir / "state").resolve()
+        if not self.path.resolve().is_relative_to(root):
+            raise ValueError(f"illegal role path: {self.path}")
         self._lock = threading.RLock()
 
     def load(self) -> dict:
@@ -278,10 +285,22 @@ class StateStore:
         emo = data.get("emotion") or {}
         merged = dict(DEFAULT_STATE)
         merged.update({k: v for k, v in data.items() if k != "emotion"})
-        merged["emotion"] = {
-            "valence": float(emo.get("valence", DEFAULT_STATE["emotion"]["valence"])),
-            "arousal": float(emo.get("arousal", DEFAULT_STATE["emotion"]["arousal"])),
-        }
+        # 数值字段统一 float() 防御：手改/损坏的 JSON 若为字符串，衰减计算会 TypeError
+        try:
+            merged["emotion"] = {
+                "valence": float(emo.get("valence", DEFAULT_STATE["emotion"]["valence"])),
+                "arousal": float(emo.get("arousal", DEFAULT_STATE["emotion"]["arousal"])),
+            }
+        except (TypeError, ValueError):
+            merged["emotion"] = dict(DEFAULT_STATE["emotion"])
+        try:
+            merged["energy"] = float(merged.get("energy", DEFAULT_STATE["energy"]))
+        except (TypeError, ValueError):
+            merged["energy"] = DEFAULT_STATE["energy"]
+        try:
+            merged["intimacy"] = float(merged.get("intimacy", DEFAULT_STATE["intimacy"]))
+        except (TypeError, ValueError):
+            merged["intimacy"] = DEFAULT_STATE["intimacy"]
         return merged
 
     def _save(self, state: dict) -> bool:

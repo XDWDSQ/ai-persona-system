@@ -326,12 +326,29 @@ def _spawn_bg(coro) -> None:
 _role_stores: dict[str, tuple[MemoryStore, StateStore]] = {}
 _post_processor: PostProcessor | None = None
 
+# 角色名白名单：仅字母/数字/下划线/连字符/中文，最长 64。
+# role 会拼进 data/memory/{role}.json / data/state/{role}.json 文件路径，
+# 不经校验的任意字符串 = 路径穿越（可越权读任意角色的记忆、或探测任意 JSON 文件）。
+_ROLE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff]{1,64}$")
+
+
+def _sanitize_role(role: str) -> str:
+    """角色名合法性校验：非法字符/超长一律拒绝，防止路径穿越。"""
+    role = (role or "").strip()
+    if role and not _ROLE_NAME_RE.fullmatch(role):
+        _log.warning("role name rejected (invalid chars): %r", role)
+        return ""
+    return role
+
 
 def _get_role_stores(role: str) -> tuple[MemoryStore, StateStore]:
     """获取（或创建）指定角色的记忆库+状态库。data/ 下按角色分文件。
 
     memory_limit 每次调用都从配置同步：此前在 store 懒创建时固化，
-    改配置不重启永远不生效。"""
+    改配置不重启永远不生效。role 必须通过白名单校验，否则抛 400。"""
+    role = _sanitize_role(role)
+    if not role:
+        raise HTTPException(400, "非法的角色名")
     cfg = load_config()
     engine_cfg = cfg.get("role_engine") or {}
     try:
@@ -669,6 +686,25 @@ def _gps_text(lat: float, lng: float) -> str:
     return f"{ns}{abs(lat):.2f}°、{ew}{abs(lng):.2f}°附近"
 
 
+def _safe_float(v, default: float = 0.0) -> float:
+    """安全转 float：字符串/None/非法值一律回退默认，绝不抛异常。
+
+    用于读取可能被手改/损坏的 JSON 缓存字段（ts/lat/lng 等），
+    这些字段在对话主链路被消费，一次 ValueError 会整条对话 500。"""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(v, default: int = 0) -> int:
+    """安全转 int：非法值回退默认（与 _safe_float 同思路）。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _ip_locate() -> dict:
     """IP 自动定位（城市级）。按 _IP_LOCATE_URLS 顺序尝试，全失败返回空 dict，
     绝不抛异常（任何主链路都不依赖它）。"""
@@ -731,8 +767,11 @@ def _location_summary() -> dict:
     auto_src = str(auto.get("source") or "")
     # GPS 只有经纬度时，用方位文本兜底；有城市描述则优先城市
     if not auto_city and auto.get("lat") is not None and auto.get("lng") is not None:
-        auto_city = _gps_text(float(auto["lat"]), float(auto["lng"]))
-        auto_src = "gps"
+        try:
+            auto_city = _gps_text(_safe_float(auto["lat"]), _safe_float(auto["lng"]))
+            auto_src = "gps"
+        except (TypeError, ValueError):
+            pass  # 经纬度非法 → 按位置未知降级，绝不中断对话主链路
     if manual:
         effective, source = manual, "manual"
     elif auto_city:
@@ -1138,7 +1177,7 @@ async def _bg_weather_refresh(force: bool = False) -> str:
             s_loc = _location_summary()
             cur_city = s_loc["effective"] if s_loc["enabled"] else ""
             if (snap.get("text") and snap.get("city") == cur_city
-                    and (time.time() - float(snap.get("ts", 0))) < _WEATHER_MAX_AGE_S):
+                    and (time.time() - _safe_float(snap.get("ts", 0))) < _WEATHER_MAX_AGE_S):
                 return snap["text"]  # 30 分钟内且城市未变 → 直接用缓存
         if not _weather_enabled():
             return ""
@@ -1165,7 +1204,7 @@ def _weather_text() -> str:
         return ""
     snap = _weather_snapshot()
     if snap.get("text"):
-        if (time.time() - float(snap.get("ts", 0))) >= _WEATHER_MAX_AGE_S:
+        if (time.time() - _safe_float(snap.get("ts", 0))) >= _WEATHER_MAX_AGE_S:
             _spawn_bg(_bg_weather_refresh(force=True))  # 过期 → 后台刷新，本轮先用旧值
         return snap["text"]
     _spawn_bg(_bg_weather_refresh())
@@ -1303,7 +1342,7 @@ async def _bg_role_news_refresh(force: bool = False) -> str:
         if not force:
             snap = _load_role_news()
             if (snap.get("text") and snap.get("keyword") == keyword
-                    and (time.time() - float(snap.get("ts", 0))) < _ROLE_NEWS_MAX_AGE_S):
+                    and (time.time() - _safe_float(snap.get("ts", 0))) < _ROLE_NEWS_MAX_AGE_S):
                 return snap["text"]  # 12h 内同关键词 → 直接用缓存
         # 先按「最新动态」搜，再按关键词本身兜底
         results = await web_search(f"{keyword} 最新 动态 比赛 训练", None)
@@ -1332,7 +1371,7 @@ def _role_news_text() -> str:
         return ""
     snap = _load_role_news()
     if snap.get("text") and snap.get("keyword") == keyword:
-        if (time.time() - float(snap.get("ts", 0))) >= _ROLE_NEWS_MAX_AGE_S:
+        if (time.time() - _safe_float(snap.get("ts", 0))) >= _ROLE_NEWS_MAX_AGE_S:
             _spawn_bg(_bg_role_news_refresh(force=True))
         return snap["text"]
     _spawn_bg(_bg_role_news_refresh())
@@ -3032,7 +3071,7 @@ def _fix_addressing(text: str) -> str:
                 r"他搂", r"他抱", r"他亲", r"他摸"]:
         text = _re.sub(pat, pat.replace("他", "你"), text)
     # 4) 女性自称替换（覆盖复杂句式：我是/我可不是/我真是...的女人/女孩子/女生）
-    text = text.replace("这是我的女人", "我是你的人")
+    text = text.replace("这是我的女人", "你是我的人")
     text = _re.sub(r"我是(?:一个|个)?女人", "我是个男生", text)
     text = _re.sub(r"我是(?:一个|个)?女孩子", "我是个男生", text)
     text = _re.sub(r"我是(?:一个|个)?女生", "我是个男生", text)
@@ -3176,7 +3215,7 @@ async def search_api(req: SearchRequest):
 
 async def _chat_stream_events(system: dict, history: list[dict], user_content: str,
                               cfg: dict, out_tokens: int, chat_thinking: bool | None,
-                              req: ChatRequest):
+                              req: ChatRequest, active_role: str = ""):
     """/api/chat?stream 的 SSE 事件生成器。
 
     事件（data: JSON）：
@@ -3200,6 +3239,16 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
             raw = _strip_search_markers(raw)
             full = raw
             yield ev({"d": raw})
+            # 视觉回复已完整给出：立即收尾返回。此前此处缺 return，会继续执行下方文本
+            # 流式主循环，把同一问题再交给文本模型生成一遍（用户看到双份回答）。
+            clean = _STYLE_RE.sub("", full).strip()
+            clean = _strip_meta_notes(clean)
+            if active_role == "dashuai":
+                clean = _fix_addressing(clean)
+            style, _ = parse_style_prefix(full)
+            yield ev({"done": True, "clean": clean, "style": style,
+                      "searched": False, "vision_used": True})
+            return
 
     # 文本流式主循环（含搜索探测与长文续写）
     search_cfg = cfg.get("search") or {}
@@ -3302,7 +3351,9 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
     # 收尾：剥离全部 style 标记与元话语，交给前端入库展示
     clean = _STYLE_RE.sub("", full).strip()
     clean = _strip_meta_notes(clean)
-    clean = _fix_addressing(clean)
+    # 称呼纠错仅对大帅角色生效（自称老婆/称用户老公/男性自称），其他角色会误伤
+    if active_role == "dashuai":
+        clean = _fix_addressing(clean)
     style, _ = parse_style_prefix(full)
     yield ev({"done": True, "clean": clean, "style": style,
               "searched": searched, "vision_used": vision_used})
@@ -3331,7 +3382,7 @@ async def chat(req: ChatRequest):
             # build_context 含磁盘读 + O(n) 记忆打分，属 CPU/IO 工作，丢线程池避免卡事件循环
             ctx = await asyncio.to_thread(
                 role_engine.build_context, mem, st, user_text or "（附件）",
-                top_k=int(engine_cfg.get("top_k", 5)),
+                top_k=_safe_int(engine_cfg.get("top_k"), 5),
                 location=location_text, weather=weather_text,
                 self_location=self_loc, self_recent=self_rec, news=news_text,
             )
@@ -3380,7 +3431,7 @@ async def chat(req: ChatRequest):
     if req.stream:
         # SSE 流式输出：边生成边推送增量，前端逐块渲染（视觉/搜索/长文续写内部处理）
         return StreamingResponse(
-            _chat_stream_events(system, history, user_content, cfg, out_tokens, chat_thinking, req),
+            _chat_stream_events(system, history, user_content, cfg, out_tokens, chat_thinking, req, active_role),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -3441,8 +3492,11 @@ async def chat(req: ChatRequest):
     # 对话后处理（异步，不阻塞）：更新情绪状态 + 抽取长期记忆写回
     if engine_on and mem is not None and st is not None and reply:
         _spawn_bg(_post_process_chat(active_role, post_text, reply))
-    # 称呼纠错兜底：4B 模型偶发自称老公/称用户老婆/用第三人称，返回前自动纠正
-    reply = _fix_addressing(reply)
+    # 称呼纠错兜底：仅大帅角色适用（4B 模型偶发自称老公/称用户老婆/用第三人称）。
+    # 该替换规则是给大帅（用户是老公、大帅自称老婆）专门定制的，对小拟/老铁/妹儿
+    # 等其他角色是无条件执行的，会把「我是女孩子」这类正常表述误改成「我是男生」。
+    if active_role == "dashuai":
+        reply = _fix_addressing(reply)
     return {"reply": reply, "style": style, "vision_used": vision_used, "searched": searched}
 
 
@@ -3589,7 +3643,7 @@ async def role_greeting():
             mem, st = _get_role_stores(active_role)
             ctx = await asyncio.to_thread(
                 role_engine.build_context, mem, st, "",
-                top_k=int(engine_cfg.get("top_k", 5)),
+                top_k=_safe_int(engine_cfg.get("top_k"), 5),
                 location=location_text, weather=weather_text,
                 self_location=self_loc, self_recent=self_rec, news=news_text,
             )
@@ -3716,8 +3770,9 @@ async def put_sessions(req: SessionsRequest, client: str = ""):
         # （曾发生：手机端测试删除记录覆盖服务端，28 条对话只剩空壳）。
         # 合并后若出现"消息数骤降"，先把当前文件备份为 .bak-时间戳 再写入，
         # 保证任何情况下都能从最近的完整快照回滚。备份节流：同文件 5 分钟内至多一次。
+        # 备份含同步 copy2（可能复制数十 MB），丢线程池避免阻塞事件循环。
         try:
-            _backup_sessions_before_destructive(current, merged)
+            await asyncio.to_thread(_backup_sessions_before_destructive, current, merged)
         except Exception as exc:  # noqa: BLE001
             _log.warning("sessions backup skipped: %s", exc)
 

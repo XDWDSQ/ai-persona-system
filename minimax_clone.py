@@ -44,7 +44,8 @@ def _load_dotenv() -> dict:
 
 
 def get_key() -> str:
-    key = (BASE_DIR / ".env" and _load_dotenv().get("MINIMAX_API_KEY")) or ""
+    env = _load_dotenv()
+    key = env.get("MINIMAX_API_KEY", "")
     return key or input("请输入 MiniMax API Key: ").strip()
 
 

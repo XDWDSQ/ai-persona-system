@@ -1,8 +1,11 @@
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { extname, join, normalize } from 'node:path';
+import { dirname, extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = 'd:\\Users\\31557\\Desktop-快速访问\\AI拟人系统\\xiaoni-ai-persona';
+/* 站点根目录从本文件位置推导（本文件位于 xiaoni-ai-persona/ 下），
+   不再硬编码用户绝对路径——换机器/移动目录也不会全部 404。 */
+const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = 8390;
 
 const MIME = {
