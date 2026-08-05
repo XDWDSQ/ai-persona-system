@@ -1443,6 +1443,34 @@ def _emotion_text(st: dict | None) -> str:
     return f"情绪{mood}、{energy}（角色引擎状态）"
 
 
+def _role_news_relevant(blob: str, keyword: str, role_name: str) -> bool:
+    """规则级相关性过滤：搜索结果文本是否与角色/战队直接相关。
+
+    命中以下任一条件即判定相关：
+      - 出现角色名（name/full_name 片段）
+      - 出现 keyword 中 ≥2 字的片段（如「成都AG超玩会」「孟家俊」）
+      - 出现电竞领域强信号词（比赛/战队/选手/训练/直播/KPL 等）且文本含 keyword 任一分词
+    纯城市/景点/旅游类内容（keyword 里常见的城市名）不会误判为角色动态。"""
+    text = (blob or "").strip()
+    if not text:
+        return False
+    name_bits = [b for b in re.split(r"[\s·.、]+", str(role_name or "")) if len(b) >= 2]
+    kw_bits = [b for b in re.split(r"[\s·.、]+", str(keyword or "")) if len(b) >= 2]
+    # 1) 角色名直接出现
+    for b in name_bits:
+        if b and b in text:
+            return True
+    # 2) keyword 片段命中（任一 ≥2 字分词出现在文本）
+    if any(b and b in text for b in kw_bits):
+        return True
+    # 3) 电竞信号词 + keyword 任意强分词（如「AG」「超玩会」）共同出现
+    strong = [b for b in kw_bits if len(b) >= 4]
+    if strong and any(b in text for b in strong) and any(
+            w in text for w in ("比赛", "战队", "选手", "训练", "直播", "KPL", "电竞", "赛")):
+        return True
+    return False
+
+
 def _build_rule_cards(keyword: str, results: list[dict], facts: dict, role_name: str) -> list[dict]:
     """规则兜底卡片：按来源逐个产出「已确认」条目，资料不足的类别降级为缺失提示。
 
@@ -1465,27 +1493,31 @@ def _build_rule_cards(keyword: str, results: list[dict], facts: dict, role_name:
         cards.append({"id": "situ", "category": "当前处境", "status": "missing",
                       "content": "", "reason": "未配置位置（config.location.manual 为空），也无角色静态设定",
                       "suggestion": "在 config.json 中配置 location.manual 可启用位置感知", "source": "", "ts": now})
-    # 2) 近期活动：搜索最新结果
+    # 2) 近期活动：搜索最新结果（先做相关性过滤：结果必须与角色/战队直接相关）
     web_parts = []
     for r in results[:5]:
         t = (r.get("title") or "").strip()
         s = (r.get("snippet") or "").strip()
-        web_parts.append(t or s)
+        blob = (t + " " + s)[:200]
+        if _role_news_relevant(blob, keyword, role_name):
+            web_parts.append(t or s)
     if web_parts:
         cards.append({"id": "active", "category": "近期活动", "status": "confirmed",
                       "content": "；".join(web_parts)[:200], "source": "web", "ts": now})
     else:
         cards.append({"id": "active", "category": "近期活动", "status": "missing",
-                      "content": "", "reason": f"联网搜索「{keyword}」暂无结果",
+                      "content": "",
+                      "reason": (f"联网搜索「{keyword}」暂无结果" if not results
+                                 else "搜索到的资料与角色无关（如同名城市/景点/通用资讯），已过滤"),
                       "suggestion": "可稍后重试，或调整 roles.*.news.keyword 关键词", "source": "web", "ts": now})
-    # 3) 关键事件：搜索中带日期的条目（规则无法可靠提取日期时标注推测）
-    if results:
+    # 3) 关键事件：仅当搜索结果与角色相关时才给推测
+    if web_parts:
         cards.append({"id": "event", "category": "关键事件", "status": "inferred",
                       "content": "推测：近期有比赛/训练相关安排（以搜索结果标题为准）",
-                      "reason": "仅能确认有最新资讯，具体事件需人工核实", "source": "web", "ts": now})
+                      "reason": "仅能确认有相关资讯，具体事件需人工核实", "source": "web", "ts": now})
     else:
         cards.append({"id": "event", "category": "关键事件", "status": "missing",
-                      "content": "", "reason": "无搜索结果可提取关键事件",
+                      "content": "", "reason": "无与角色相关的搜索结果，无法提取关键事件",
                       "suggestion": "补充资料：在设置中点击「搜索动态」重试", "source": "", "ts": now})
     # 4) 人物关系：长期记忆
     mems = facts.get("memory") or []
@@ -1528,11 +1560,14 @@ async def _summarize_role_news(keyword: str, role_name: str, results: list[dict]
             '"status": "confirmed|inferred|missing", "content": "内容", "reason": "依据或缺失原因", '
             '"date": "可选日期"}]}\n'
             "规则：\n"
-            "1. confirmed = 资料中有明确证据的事实（搜索结果/静态设定/记忆/位置天气）；\n"
-            "2. inferred = 无直接证据但可合理推断的内容，content 以「推测：」开头，reason 写推断依据；\n"
-            "3. missing = 该类别完全没有资料时给出，content 留空，reason 写缺失原因；\n"
-            "4. 四个类别（当前处境/近期活动/关键事件/人物关系）尽量各覆盖一条；\n"
-            "5. 绝不要编造资料里没有的事实，宁可 missing 也不要虚构。"
+            "1. 相关性过滤（最重要）：搜索结果若与「该角色本人或其所属战队」无关"
+            "（如只是同名城市/景点/通用资讯），一律不得写入 confirmed/inferred，"
+            "该类别直接标 missing 并注明「搜索资料与角色无关」；\n"
+            "2. confirmed = 资料中有明确证据且与角色直接相关的事实（搜索结果/静态设定/记忆/位置天气）；\n"
+            "3. inferred = 无直接证据但可合理推断的内容，content 以「推测：」开头，reason 写推断依据；\n"
+            "4. missing = 该类别完全没有可靠资料时给出，content 留空，reason 写缺失原因；\n"
+            "5. 四个类别（当前处境/近期活动/关键事件/人物关系）尽量各覆盖一条；\n"
+            "6. 绝不要编造资料里没有的事实，宁可 missing 也不要虚构。"
         )
         prompt = (
             f"对象：{role_name}\n搜索关键词：{keyword}\n\n"
