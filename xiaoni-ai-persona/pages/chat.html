@@ -526,6 +526,12 @@
         .loop-btn:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--muted-foreground) 45%,transparent)}
         .loop-btn:active{transform:scale(.94)}
         .loop-btn.on{color:#fff;background:var(--chart-2);border-color:var(--chart-2)}
+        .save-btn{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;background:none;border:1px solid var(--border);border-radius:999px;color:var(--muted-foreground);cursor:pointer;flex:none;transition:color .16s ease,border-color .16s ease,background-color .16s ease,transform .12s ease}
+        .save-btn svg{width:12px;height:12px}
+        .save-btn:hover{color:var(--success);border-color:color-mix(in srgb,var(--success) 45%,transparent)}
+        .save-btn:active{transform:scale(.94)}
+        .save-btn.saving{opacity:.6;pointer-events:none}
+        .save-btn.saved{color:#fff;background:var(--success);border-color:var(--success)}
         .speak-btn:hover{color:var(--chart-2);border-color:color-mix(in srgb,var(--chart-2) 45%,transparent)}
         .speak-btn.done{color:var(--success);border-color:color-mix(in srgb,var(--success) 40%,transparent)}
         .speak-btn.playing{color:var(--chart-2);border-color:color-mix(in srgb,var(--chart-2) 45%,transparent);background:color-mix(in srgb,var(--chart-2) 10%,transparent)}
@@ -1154,7 +1160,8 @@
                 return;
               }
               s = fresh;
-              s.history.push({ role: 'assistant', content: clean, style: style });
+              var aiMsg = { role: 'assistant', content: clean, style: style };
+              s.history.push(aiMsg);
               markSessionActivity(sessionId);
               if (currentSessionId === sessionId) {
                 if (!div) {
@@ -1165,11 +1172,11 @@
                   b2.classList.remove('no-text');
                 }
                 var meta = div.querySelector('.msg-meta');
-                var spk = makeSpeakBtn(clean, style);
+                var spk = makeSpeakBtn(clean, style, aiMsg, sessionId);
                 meta.appendChild(spk);
-                meta.appendChild(makeResynthBtn(clean, style));
+                meta.appendChild(makeResynthBtn(clean, style, aiMsg, sessionId));
                 meta.appendChild(makeRegenBtn(div));
-                if (state.soundOn) ttsAndPlay(clean, spk, style);
+                if (state.soundOn) ttsAndPlay(clean, spk, style, false, aiMsg, sessionId);
               }
             } catch (e) {
               hideTyping();
@@ -1868,13 +1875,57 @@
               state.playingBtn = null;
             }
           }
-          function makeSpeakBtn(text, style) {
+          /* 保存/下载合成音频到本地：绕过前端内存缓存，直接请求后端
+             （后端 tts_cache 磁盘缓存命中，秒回；force=false 复用原合成结果）。
+             文件名带文本前缀与时间戳，方便识别。 */
+          async function saveTTSAudio(text, style, btn, msg) {
+            if (!btn) btn = null;
+            try {
+              if (btn) { btn.classList.add('saving'); btn.title = '正在保存…'; }
+              // 优先用已持久化的稳定音频 URL（刷新/切会话后仍在），否则回退 POST 合成（命中磁盘缓存）
+              var blob;
+              if (msg && msg.audio) {
+                try {
+                  var gr = await fetch(msg.audio);
+                  if (gr.ok) blob = await gr.blob();
+                } catch (e) { blob = null; }
+              }
+              if (!blob) {
+                var r = await fetch('/api/tts', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ text: text, style: style || '', speed: 1.0, force: false }),
+                });
+                if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
+                if (!r.ok) throw new Error('TTS 失败');
+                blob = await r.blob();
+              }
+              var a = document.createElement('a');
+              var prefix = (text || '').replace(/[\\/:*?"<>|\s]+/g, '').slice(0, 12) || 'tts';
+              var ts = new Date();
+              var pad = function(n){ return (n < 10 ? '0' : '') + n; };
+              var fname = prefix + '-' + ts.getFullYear() + pad(ts.getMonth()+1) + pad(ts.getDate()) + '-' +
+                          pad(ts.getHours()) + pad(ts.getMinutes()) + pad(ts.getSeconds()) + '.wav';
+              a.href = URL.createObjectURL(blob);
+              a.download = fname;
+              document.body.appendChild(a);
+              a.click();
+              setTimeout(function(){ URL.revokeObjectURL(a.href); a.parentNode.removeChild(a); }, 800);
+              if (btn) { btn.classList.remove('saving'); btn.classList.add('saved'); btn.title = '已保存'; }
+              setTimeout(function(){ if (btn) btn.classList.remove('saved'); }, 1800);
+            } catch (e) {
+              if (btn) { btn.classList.remove('saving'); btn.title = '保存失败'; }
+              toast && toast(e.message || '保存失败', 3000, 'error');
+            }
+          }
+          function makeSpeakBtn(text, style, msg, sid) {
             var wrap = document.createElement('span');
             wrap.className = 'speak-wrap';
             var b = document.createElement('button');
             b.className = 'speak-btn';
             b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg><span class="speak-label">朗读</span>';
-            b.onclick = function(){ ttsAndPlay(text, b, style); };
+            b._msg = msg || null;
+            b._sid = sid || null;
+            b.onclick = function(){ ttsAndPlay(text, b, style, false, msg, sid); };
             /* 循环播放开关：开启后该条音频播完自动从头再播 */
             var lb = document.createElement('button');
             lb.type = 'button';
@@ -1892,20 +1943,38 @@
             };
             wrap.appendChild(b);
             wrap.appendChild(lb);
+            /* 保存/下载音频：直接走后端 /api/tts（命中磁盘缓存，秒回），
+               不依赖前端内存 audioCache，刷新页面后依然能存到本地 */
+            var sb = document.createElement('button');
+            sb.type = 'button';
+            sb.className = 'save-btn';
+            sb.title = '保存音频到本地';
+            sb.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>';
+            sb.onclick = function(ev) {
+              if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+              saveTTSAudio(text, style, sb, msg);
+            };
+            wrap.appendChild(sb);
             wrap._speak = b; /* 调用处传入 wrap 时据此解包到朗读按钮 */
             return wrap;
           }
-          function makeResynthBtn(text, style) {
+          function makeResynthBtn(text, style, msg, sid) {
             var b = document.createElement('button');
             b.className = 'speak-btn resynth-btn';
             b.title = '重新合成并替换当前音频';
             b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg><span class="speak-label">重新合成</span>';
-            b.onclick = function(){ ttsAndPlay(text, b, style, true); };
+            b._msg = msg || null;
+            b._sid = sid || null;
+            b.onclick = function(){ ttsAndPlay(text, b, style, true, msg, sid); };
             return b;
           }
-          async function ttsAndPlay(text, btn, style, force) {
+          async function ttsAndPlay(text, btn, style, force, msg, sid) {
             force = !!force;
             if (btn && btn._speak) btn = btn._speak; /* 朗读按钮组容器 -> 解包到朗读按钮 */
+            /* 兜底：调用方未显式传 msg/sid 时（如自动朗读），从按钮上携带的引用取，
+               保证自动播放的音频也能持久化进消息 */
+            if (!msg && btn && btn._msg) msg = btn._msg;
+            if (!sid && btn && btn._sid) sid = btn._sid;
             /* 播放/暂停切换：同一条正在播放时再点一下暂停，再点一下继续 */
             if (!force && state.playing && state.playingBtn === btn) {
               if (state.playing.paused) {
@@ -1939,36 +2008,56 @@
             }
             try {
               if (!url || force) {
-                if (!force && state.ttsInflight[key]) {
-                  // 同一句已有合成请求在飞（自动朗读+手动点朗读撞车），直接等它结果，不重复请求
-                  url = await state.ttsInflight[key];
-                } else {
-                  var job = (async function(){
-                    var r = await fetch('/api/tts', {
-                      method: 'POST', headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ text: text, style: style || '', speed: state.speed, force: force }),
-                    });
-                    if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
-                    if (!r.ok) throw new Error('TTS 失败');
-                    // 释放旧 URL 避免内存泄漏
-                    if (state.audioCache[key]) URL.revokeObjectURL(state.audioCache[key]);
-                    var u = URL.createObjectURL(await r.blob());
-                    state.audioCache[key] = u;
-                    // 超过 50 条时淘汰最旧条目，防止无界增长（跳过正在播放的 URL）
-                    var ck = Object.keys(state.audioCache);
-                    if (ck.length > 50) {
-                      for (var ci = 0; ci < ck.length; ci++) {
-                        var oldU = state.audioCache[ck[ci]];
-                        if (state.playing && state.playing.src === oldU) continue;
-                        URL.revokeObjectURL(oldU);
-                        delete state.audioCache[ck[ci]];
-                        break;
-                      }
+                // 已持久化到消息的音频 URL（刷新/切会话后仍在）：直接取，免重新合成
+                if (!force && msg && msg.audio) {
+                  try {
+                    var gr = await fetch(msg.audio);
+                    if (gr.ok) {
+                      var gu = URL.createObjectURL(await gr.blob());
+                      if (state.audioCache[key]) URL.revokeObjectURL(state.audioCache[key]);
+                      state.audioCache[key] = gu;
+                      url = gu;
                     }
-                    return u;
-                  })();
-                  if (!force) state.ttsInflight[key] = job;
-                  try { url = await job; } finally { if (!force) delete state.ttsInflight[key]; }
+                  } catch (e) { /* 落到下面的合成兜底 */ }
+                }
+                if (!url || force) {
+                  if (!force && state.ttsInflight[key]) {
+                    // 同一句已有合成请求在飞（自动朗读+手动点朗读撞车），直接等它结果，不重复请求
+                    url = await state.ttsInflight[key];
+                  } else {
+                    var job = (async function(){
+                      var r = await fetch('/api/tts', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: text, style: style || '', speed: state.speed, force: force }),
+                      });
+                      if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
+                      if (!r.ok) throw new Error('TTS 失败');
+                      // 把稳定可回放/下载的音频 URL 持久化进消息，随对话一起保存
+                      var cacheHash = r.headers.get('X-TTS-Cache');
+                      if (cacheHash && msg) {
+                        msg.audio = '/api/tts/file?h=' + cacheHash;
+                        try { if (sid) markSessionActivity(sid); saveSessions(); } catch (e) {}
+                      }
+                      // 释放旧 URL 避免内存泄漏
+                      if (state.audioCache[key]) URL.revokeObjectURL(state.audioCache[key]);
+                      var u = URL.createObjectURL(await r.blob());
+                      state.audioCache[key] = u;
+                      // 超过 50 条时淘汰最旧条目，防止无界增长（跳过正在播放的 URL）
+                      var ck = Object.keys(state.audioCache);
+                      if (ck.length > 50) {
+                        for (var ci = 0; ci < ck.length; ci++) {
+                          var oldU = state.audioCache[ck[ci]];
+                          if (state.playing && state.playing.src === oldU) continue;
+                          URL.revokeObjectURL(oldU);
+                          delete state.audioCache[ck[ci]];
+                          break;
+                        }
+                      }
+                      return u;
+                    })();
+                    if (!force) state.ttsInflight[key] = job;
+                    try { url = await job; } finally { if (!force) delete state.ttsInflight[key]; }
+                  }
                 }
               }
               if (prog) { prog.done(); prog = null; }
@@ -2980,8 +3069,8 @@
               div.dataset.hidx = String(i);
               if (m.role === 'assistant') {
                 var meta = div.querySelector('.msg-meta');
-                meta.appendChild(makeSpeakBtn(m.content, m.style || ''));
-                meta.appendChild(makeResynthBtn(m.content, m.style || ''));
+                meta.appendChild(makeSpeakBtn(m.content, m.style || '', m, currentSessionId));
+                meta.appendChild(makeResynthBtn(m.content, m.style || '', m, currentSessionId));
                 meta.appendChild(makeRegenBtn(div));
               }
             });
@@ -3351,20 +3440,21 @@
                   if (currentSessionId !== sessionId) return;
                   var s = findSession(sessionId);
                   if (!s) return;
+                  var gMsg = { role: 'assistant', content: r.reply, style: r.style || '' };
                   var div = addMsg('assistant', r.reply);
                   var meta = div.querySelector('.msg-meta');
                   var spk = null;
                   if (meta) {
-                    spk = makeSpeakBtn(r.reply, r.style);
+                    spk = makeSpeakBtn(r.reply, r.style, gMsg, sessionId);
                     meta.appendChild(spk);
-                    meta.appendChild(makeResynthBtn(r.reply, r.style));
+                    meta.appendChild(makeResynthBtn(r.reply, r.style, gMsg, sessionId));
                     meta.appendChild(makeRegenBtn(div));
                   }
                   /* 入库持久化：刷新不丢、右键可删、后续对话有上下文 */
-                  s.history.push({ role: 'assistant', content: r.reply, style: r.style || '' });
+                  s.history.push(gMsg);
                   div.dataset.hidx = String(s.history.length - 1);
                   markSessionActivity(sessionId);
-                  if (state.soundOn && spk) ttsAndPlay(r.reply, spk, r.style);
+                  if (state.soundOn && spk) ttsAndPlay(r.reply, spk, r.style, false, gMsg, sessionId);
                 }, 1500);
               }
             } catch(e) { /* 静默失败，不影响使用 */ }

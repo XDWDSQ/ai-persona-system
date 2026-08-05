@@ -637,6 +637,41 @@ _META_HINT = (
     "这类广播式口吻收尾。你就是角色本人，把想对对方说的话说完就结束，不加任何注释。"
 )
 
+def _heic_to_jpeg_bytes(raw: bytes) -> bytes | None:
+    """把 HEIC/AVIF 图片转成 JPEG 字节（iPhone 照片默认 HEIC，扩展名常被改成 .jpg，
+    云端视觉模型只认 bmp/gif/png/jpeg/webp，直接送 HEIC 会被 400 拒绝）。
+
+    用 pillow_heif 解码（惰性 import，仅当检测到 HEIC/AVIF 时加载，避免拖慢启动）；
+    失败返回 None，由调用方走原降级链。"""
+    if len(raw) < 12:
+        return None
+    # ISO-BMFF 容器：前 4 字节为 box size，4~8 字节为 'ftyp'，8~12 为 brand
+    if raw[4:8] != b"ftyp":
+        return None
+    brand = raw[8:12].lower()
+    if brand not in (b"heic", b"heix", b"heif", b"mif1", b"msf1", b"avif"):
+        return None
+    try:
+        import io
+        from PIL import Image
+        import pillow_heif
+        pillow_heif.options.DISABLE_SECURITY_LIMITS = True  # iPhone HEIC 元数据多，默认安全限制会误杀
+        pillow_heif.register_heif_opener()
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        buf = io.BytesIO()
+        # HEIC 可能是 RGBA：转 RGB 再存 JPEG；按最长边等比缩到 1600px，控制 base64 体积
+        img = img.convert("RGB")
+        w, h = img.size
+        if max(w, h) > 1600:
+            scale = 1600 / max(w, h)
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        img.save(buf, "JPEG", quality=88)
+        return buf.getvalue()
+    except Exception:  # noqa: BLE001  解码失败不阻断主流程，走原降级
+        return None
+
+
 # 视觉链路全部不可用（云端多模态 + 本地 VL 都失败）时的诚实降级提示：
 # 文本模型看不到图片内容，必须如实说明，禁止假装看到/编造图片内容
 #（此前模型会瞎编「图片已生效」之类的确认话术糊弄用户）。
@@ -3245,9 +3280,20 @@ async def _try_vision_chat(system: dict, history: list[dict], req: ChatRequest, 
         mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
         try:
             # 图片单张可达 15MB：读盘+base64 编码放线程池，避免事件循环被同步 IO 卡住
-            def _read_b64() -> str:
-                return base64.b64encode(path.read_bytes()).decode("ascii")
-            b64 = await asyncio.to_thread(_read_b64)
+            def _read_bytes() -> bytes:
+                return path.read_bytes()
+            raw = await asyncio.to_thread(_read_bytes)
+            if raw[:4] == b"\xff\xd8\xff":
+                b64 = base64.b64encode(raw).decode("ascii")
+            else:
+                # 非标准 JPEG：尝试 HEIC/AVIF → JPEG 转码（iPhone 照片常见），
+                # 转码失败则按原字节送（交给模型 API 判断，多数会明确报格式错误）
+                jpeg = await asyncio.to_thread(_heic_to_jpeg_bytes, raw)
+                if jpeg:
+                    mime = "image/jpeg"
+                    b64 = base64.b64encode(jpeg).decode("ascii")
+                else:
+                    b64 = base64.b64encode(raw).decode("ascii")
         except OSError:
             continue
         content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
@@ -3964,7 +4010,45 @@ async def tts(req: dict):
         raise HTTPException(400, "speed 需在 0.5 到 2.0 之间")
     force = req.get("force") in (True, "true", 1, "1")
     path = await tts_synthesize(text, style, speed, force)
-    return FileResponse(path, media_type="audio/wav", filename=path.name)
+    resp = FileResponse(path, media_type="audio/wav", filename=path.name)
+    # 返回缓存文件名（<sha256>.wav），前端据此拼出可持久回放/下载的
+    # GET /api/tts/file?h=<hash> 链接，写入消息体，刷新/切会话后无需重新合成。
+    # 仅当落盘到 tts_cache 时才给（失败回退返回 src 时不给，避免脏 hash）。
+    if path.parent == TTS_CACHE_DIR:
+        resp.headers["X-TTS-Cache"] = path.name
+    return resp
+
+
+@app.get("/api/tts/file")
+async def tts_file(h: str = "", text: str = "", style: str = ""):
+    """持久可回放/可下载音频端点。
+
+    前端把 POST /api/tts 返回的 X-TTS-Cache（缓存文件名）拼成
+    /api/tts/file?h=<hash> 写入消息体（msg.audio）。刷新/切会话后该 URL 仍有效，
+    直接播放或下载，无需重新合成（只要 tts_cache 里文件未被清理阈值回收）。
+    兜底：未带 h 时按 文本+风格+当前音色指纹 重新定位，兼容老消息/音色未变场景。
+    """
+    cfg = load_config()
+    # 优先按缓存文件名直接取：最稳，不受音色配置变更影响
+    if h:
+        name = h if isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}\.wav", h) else ""
+        if name:
+            p = TTS_CACHE_DIR / name
+            try:
+                if p.stat().st_size:
+                    return FileResponse(p, media_type="audio/wav", filename=name)
+            except OSError:
+                pass
+    # 兜底：按文本+风格+当前音色指纹定位（与 tts_cache_path 同源）
+    t = normalize_tts_text(text or "")
+    if t:
+        p = tts_cache_path(t, style or "", cfg)
+        try:
+            if p.stat().st_size:
+                return FileResponse(p, media_type="audio/wav", filename=p.name)
+        except OSError:
+            pass
+    raise HTTPException(404, "音频尚未合成或缓存已过期")
 
 
 class SessionsRequest(BaseModel):
@@ -4468,6 +4552,22 @@ async def upload_files(files: list[UploadFile] = File(...)):
             raise HTTPException(400, f"文件为空: {original}")
         written.append(dest)
         kind = "image" if suffix in _IMAGE_SUFFIXES else ("doc" if suffix in _DOC_SUFFIXES else "file")
+        # iPhone 照片默认 HEIC：文件后缀可能是 .jpg 但内容仍是 HEIC，浏览器 img 无法解码，
+        # 云端视觉模型也只认 bmp/gif/png/jpeg/webp。上传时直接转成 JPEG 存盘，
+        # 前端显示与视觉链路一并解决（转码失败保留原文件，交给视觉链路兜底转码）。
+        if kind == "image":
+            try:
+                raw = dest.read_bytes()
+                if len(raw) >= 12 and raw[:4] != b"\xff\xd8\xff" and raw[4:8] == b"ftyp":
+                    jpeg = await asyncio.to_thread(_heic_to_jpeg_bytes, raw)
+                    if jpeg:
+                        # 覆盖写回原文件（保持同一 URL），并把元数据统一为 jpeg
+                        await asyncio.to_thread(dest.write_bytes, jpeg)
+                        total = len(jpeg)
+                        suffix = ".jpg"
+                        stored = dest.name
+            except OSError:
+                pass  # 转码阶段读/写失败不影响已上传成功的文件
         results.append({
             "name": original,
             "url": f"/uploads/{stored}",

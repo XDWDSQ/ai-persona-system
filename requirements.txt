@@ -4,3 +4,6 @@ uvicorn==0.52.1
 httpx==0.28.1
 pydantic==2.13.4
 python-multipart==0.0.32
+# HEIC/AVIF 图片转 JPEG（iPhone 照片默认 HEIC，云端视觉模型只认 bmp/gif/png/jpeg/webp）
+pillow>=10.0
+pillow-heif>=0.16
