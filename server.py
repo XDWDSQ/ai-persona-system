@@ -1306,6 +1306,18 @@ def _role_news_config(cfg: dict | None = None) -> tuple[str, str]:
     return str(news["keyword"]).strip(), str(role_cfg.get("name") or role)
 
 
+def _role_news_auto_refresh(cfg: dict | None = None) -> bool:
+    """角色动态是否允许系统自动联网搜索刷新（roles.<role>.news.auto_refresh，默认 True）。
+
+    False = 按需模式：系统不再自动搜索（巡检/读时过期/启动预取/切角色全部跳过），
+    动态内容由开发端 AI 人工查证后经 POST /api/role-news/update 写入，读取注入不受影响。"""
+    cfg = cfg or load_config()
+    role = cfg.get("active_role", "")
+    role_cfg = (cfg.get("roles") or {}).get(role) or {}
+    news = role_cfg.get("news") or {}
+    return bool(news.get("auto_refresh", True))
+
+
 def _load_role_news() -> dict:
     """读取角色现实动态缓存 v2（mtime 失效缓存，chat 主链路每请求调用不重复读盘）。
 
@@ -1733,6 +1745,8 @@ async def _role_news_scheduler() -> None:
     while True:
         await asyncio.sleep(_ROLE_NEWS_CHECK_INTERVAL_S)
         try:
+            if not _role_news_auto_refresh():
+                continue  # 按需模式：不自动巡检刷新，动态由人工写入
             keyword, _ = _role_news_config()
             if not keyword:
                 continue
@@ -1748,16 +1762,19 @@ def _role_news_text() -> str:
     """返回当前角色现实动态文案（缓存优先，过期后台刷新，绝不阻塞）。
 
     返回的是 summary 纯文本（已确认+推测混合），供 system prompt 注入；
-    结构化的卡片/时间线由 /api/role-news 返回给前端。"""
+    结构化的卡片/时间线由 /api/role-news 返回给前端。
+    按需模式（auto_refresh=false）：过期不自动刷新、无缓存不补搜，只回已有缓存。"""
     keyword, _ = _role_news_config()
     if not keyword:
         return ""
     snap = _load_role_news()
     if snap.get("summary") and snap.get("keyword") == keyword:
         if (time.time() - _safe_float(snap.get("ts", 0))) >= _ROLE_NEWS_MAX_AGE_S:
-            _spawn_bg(_bg_role_news_refresh(force=True))
+            if _role_news_auto_refresh():
+                _spawn_bg(_bg_role_news_refresh(force=True))
         return snap["summary"]
-    _spawn_bg(_bg_role_news_refresh())
+    if _role_news_auto_refresh():
+        _spawn_bg(_bg_role_news_refresh())
     return ""
 
 
@@ -2146,9 +2163,11 @@ async def lifespan(app: FastAPI):
     _spawn_bg(_uploads_cleanup_loop())
     # 启动时后台预取一次天气（未配置手动位置时自动跳过，失败静默不影响启动）
     _spawn_bg(_bg_weather_refresh())
-    # 启动时后台预取一次角色现实动态（有 news 关键词才生效）
-    _spawn_bg(_bg_role_news_refresh())
+    # 启动时后台预取一次角色现实动态（有 news 关键词且允许自动刷新才生效）
+    if _role_news_auto_refresh():
+        _spawn_bg(_bg_role_news_refresh())
     # 定时巡检角色现实动态缓存：过期自动后台刷新，保证角色状态随时间自动变化
+    # （按需模式 auto_refresh=false 时巡检器内部直接跳过）
     _spawn_bg(_role_news_scheduler())
     yield
     # 关闭：先等后台任务收尾（上限 5s），再关 httpx 连接池
@@ -4631,8 +4650,10 @@ async def roles_apply(req: dict):
             cfg["voice"]["preset"] = v["preset"]
         cfg["voice"]["style"] = v.get("style", "")
         await _save_config_locked(cfg)
-    # 切角色后：角色现实动态缓存属于旧角色，后台重新搜索（不阻塞本次切换）
-    _spawn_bg(_bg_role_news_refresh(force=True))
+    # 切角色后：角色现实动态缓存属于旧角色，后台重新搜索（不阻塞本次切换）；
+    # 按需模式（auto_refresh=false）跳过自动搜索，动态由人工写入
+    if _role_news_auto_refresh():
+        _spawn_bg(_bg_role_news_refresh(force=True))
     return {"ok": True, "role": key, "persona": cfg["persona"]}
 
 
@@ -4690,6 +4711,63 @@ async def role_news_refresh():
         "sources": snap.get("sources") or {},
         "cached_at": snap.get("ts") or 0,
     }
+
+
+@app.post("/api/role-news/update")
+async def role_news_update(req: dict):
+    """按需模式入口：由开发端 AI 人工查证后写入角色现实动态（替代系统自动联网搜索）。
+
+    与 /api/role-news/refresh（系统自己搜索）互不干扰；写入后读取注入/前端展示立即生效，
+    缓存时间戳刷新为当前时刻，系统不再对其做自动过期重搜（auto_refresh=false 时）。
+    body: {keyword, role?, summary?, cards?, timeline?, sources?}
+    cards 每项: {category, status(confirmed/missing), content, reason?, source?, ts?}"""
+    keyword = str(req.get("keyword") or "").strip()
+    if not keyword:
+        raise HTTPException(400, "keyword 不能为空")
+    cur_role = _role_news_config()[1]
+    role = str(req.get("role") or "").strip() or cur_role
+    summary = str(req.get("summary") or "").strip()[:2000]
+    cards = req.get("cards")
+    if cards is not None and not isinstance(cards, list):
+        raise HTTPException(400, "cards 必须是数组")
+    cards = cards or []
+    # 卡片字段白名单清洗：只保留已知字段并截断长度，防脏数据入库
+    clean_cards: list[dict] = []
+    for c in cards[:30]:
+        if not isinstance(c, dict):
+            continue
+        cc = {
+            "id": str(c.get("id") or f"manual-{len(clean_cards) + 1}")[:64],
+            "category": str(c.get("category") or "近期活动")[:20],
+            "status": str(c.get("status") or "confirmed")[:16],
+            "content": str(c.get("content") or "")[:500],
+            "reason": str(c.get("reason") or "")[:200],
+            "source": str(c.get("source") or "manual")[:16],
+            "ts": _safe_float(c.get("ts")) or time.time(),
+        }
+        if cc["content"]:
+            clean_cards.append(cc)
+    timeline = req.get("timeline")
+    if timeline is not None and not isinstance(timeline, list):
+        raise HTTPException(400, "timeline 必须是数组")
+    timeline = (timeline or [])[:30]
+    sources = req.get("sources")
+    if sources is not None and not isinstance(sources, dict):
+        raise HTTPException(400, "sources 必须是对象")
+    d = {
+        "version": 2, "role": role, "keyword": keyword,
+        "summary": summary,
+        "cards": clean_cards,
+        "timeline": timeline or _build_timeline(clean_cards, {}),
+        "sources": sources or {"web": "manual", "persona": "empty", "memory": "empty",
+                               "state": "empty", "location": "empty", "weather": "empty"},
+        "ts": time.time(),
+    }
+    if not summary and clean_cards:
+        d["summary"] = _cards_to_summary(clean_cards)
+    _save_role_news(d)
+    return {"ok": True, "role": role, "keyword": keyword,
+            "cards": len(clean_cards), "summary": d["summary"]}
 
 
 @app.post("/api/upload")
