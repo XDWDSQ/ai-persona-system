@@ -630,7 +630,7 @@
           <div class="hero-copy">
             <span class="eyebrow reveal"><span class="pip"></span>Local-first AI Persona</span>
             <h1 class="reveal">用一个声音，<span class="grad-text">唤醒你的 AI 分身</span></h1>
-            <p class="lead reveal">小拟默认全程在你的电脑上运行：本地大模型驱动对话，离线听写每一句话，四个内置角色各有专属音色。需要更快时也可一键切换到云端 OpenAI 兼容 API，声音与数据始终可控。</p>
+            <p class="lead reveal">小拟默认全程在你的电脑上运行：本地大模型驱动对话，声音克隆朗读每一句回复，四个内置角色各有专属音色。需要更快时也可一键切换到云端 OpenAI 兼容 API，声音与数据始终可控。</p>
             <div class="hero-cta reveal">
               <a class="btn btn-primary btn-lg" href="/pages/chat.html" data-dom-id="hero-start">开始体验
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
@@ -641,7 +641,6 @@
               <span>Qwen3.5-4B</span>
               <span>llama.cpp</span>
               <span>Qwen3-TTS</span>
-              <span>本地 ASR</span>
               <span>内置角色</span>
               <span>角色引擎</span>
             </div>
@@ -669,7 +668,7 @@
           <div class="sec-head reveal">
             <span class="eyebrow"><span class="pip"></span>核心能力</span>
             <h2>本地能力 + 角色引擎，一个懂你的分身</h2>
-            <p>对话、声音、听写——全部可在本机闭环运行，也可切换至云端 OpenAI 兼容 API。小拟不只是一个聊天框，而是一个有音色、有性格的存在。</p>
+            <p>对话、声音——全部可在本机闭环运行，也可切换至云端 OpenAI 兼容 API。小拟不只是一个聊天框，而是一个有音色、有性格的存在。</p>
           </div>
           <div class="bento">
             <article class="bcard big reveal">
@@ -690,14 +689,6 @@
               </div>
               <h3>语音合成</h3>
               <p>小拟的每句回复都可以用语音朗读，支持本地 Qwen3-TTS 或云端 MiMo 引擎。</p>
-            </article>
-            <article class="bcard med reveal">
-              <div class="b-tag">ASR</div>
-              <div class="b-ico">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10v4h4l5 4V6L7 10H3z"/><path d="M16 8a5 5 0 0 1 0 8M19 5a9 9 0 0 1 0 14"/></svg>
-              </div>
-              <h3>语音听写</h3>
-              <p>本地离线识别，对着麦克风说话即可输入。无需联网，口音与隐私不外泄。</p>
             </article>
             <article class="bcard wide reveal">
               <div class="b-text">
@@ -722,18 +713,13 @@
           <div class="sec-head reveal">
             <span class="eyebrow"><span class="pip"></span>本地优先</span>
             <h2>全部本地运行，数据不出本机</h2>
-            <p>小拟的每一层都可在本机闭环：推理、合成、识别互不依赖云端。你的对话与声纹，始终留在你自己的硬盘里。</p>
+            <p>小拟的每一层都可在本机闭环：推理、合成互不依赖云端。你的对话与声纹，始终留在你自己的硬盘里。</p>
           </div>
           <div class="local-grid reveal">
             <div class="local-cell">
               <div class="l-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg></div>
               <h4>本地 LLM</h4>
               <p>Qwen3-4B 量化模型经 llama.cpp CUDA 后端在 GPU 上加速推理，本地对话更流畅。</p>
-            </div>
-            <div class="local-cell">
-              <div class="l-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg></div>
-              <h4>离线 ASR</h4>
-              <p>本地语音识别引擎，录音转文字全程离线，口音与隐私不外泄。</p>
             </div>
             <div class="local-cell">
               <div class="l-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></div>
@@ -770,7 +756,7 @@
             <div class="step reveal">
               <div class="s-num"><span class="dot">03</span></div>
               <h4>开始对话</h4>
-              <p>文字或语音输入，角色以人设风格回复、自动标注朗读风格，并用专属音色朗读。角色引擎同步更新长期记忆与情绪状态，本地模式断网亦可用。</p>
+              <p>文字输入，角色以人设风格回复、自动标注朗读风格，并用专属音色朗读。角色引擎同步更新长期记忆与情绪状态，本地模式断网亦可用。</p>
             </div>
           </div>
         </div>
@@ -800,7 +786,7 @@
                 </span>
                 <span><span class="brand-name">小拟</span><span class="brand-sub">Xiaoni · AI Persona</span></span>
               </a>
-              <p>本地优先的 AI 拟人系统。对话、语音听写，全部可在你的电脑上闭环运行。</p>
+              <p>本地优先的 AI 拟人系统。对话、朗读，全部可在你的电脑上闭环运行。</p>
             </div>
             <div class="foot-col">
               <h5>产品</h5>
@@ -813,7 +799,6 @@
               <a href="#how">Qwen3.5-4B</a>
               <a href="#how">llama.cpp</a>
               <a href="#how">Qwen3-TTS</a>
-              <a href="#local">本地 ASR</a>
             </div>
             <div class="foot-col">
               <h5>资源</h5>

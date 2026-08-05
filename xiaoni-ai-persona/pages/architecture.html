@@ -595,7 +595,6 @@
               <span>llama.cpp</span>
               <span>Qwen3.5-4B</span>
               <span>Qwen3-TTS</span>
-              <span>Qwen3-ASR</span>
               <span>内置角色</span>
               <span>角色引擎</span>
             </div>
@@ -608,8 +607,8 @@
         <div class="wrap">
           <div class="sec-head reveal">
             <span class="eyebrow"><span class="pip"></span>系统分层</span>
-            <h2>五层架构，各司其职</h2>
-            <p>从前端界面到语音识别，小拟的五个层次各负其责；角色引擎在对话推理前后维护记忆与状态，数据默认全部在本机闭环。</p>
+            <h2>四层架构，各司其职</h2>
+            <p>从前端界面到声音合成，小拟的四个层次各负其责；角色引擎在对话推理前后维护记忆与状态，数据默认全部在本机闭环。</p>
           </div>
           <div class="arch-flow reveal">
             <!-- Layer 1: Frontend -->
@@ -737,34 +736,6 @@
                 </span>
               </div>
             </div>
-            <div class="arch-arrow">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
-            </div>
-            <!-- Layer 5: ASR -->
-            <div class="arch-layer">
-              <div class="a-label">
-                <span class="a-name">语音识别</span>
-                <span class="a-tag">ASR</span>
-              </div>
-              <div class="a-body">
-                <span class="arch-chip">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
-                  Qwen3-ASR
-                </span>
-                <span class="arch-chip">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 2l20 20M8.5 16.5a5 5 0 0 1 7 0M2 8.82a15 15 0 0 1 4.17-2.65M10.66 5c4.01-.36 8.14.9 11.34 3.76M16.85 11.25a10 10 0 0 1 2.22 1.68M5 13a10 10 0 0 1 5.24-2.76M12 20h.01"/></svg>
-                  本地离线
-                </span>
-                <span class="arch-chip">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg>
-                  CPU 推理
-                </span>
-                <span class="arch-chip">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg>
-                  0.6B 模型
-                </span>
-              </div>
-            </div>
           </div>
         </div>
       </section>
@@ -774,8 +745,8 @@
         <div class="wrap">
           <div class="sec-head reveal">
             <span class="eyebrow"><span class="pip"></span>核心组件</span>
-            <h2>四大引擎，驱动拟人体验</h2>
-            <p>对话大脑、角色引擎、声音引擎、听写引擎协同运转，串行调度保障稳定，数据安全贯穿始终。</p>
+            <h2>三大引擎，驱动拟人体验</h2>
+            <p>对话大脑、角色引擎、声音引擎协同运转，串行调度保障稳定，数据安全贯穿始终。</p>
           </div>
           <div class="bento">
             <article class="bcard big reveal">
@@ -797,20 +768,12 @@
               <p>Qwen3-TTS 经 NVIDIA GPU（CUDA）合成（云端 MiMo 备选），每个角色有专属参考音色，朗读风格随回复自动变化。</p>
             </article>
             <article class="bcard med reveal">
-              <div class="b-tag">ASR</div>
-              <div class="b-ico">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
-              </div>
-              <h3>听写引擎</h3>
-              <p>Qwen3-ASR 本地离线识别，录音转文字全程不上传。</p>
-            </article>
-            <article class="bcard med reveal">
               <div class="b-tag">Lock</div>
               <div class="b-ico">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
               </div>
               <h3>串行调度</h3>
-              <p>全局锁串行化 TTS/ASR 调用，避免共享服务冲突。</p>
+              <p>全局锁串行化 TTS 调用，避免共享服务冲突。</p>
             </article>
             <article class="bcard med reveal">
               <div class="b-tag">Roles</div>
@@ -843,13 +806,13 @@
           <div class="sec-head reveal">
             <span class="eyebrow"><span class="pip"></span>数据流向</span>
             <h2>一句话的旅程</h2>
-            <p>从你开口说话到小拟用语音回应，数据在三层引擎间流转，全程不离开本机。</p>
+            <p>从你输入文字到小拟用语音回应，数据在引擎间流转，全程不离开本机。</p>
           </div>
           <div class="flow-grid">
             <div class="flow-step reveal">
               <div class="f-num"><span class="dot">01</span></div>
               <h4>用户输入</h4>
-              <p>文字或语音输入，ASR 离线转写为文本，送入后端等待推理。</p>
+              <p>文字输入，送入后端等待推理。</p>
             </div>
             <div class="flow-step reveal">
               <div class="f-num"><span class="dot">02</span></div>
@@ -877,7 +840,7 @@
             <div class="local-cell">
               <div class="l-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg></div>
               <h4>Qwen3 系列</h4>
-              <p>4B 对话模型 + TTS + ASR，全链路 Qwen3 驱动。</p>
+              <p>4B 对话模型 + TTS，全链路 Qwen3 驱动。</p>
             </div>
             <div class="local-cell">
               <div class="l-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg></div>
@@ -924,7 +887,7 @@
                 </span>
                 <span><span class="brand-name">小拟</span><span class="brand-sub">Xiaoni · AI Persona</span></span>
               </a>
-              <p>本地优先的 AI 拟人系统。对话、语音听写，全部可在你的电脑上闭环运行。</p>
+              <p>本地优先的 AI 拟人系统。对话、朗读，全部可在你的电脑上闭环运行。</p>
             </div>
             <div class="foot-col">
               <h5>产品</h5>

@@ -430,19 +430,7 @@
             ]
           });
 
-          /* 3. 语音识别 ASR */
-          var asrCls = 'on';
-          deps.push({
-            name: '语音识别 (ASR)', cls: asrCls, statusCls: 'on',
-            status: 'READY',
-            fields: [
-              ['引擎', 'Qwen3-ASR 本地'],
-              ['转写', '离线本地'],
-              ['隐私', '不上传'],
-            ]
-          });
-
-          /* 4. TTS 缓存 */
+          /* 3. TTS 缓存 */
           var cacheN = (health && health.tts_cache_files != null) ? health.tts_cache_files : '—';
           deps.push({
             name: 'TTS 缓存', cls: 'on', statusCls: 'on',
