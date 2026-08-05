@@ -1765,6 +1765,12 @@
           function setMsgSpeaking(btn, on) {
             var m = btn && btn.closest ? btn.closest('.msg') : null;
             if (m) m.classList.toggle('speaking', !!on);
+            /* 桌宠联动：TTS 播放中 → speaking；结束 → idle */
+            try {
+              window.dispatchEvent(new CustomEvent('pet:state', {
+                detail: { state: on ? 'speaking' : 'idle' }
+              }));
+            } catch (e) {}
           }
           /* 合成中的伪进度：请求完成前缓步爬到 90%，完成后直接到 100%，失败标红 */
           function startSynthProgress(btn) {
@@ -2057,6 +2063,14 @@
           function markAwaiting(sessionId, on) {
             if (!sessionId) return;
             state.awaiting[sessionId] = Math.max(0, (state.awaiting[sessionId] || 0) + (on ? 1 : -1));
+            /* 桌宠联动：生成中 → thinking（结束不直接回 idle，等 TTS 事件收尾） */
+            if (on) {
+              try {
+                window.dispatchEvent(new CustomEvent('pet:state', {
+                  detail: { state: 'thinking' }
+                }));
+              } catch (e) {}
+            }
           }
           function makeRetryBtn(sessionId, snap) {
             var b = document.createElement('button');
@@ -3476,5 +3490,7 @@
         </div>
       </div>
     </div>
+    <!-- ===== 桌面宠物（大帅） ===== -->
+    <script src="pet.js"></script>
 </body>
 </html>

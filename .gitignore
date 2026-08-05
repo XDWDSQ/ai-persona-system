@@ -34,3 +34,6 @@ _preview.jpg
 .qoder/
 .workbuddy/
 _tmp_ui_check/
+
+# 临时预览图（桌宠素材加工检查用）
+_pet_preview/
