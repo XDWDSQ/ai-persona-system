@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-"""AI 拟人系统后端：聊天(LLM) + 声音克隆(TTS) + 语音输入(ASR)
+"""AI 拟人系统后端：聊天(LLM) + 声音克隆(TTS)
 
 调用链：
   对话 → LLM Provider(本地 llama.cpp / 云端 OpenAI 兼容 API)
   朗读 → local-tts 的 client.py（绕过 AIPC 门禁直接驱动 Qwen3-TTS，参考音频克隆音色）
-  听写 → local-asr 的 client.py（本地离线转写）
 """
 from __future__ import annotations
 
@@ -94,9 +93,7 @@ _load_dotenv()
 
 USER_HOME = Path.home()
 TTS_SKILL = USER_HOME / ".trae-cn" / "skills" / "local-tts"
-ASR_SKILL = BASE_DIR / "adapters" / "asr"
 TTS_VENV_PY = USER_HOME / ".openvino" / "venv" / "t2i-tts" / "Scripts" / "python.exe"
-ASR_VENV_PY = USER_HOME / ".openvino" / "venv" / "asr-cu" / "Scripts" / "python.exe"
 
 for d in (DATA_DIR, UPLOAD_DIR, OUTPUT_DIR, TTS_CACHE_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -410,11 +407,6 @@ def _get_post_processor() -> PostProcessor:
             return ""
         _post_processor = PostProcessor(_post_llm)
     return _post_processor
-
-# ASR 上传安全限制
-_MAX_ASR_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB，约 2h 48kHz 立体声 PCM
-_ALLOWED_AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac", ".wma", ".opus", ".webm", ".mp4"}
-
 
 # 文字模型供应商对应的 .env 密钥名；DASHSCOPE_API_KEY 作为 ALIYUN_API_KEY 的兼容别名
 _CLOUD_PROVIDER_ENV = {
@@ -2726,7 +2718,7 @@ def _run_sync(*args: str, timeout: float = 660) -> tuple[int, str, str]:
         raise HTTPException(
             504,
             f"本地模型子进程执行超时（{int(timeout)} 秒），请稍后重试；"
-            "若持续出现请检查本地 TTS/ASR 服务是否卡死或重启对应服务",
+            "若持续出现请检查本地 TTS 服务是否卡死或重启对应服务",
         )
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -3047,31 +3039,6 @@ async def minimax_tts_synthesize(text: str, style: str = "", cfg: dict | None = 
     out_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
     await asyncio.to_thread(out_path.write_bytes, audio_bytes)
     return out_path
-
-
-# ---------------------------------------------------------------- ASR ---------
-async def asr_transcribe(audio_path: Path) -> str:
-    args = [str(ASR_VENV_PY), str(ASR_SKILL / "scripts" / "client.py"),
-            "--audio", str(audio_path), "--language", "auto"]
-    code, out, err = await asyncio.to_thread(_run_sync, *args)
-    if code == 3:
-        code, out, err = await asyncio.to_thread(_run_sync, str(ASR_VENV_PY), str(ASR_SKILL / "scripts" / "client.py"), "--continue")
-    if code != 0:
-        raise HTTPException(500, f"语音识别失败: {(err or out)[-500:]}")
-    m = re.search(r"=== RESULT ===\s*(\{.*\})", out, re.S)
-    if not m:
-        raise HTTPException(500, "语音识别没有返回结果")
-    try:
-        data = json.loads(m.group(1))
-        return data.get("text", "")
-    except json.JSONDecodeError:
-        raise HTTPException(500, "语音识别结果解析失败")
-
-
-async def asr_transcribe_serial(audio_path: Path) -> str:
-    """ASR 与 TTS 共用一个串行锁（共用 server-dog 不能并发）。"""
-    async with skill_lock:
-        return await asr_transcribe(audio_path)
 
 
 # ---------------------------------------------------------------- 接口 ---------
@@ -4206,42 +4173,6 @@ async def sync_stream(request: Request, client: str = ""):
         events(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-
-
-@app.post("/api/asr")
-async def asr(file: UploadFile = File(...)):
-    """ASR 语音识别：后缀白名单 + 大小上限 50MB，避免恶意上传打满磁盘。"""
-    suffix = (Path(file.filename or "audio.webm").suffix or ".webm").lower()
-    if suffix not in _ALLOWED_AUDIO_SUFFIXES:
-        raise HTTPException(400, f"不支持的音频格式: {suffix}，仅支持 {sorted(_ALLOWED_AUDIO_SUFFIXES)}")
-    # 流式边收边写盘，超上限立刻拒绝；相比先全量进内存再 join 写盘，峰值内存不翻倍
-    audio_path = UPLOAD_DIR / f"asr_{uuid.uuid4().hex[:8]}{suffix}"
-    total = 0
-    try:
-        with audio_path.open("wb") as fout:
-            while True:
-                chunk = await file.read(256 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > _MAX_ASR_UPLOAD_BYTES:
-                    raise HTTPException(413, f"上传文件过大（上限 {_MAX_ASR_UPLOAD_BYTES // 1024 // 1024}MB）")
-                # 同步写盘丢线程池：Windows 杀软扫描下单次 write 可达数十 ms，会卡住 SSE 流
-                await asyncio.to_thread(fout.write, chunk)
-    except HTTPException:
-        audio_path.unlink(missing_ok=True)
-        raise
-    except OSError as exc:
-        audio_path.unlink(missing_ok=True)
-        raise HTTPException(500, f"上传保存失败: {exc}")
-    if total == 0:
-        audio_path.unlink(missing_ok=True)
-        raise HTTPException(400, "上传文件为空")
-    try:
-        text = await asr_transcribe_serial(audio_path)
-    finally:
-        audio_path.unlink(missing_ok=True)
-    return {"text": text}
 
 
 class ConfigUpdate(BaseModel):

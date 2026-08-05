@@ -20,12 +20,20 @@
  *   - 去掉 .pet-img 的 drop-shadow 滤镜（动画 WebP 每帧重绘滤镜，最贵的开销）
  *   - speaking 无独立素材：只加 CSS 动效，不再发 404 请求
  *   - 状态切换淡入，拖拽期间关闭过渡
+ *
+ * v3 画质要点（配合 pet_process.py v3，素材升级为 384px/q82 + 边缘去色边）：
+ *   - .pet-img 显式 image-rendering:auto（双线性插值，浏览器各向异性过滤由引擎自动开启；
+ *     锐利度主要靠素材分辨率 384px > 显示尺寸 160px × DPR，见下方 ASSET_PX 说明）
+ *   - 小屏(mini)与常规显示尺寸不变，交互逻辑零改动
  * ========================================================================== */
 (function () {
   'use strict';
 
   /* ---------- 配置：换视频不动这里；加情绪加一行 ---------- */
-  var ASSET_VERSION = '2';         // 重新生成 webp 后 bump，配合长缓存刷新
+  var ASSET_VERSION = '3';         // 重新生成 webp 后 bump，配合长缓存刷新
+  /* 素材分辨率说明：pet_process.py 默认输出 384x384。
+     桌宠容器 160px（2x/3x DPR 屏对应 320/480 物理像素），384px 素材保证：
+     DPR≤2 超采样锐利，DPR=3 基本持平，边缘由 LANCZOS + 浏览器双线性共同抗锯齿。 */
   var PET_META = [
     { state: 'idle',     label: '空闲',   group: '基础' },
     { state: 'happy',    label: '开心',   group: '基础' },
@@ -85,6 +93,9 @@
       /* 注意：不加 filter/drop-shadow —— 动画 WebP 每帧重绘滤镜非常贵，
          立体感交给 .pet-stage 的 box-shadow */
       '#pet .pet-img{width:100%;height:100%;object-fit:contain;display:block;',
+      /* image-rendering:auto = 双线性（清晰度靠素材 384px 超采样 + 浏览器自动各向异性过滤），
+         不要设 pixelated（会出锯齿）或 crisp-edges（会糊透明渐变） */
+      'image-rendering:auto;',
       'animation:pet-fadein .18s ease}',
       '#pet .pet-bubble{position:absolute;left:-6px;top:-14px;max-width:140px;min-width:24px;',
       'background:var(--card,#fff);color:var(--foreground,#0a0a0a);font-size:13px;line-height:1.4;',

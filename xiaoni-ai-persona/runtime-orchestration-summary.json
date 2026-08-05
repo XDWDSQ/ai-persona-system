@@ -895,7 +895,6 @@
         "prompt-2",
         "prompt-3",
         "input-text",
-        "btn-mic",
         "btn-send"
       ],
       "componentsRead": [
@@ -955,7 +954,7 @@
         "antiSlopCheck": "no emoji-as-icon (inline SVG; welcome uses literal text); single primary hue; subtle glows via color-mix; real sidebar/footer content"
       },
       "interactionStates": {
-        "buttons": "default/hover via .new-btn,.top-btn,.send-btn,.mic-btn",
+        "buttons": "default/hover via .new-btn,.top-btn,.send-btn",
         "speakButtons": "idle/playing/done via .speak-btn.playing/.done with mini-wave",
         "sessions": "hover accent bg; active via .session.active",
         "composer": "focus-within ring on inputbar",

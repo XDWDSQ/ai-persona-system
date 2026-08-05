@@ -1,6 +1,6 @@
 # AI 拟人系统
 
-本地优先的 AI 拟人对话系统：FastAPI 后端 + 前端交互页面，集成 LLM 对话、TTS 语音合成（音色克隆）、ASR 语音识别，以及角色运行引擎（长期记忆、情绪状态、时间/位置/天气/现实动态感知、主动问候）。
+本地优先的 AI 拟人对话系统：FastAPI 后端 + 前端交互页面，集成 LLM 对话、TTS 语音合成（音色克隆），以及角色运行引擎（长期记忆、情绪状态、时间/位置/天气/现实动态感知、主动问候）。
 
 ## 功能
 
@@ -9,7 +9,6 @@
 - 图片/文件附件：发送栏可发图片、文档和其他文件，图片会优先走本地视觉模型，让角色真正“看到”
 - 联网搜索：模型判断知识过时时会自动搜索最新消息（默认 DuckDuckGo，Bing RSS 兜底），尤其适合查自己的比赛、战队与近况
 - 语音合成与音色克隆：支持本地 Qwen3-TTS、阿里云千问（qwen3-tts-flash）与 MiniMax 海螺（T2A v2）三条链路（MiMo TTS 已下线，不再支持）；MiniMax 支持声音克隆，合成采样参数（语速/音量/音调/采样率）可在设置页调整
-- 语音识别：本地 Qwen3-ASR，离线转写
 - 人设、语音参数可视化配置
 
 ## 快速开始
@@ -140,7 +139,7 @@ python minimax_clone.py
 - **日志级别**：可用环境变量 `LOG_LEVEL` 控制（默认 `WARNING`，可设 `INFO` / `DEBUG`），例如 `set LOG_LEVEL=DEBUG` 后启动。
 - **健康检查**：`GET /api/health` 可用于探活与依赖状态检查。
 - **TTS 缓存**：合成音频缓存在 `data/tts_cache/`，清理阈值由 `config.json` 的 `tts_cache` 节配置（`max_files` 默认 500、`max_bytes` 默认 8GB、`clean_interval` 默认 3600 秒）。
-- **本地 TTS/ASR 依赖的 venv 路径**（硬编码默认值，换机器需按此布局准备，风险已知、暂不可配）：
+- **本地 TTS 依赖的 venv 路径**（硬编码默认值，换机器需按此布局准备，风险已知、暂不可配）：
   - 本地 TTS：`~/.trae-cn/skills/local-tts`
   - Python 虚拟环境：`~/.openvino/venv/*`（如 `~/.openvino/venv/t2i-tts`）
 
@@ -148,7 +147,7 @@ python minimax_clone.py
 
 - `POST /api/chat` 对话（注入角色上下文，返回 `{reply, style}`）
 - `POST /api/greeting` 主动问候；`GET/DELETE /api/state` 查看/重置角色状态
-- `POST /api/tts` 语音合成；`POST /api/asr` 语音识别
+- `POST /api/tts` 语音合成
 - `POST /api/upload` 附件上传；`GET /uploads/...` 附件访问
 - `POST /api/search` 联网搜索；对话中模型输出 `[search:关键词]` 会自动触发
 - `GET /api/status`、`GET/POST /api/config`、`GET /api/roles`、`POST /api/roles/apply`
@@ -162,7 +161,6 @@ server.py               FastAPI 后端主程序（端口 8000）
 role_engine.py          角色运行引擎（记忆/状态/时间/位置/天气/后处理）
 config.example.json     配置模板（复制为 config.json 使用）
 llm/                    llama.cpp 运行时（llm/bin）、模型（llm/models）与启动脚本
-adapters/asr/           本地 ASR 适配服务
 xiaoni-ai-persona/      前端页面源码
 docs-specs/             角色引擎设计文档
 data/                   运行时数据（会话、音频、记忆、状态，不入库）
