@@ -1,0 +1,43 @@
+== 角色现实动态 v2 离线测试 ==
+import server OK
+
+--- 1) 多来源聚合 _collect_role_facts ---
+  ✓ persona 提取
+  ✓ memory 提取
+  ✓ state 提取
+
+--- 2) 规则兜底卡片 _build_rule_cards（搜索无结果场景） ---
+  ✓ 产出 4 个类别
+  ✓ 类别齐全
+  ✓ 三态齐全
+  ✓ 搜索空→近期活动=missing
+  ✓ 位置有→当前处境=confirmed
+  ✓ 记忆有→人物关系=confirmed
+
+--- 3) 卡片→摘要 _cards_to_summary（不注入 missing） ---
+  ✓ 摘要非空
+  ✓ 摘要不含「暂无资料」
+  ✓ 摘要长度≤300
+
+--- 4) 合并 LLM 卡片 _merge_cards（LLM 缺类→规则补齐） ---
+  ✓ 4 类齐全
+
+--- 5) 时间线 _build_timeline（日期倒序、去重） ---
+  ✓ 时间线非空
+  ✓ 去重生效
+  ✓ 无日期条目排最后
+
+--- 6) 情绪转文本 _emotion_text ---
+  ✓ 低落场景
+  ✓ None 安全
+
+--- 7) 缺失日志 _log_role_news_missing（追加 JSONL） ---
+  ✓ 写入 2 条
+  ✓ 字段齐全
+
+--- 8) v1→v2 缓存升级 _load_role_news ---
+  ✓ version=2
+  ✓ summary 迁移
+  ✓ cards 含 legacy 卡片
+
+== 结果：23 通过 / 0 失败 ==

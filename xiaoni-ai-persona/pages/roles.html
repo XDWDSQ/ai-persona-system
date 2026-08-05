@@ -266,7 +266,10 @@
       /* 顶栏不透明：原半透明+backdrop-filter 在内容滚动时每帧重采样，去掉更流畅 */
       .top-bar{height:60px;flex:none;display:flex;align-items:center;gap:12px;padding:0 22px;border-bottom:1px solid var(--border);background:var(--background)}
       ::selection{background:color-mix(in srgb,var(--chart-2) 32%,transparent)}
+      :focus:not(:focus-visible){outline:none} /* 鼠标/触屏点击不显示焦点框 */
+      button:focus{outline:none} /* Chrome 对按钮鼠标点击也判定 :focus-visible，需单独覆盖 */
       button:focus-visible,textarea:focus-visible{outline:2px solid color-mix(in srgb,var(--chart-2) 70%,transparent);outline-offset:2px}
+      *{-webkit-tap-highlight-color:transparent} /* 移动端点击不闪现高亮块 */
       .top-title{display:flex;align-items:center;gap:10px;min-width:0}
       .top-title .t-ava{width:28px;height:28px;border-radius:7px;background:var(--chart-2);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;color:#fff;flex:none}
       .top-title .t-ava img{width:100%;height:100%;border-radius:7px;object-fit:cover;display:block}

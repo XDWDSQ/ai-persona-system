@@ -394,7 +394,10 @@
         .brand{display:flex;align-items:center;gap:11px}
         /* 品牌名与副标题纵向堆叠：原先两个 inline span 挤在一行 */
         .brand > span:not(.brand-mark){display:flex;flex-direction:column;min-width:0}
+        :focus:not(:focus-visible){outline:none} /* 鼠标/触屏点击不显示焦点框 */
+        .btn:focus{outline:none} /* Chrome 对按钮鼠标点击也判定 :focus-visible，需单独覆盖 */
         a:focus-visible,.btn:focus-visible{outline:2px solid color-mix(in srgb,var(--chart-2) 70%,transparent);outline-offset:2px}
+        *{-webkit-tap-highlight-color:transparent} /* 移动端点击不闪现高亮块 */
         .brand-mark{width:30px;height:30px;border-radius:8px;background:var(--foreground);display:flex;align-items:center;justify-content:center;color:var(--background);box-shadow:0 0 0 1px var(--border)}
         .brand-mark svg{width:17px;height:17px}
         .brand-name{font-size:15px;font-weight:600;letter-spacing:-.01em;line-height:1}

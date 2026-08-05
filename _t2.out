@@ -1,0 +1,57 @@
+[PASS] 空配置回落默认 base_url/model/payg
+[PASS] config 指定 token_plan 生效
+[PASS] env 兜底 token_plan
+[PASS] config 优先于 env
+[PASS] 非法计费模式回退 payg
+[PASS] base_url 尾斜杠被去除
+[PASS] quota 端点同域名拼接
+[PASS] 非 api.* 域名用配置的 quota_url
+[PASS] 非流式不带 stream 字段
+[PASS] thinking 开启(adaptive)
+[PASS] reasoning_split 拆分思考
+[PASS] 流式带 stream=true
+[PASS] 流式带标准计费参数 include_usage
+[PASS] thinking 关闭(disabled)
+[PASS] 基础字段齐全
+[PASS] think 块被剥离且正文保留
+[PASS] 只有思考块时正文为空
+[PASS] 无标签原样返回
+[PASS] 开标签未闭合整体视为思考
+[PASS] 标准 usage 解析
+[PASS] base_resp 包装不影响 usage
+[PASS] 缺 usage 返回全 0
+[PASS] 脏类型容错
+[PASS] usage 进程内累计
+[PASS] 1008 余额不足 -> 502 且带计费模式
+[PASS] 2056 Token Plan 超限 -> 明确提示
+[PASS] 1004 鉴权失败
+[PASS] HTTP 402 余额不足兜底
+[PASS] HTTP 429 限流提示
+[PASS] HTTP 500 服务错误
+[PASS] body 文本兜底识别 1039
+[PASS] chat 成功返回正文
+[PASS] chat 返回 usage
+[PASS] 请求头带 Bearer
+[PASS] 1008 抛 502 且不重试
+[PASS] 空正文自动重试并成功
+[PASS] 重试后 usage 正确
+[PASS] 2013 时去掉 thinking 重试成功
+[PASS] 重试请求不再带 thinking
+[PASS] 内嵌 think 被剥离只留正文
+[PASS] 流式逐段输出
+[PASS] 流式请求带 include_usage
+[PASS] 流式末尾 usage 已累计
+[PASS] 流式 think 标签剥离
+[PASS] 正文为空时兜底输出思考
+[PASS] 流式中途 Token Plan 超限报错
+[PASS] payg 模式返回按量提示
+[PASS] token_plan 配额查询成功
+[PASS] 配额请求带订阅 Key
+[PASS] 缺订阅 Key 明确提示
+[PASS] billing_mode 合并进 cloud
+[PASS] billing_mode 合并进供应商条目
+[PASS] 非法计费模式不写入
+[FAIL] cloud_providers 含 minimax 条目  <- ['mimo', 'deepseek', 'ark', 'custom']
+
+==================================================
+共 19 组，失败 1 组

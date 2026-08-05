@@ -672,9 +672,15 @@
         /* 品牌名与副标题纵向堆叠：原先两个 inline span 会挤成一行（margin-top 对 inline 无效） */
         .brand > span:not(.brand-mark){display:flex;flex-direction:column;min-width:0}
         ::selection{background:color-mix(in srgb,var(--chart-2) 32%,transparent)}
-        /* 键盘可达性：仅键盘聚焦时显示描边，鼠标点击不出现 */
+        /* 键盘可达性：仅键盘 Tab 聚焦时显示描边，鼠标/触屏点击不出现
+           （Chrome 对按钮的鼠标点击也判定 :focus-visible，需单独覆盖；Firefox 无此问题） */
+        :focus:not(:focus-visible){outline:none}
+        button:focus{outline:none}
         :focus-visible{outline:2px solid color-mix(in srgb,var(--chart-2) 70%,transparent);outline-offset:2px}
+        button:focus-visible{outline:2px solid color-mix(in srgb,var(--chart-2) 70%,transparent);outline-offset:2px} /* 键盘 Tab 聚焦按钮仍显示指示 */
         textarea:focus-visible,input:focus-visible{outline:none} /* 输入框已有 focus-within 高亮环 */
+        /* 移动端点击不闪现半透明高亮块 */
+        *{-webkit-tap-highlight-color:transparent}
         /* 细滚动条：消息区/会话列表/角色列表，WebKit + Firefox */
         .msgs,.sessions,.role-list{scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--muted-foreground) 26%,transparent) transparent}
         .msgs::-webkit-scrollbar,.sessions::-webkit-scrollbar,.role-list::-webkit-scrollbar{width:7px;height:7px}

@@ -1,0 +1,66 @@
+{
+  "keyword": "成都AG超玩会 大帅 孟家俊",
+  "role": "大帅",
+  "summary": "大帅正随成都AG超玩会征战 2026 电竞世界杯（EWC）王者荣耀项目，比赛在法国巴黎举行（7.30-8.8）。他担任游走位首发，8月2日小组赛首秀 2:0 横扫欧洲战队 Team Vitality 开门红，随后再取零封锁定 A 组第一晋级八强。淘汰赛阶段 8月5日开启，据报道 AG 将于 8月6日迎战 AUR（BO7 七局四胜）。作为卫冕冠军，AG 带着俱乐部积分重任出战，大帅与一诺的射辅组合是队伍稳定底盘。",
+  "cards": [
+    {
+      "category": "当前处境",
+      "status": "confirmed",
+      "content": "随成都AG超玩会征战 2026 电竞世界杯（EWC）王者荣耀项目，比赛在法国巴黎举行（7月30日-8月8日，奖金池 300 万美元）；AG 为上届冠军、本届卫冕冠军，代表 KPL 赛区",
+      "source": "web"
+    },
+    {
+      "category": "当前处境",
+      "status": "confirmed",
+      "content": "淘汰赛（八强）阶段 8月5日开启；据报道 AG 将于 8月6日迎战 AUR 战队（BO7 七局四胜）",
+      "source": "web"
+    },
+    {
+      "category": "近期活动",
+      "status": "confirmed",
+      "content": "8月2日 EWC 小组赛首秀，AG 2:0 横扫欧洲战队 Team Vitality，两局合计约 26 分钟、首局 14 分钟结束，打出 7:1 人头比，大帅首发游走位登场",
+      "source": "web"
+    },
+    {
+      "category": "近期活动",
+      "status": "confirmed",
+      "content": "小组赛两战全胜、未失一小局，锁定 A 组第一晋级八强淘汰赛（避开同赛区 KSG 直至总决赛阶段）",
+      "source": "web"
+    },
+    {
+      "category": "关键事件",
+      "status": "confirmed",
+      "content": "7月30日打完 KPL 夏季赛收官战（对阵北京JDG，官方标注为大帅与一诺的夏季赛收官战）后连夜飞赴巴黎，备战时间不足 48 小时",
+      "source": "web"
+    },
+    {
+      "category": "关键事件",
+      "status": "confirmed",
+      "content": "大帅已入选亚运会名单，EWC 结束后需继续备战亚运赛事",
+      "source": "web"
+    },
+    {
+      "category": "人物关系",
+      "status": "confirmed",
+      "content": "与一诺组成默契的射辅（下路）组合；与轩染（对抗路）、钟意（打野）、长生（中路）组成冠军首发五人组",
+      "source": "web"
+    },
+    {
+      "category": "人物关系",
+      "status": "confirmed",
+      "content": "一诺爸爸、长生爸爸飞往巴黎现场督战；AG 全队巴黎铁塔合影，赛余氛围轻松",
+      "source": "web"
+    }
+  ],
+  "timeline": [
+    {"time": "7月30日", "event": "KPL 夏季赛收官战（对北京JDG）后连夜飞巴黎，备战 EWC"},
+    {"time": "8月2日", "event": "EWC 小组赛首秀 2:0 横扫 Team Vitality，开门红"},
+    {"time": "8月3日", "event": "小组赛收官，两战零封锁定 A 组第一，晋级八强"},
+    {"time": "8月5日", "event": "淘汰赛（八强）阶段开赛"},
+    {"time": "8月6日", "event": "据报道淘汰赛首战 AUR（BO7，巴黎时间 14:45）"}
+  ],
+  "sources": {
+    "web": "ok", "persona": "ok", "memory": "empty", "state": "empty",
+    "location": "ok", "weather": "empty"
+  }
+}

@@ -243,7 +243,10 @@
       /* 顶栏不透明：去掉内容滚动区上方的 backdrop-filter，省每帧重采样开销 */
       .top-bar{height:60px;flex:none;display:flex;align-items:center;gap:12px;padding:0 22px;border-bottom:1px solid var(--border);background:var(--background)}
       ::selection{background:color-mix(in srgb,var(--chart-2) 32%,transparent)}
+      :focus:not(:focus-visible){outline:none} /* 鼠标/触屏点击不显示焦点框 */
+      button:focus{outline:none} /* Chrome 对按钮鼠标点击也判定 :focus-visible，需单独覆盖 */
       button:focus-visible{outline:2px solid color-mix(in srgb,var(--chart-2) 70%,transparent);outline-offset:2px}
+      *{-webkit-tap-highlight-color:transparent} /* 移动端点击不闪现高亮块 */
       .top-title{display:flex;align-items:center;gap:10px;min-width:0}
       .top-dot{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 8px var(--success);flex:none}
       .top-title-text{font-size:14.5px;font-weight:600;letter-spacing:-.01em;white-space:nowrap}
