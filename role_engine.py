@@ -167,7 +167,7 @@ class MemoryStore:
             m_tokens = set(re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+", text.lower()))
             overlap = len(q_tokens & m_tokens)
             sim = _jaccard(q_sh, _shingles(text))
-            # 新鲜度：last_hit 越近越好，10 天内 1.0，每多 10 天 -0.1
+            # 新鲜度：last_hit 越近越好，100 天内线性衰减到 0（10 天≈0.9，60 天≈0.4）
             last_hit = _parse_iso(m.get("last_hit"))
             recency = 1.0
             if last_hit:
@@ -243,6 +243,7 @@ class MemoryStore:
 
     @staticmethod
     def _score_for_evict(m: dict) -> float:
+        """裁剪排序分：importance × 新鲜度（新鲜度 60 天线性衰减到 0）。"""
         imp = float(m.get("importance", 0.3))
         last_hit = _parse_iso(m.get("last_hit"))
         recency = 1.0

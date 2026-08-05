@@ -176,9 +176,13 @@
     _current = state;
     if (_el) _el.dataset.state = state;
     if (!HAS_ASSET[state]) return;   // speaking 等无素材状态：只加 CSS 动效，不发 404
+    /* mount 前收到事件（外部在 DOMContentLoaded 前派发 pet:state）时 _stage 未初始化：
+       静默跳过，不抛 TypeError */
+    if (!_stage) return;
     loadImg(state).then(function (img) {
       if (!img) return;              // 文件不存在
       if (state !== _current) return; // 加载期间又切走了，别盖
+      if (!_stage) return;           // 卸载时序防御
       if (_img) _img.remove();
       _img = img;
       _stage.appendChild(_img);
@@ -314,9 +318,11 @@
       m.classList.remove('show');
     });
     m.appendChild(hide);
-    /* 定位：超出屏幕时翻转 */
-    var x = Math.min(e.clientX, window.innerWidth  - 180);
-    var y = Math.min(e.clientY, window.innerHeight - 320);
+    /* 定位：超出屏幕时翻转；窄窗口兜底 clamp 到 ≥8px（旧实现窗口 <180px 时 x 为负，菜单溢出屏幕左缘） */
+    var mw = m.offsetWidth || 180;
+    var mh = m.offsetHeight || 320;
+    var x = Math.max(8, Math.min(e.clientX, window.innerWidth - mw - 8));
+    var y = Math.max(8, Math.min(e.clientY, window.innerHeight - mh - 8));
     m.style.left = x + 'px'; m.style.top = y + 'px';
     m.classList.add('show');
   }

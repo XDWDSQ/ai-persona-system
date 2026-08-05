@@ -90,9 +90,17 @@ def upload_file(url: str, key: str, purpose: str, path: Path):
 
 
 def update_config_voice_id(voice_id: str) -> None:
-    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"读取 config.json 失败（{e}），请检查文件是否被占用或损坏")
+        return
     cfg.setdefault("voice", {}).setdefault("minimax", {})["voice"] = voice_id
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"写入 config.json 失败（{e}），请手动把 voice.minimax.voice 设为 {voice_id}")
+        return
     print(f"已写入 config.json: voice.minimax.voice = {voice_id}")
 
 
@@ -191,7 +199,11 @@ def main() -> int:
         print(f"试听合成失败: {br.get('status_code')} {br.get('status_msg')}")
         return 1
     out = DATA_DIR / "outputs" / "minimax_clone_dashuai.wav"
-    out.write_bytes(bytes.fromhex(audio_hex))
+    try:
+        out.write_bytes(bytes.fromhex(audio_hex.replace(" ", "").replace("\n", "")))
+    except ValueError as e:
+        print(f"音频 hex 解码失败（{e}），试听文件未保存")
+        return 1
     print(f"      试听已保存: {out}")
 
     # 5. 写回配置

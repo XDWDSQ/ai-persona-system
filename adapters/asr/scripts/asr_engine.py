@@ -4,6 +4,7 @@ asr_engine.py — OpenVINO inference engine for Qwen3-ASR.
 Inference only — no model conversion.
 """
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
@@ -44,12 +45,20 @@ class SinusoidsPositionEmbedding:
 
 
 def load_audio_file(path, sr=16000):
+    path = str(path)
     try:
         import soundfile as sf
-        audio, orig_sr = sf.read(str(path), dtype="float32")
+        audio, orig_sr = sf.read(path, dtype="float32")
     except Exception:
+        # scipy 兜底只能读 WAV：非 WAV 文件（mp3/m4a/ogg…）且 soundfile 不可用时，
+        # 明确报"缺少解码依赖"，而不是裸 traceback 崩溃（scipy 读 mp3 会抛 wave.Error）
+        ext = os.path.splitext(path)[1].lower()
+        if ext != ".wav":
+            raise ValueError(
+                f"无法解码 {ext or '未知格式'} 音频：缺少 soundfile 依赖，"
+                "请安装 soundfile（pip install soundfile）或使用 WAV 格式")
         import scipy.io.wavfile as wav
-        orig_sr, audio = wav.read(str(path))
+        orig_sr, audio = wav.read(path)
         audio = audio.astype(np.float32) / 32768.0
     if audio.ndim > 1: audio = audio.mean(axis=1)
     if orig_sr != sr:

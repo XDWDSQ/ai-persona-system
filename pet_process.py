@@ -101,6 +101,19 @@ def parse_name(filename: str) -> str:
 def process_one(in_path, name, out_dir, session,
                 target_size=256, target_fps=10, margin=1.05,
                 alpha_lo=0.45, alpha_hi=0.90, feather=0.8, quality=70):
+    """单段处理；任何失败返回 None（批量模式不中断其他段）。"""
+    try:
+        return _process_one_impl(in_path, name, out_dir, session,
+                                 target_size, target_fps, margin,
+                                 alpha_lo, alpha_hi, feather, quality)
+    except Exception as exc:  # noqa: BLE001
+        print(f'  × [{name}] 处理失败: {exc}', flush=True)
+        return None
+
+
+def _process_one_impl(in_path, name, out_dir, session,
+                      target_size=256, target_fps=10, margin=1.05,
+                      alpha_lo=0.45, alpha_hi=0.90, feather=0.8, quality=70):
     print(f'\n[{name}] 读取: {os.path.basename(in_path)}', flush=True)
 
     # ---- 第一遍：只保留低分辨率 mask（内存 ~0.4MB/帧），算全局 bbox ----
@@ -170,7 +183,10 @@ def process_one(in_path, name, out_dir, session,
             xe, ye = min(cx + half, W), min(cy + half, H)
             cw, ch = xe - xs, ye - ys
             rgba = np.zeros((half * 2, half * 2, 4), dtype=np.uint8)
-            px, py = (half * 2 - cw) // 2, (half * 2 - ch) // 2
+            # margin<1 或 bbox 贴近边缘时，实际裁切区可能超出画布：clamp 防负索引
+            # （numpy 负索引会从尾部取，静默错乱），超出的部分由切片自动截断
+            px = max(0, (half * 2 - cw) // 2)
+            py = max(0, (half * 2 - ch) // 2)
             rgba[py:py + ch, px:px + cw, :3] = np.asarray(rgb, dtype=np.uint8)[ys:ye, xs:xe]
             rgba[py:py + ch, px:px + cw, 3] = (a[ys:ye, xs:xe] * 255).astype(np.uint8)
             pil_frames.append(Image.fromarray(rgba, 'RGBA').resize(
@@ -214,6 +230,16 @@ def main():
     ap.add_argument('--feather', type=float, default=0.8, help='边缘羽化半径(px)')
     ap.add_argument('--quality', type=int, default=70, help='WebP 质量')
     args = ap.parse_args()
+
+    # 参数范围校验：--fps 0 / --size 0 会除零或崩溃，--margin<1 裁切会越界
+    if args.fps < 1:
+        print('--fps 必须 >= 1'); sys.exit(1)
+    if args.size < 16:
+        print('--size 必须 >= 16'); sys.exit(1)
+    if args.margin <= 0 or args.margin < 1.0:
+        print('--margin 必须 >= 1.0（小于 1 会裁掉人物边缘）'); sys.exit(1)
+    if not (0 < args.quality <= 100):
+        print('--quality 必须在 1..100'); sys.exit(1)
 
     tasks = []
     if args.all:

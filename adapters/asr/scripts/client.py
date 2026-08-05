@@ -388,6 +388,10 @@ def _send(conn, msg: dict, log_path: Path | None = None) -> dict:
     try:
         conn.send(payload)
         reply = conn.recv()
+    except (EOFError, OSError) as exc:
+        # server 进程崩溃/连接被重置：返回可读错误，而不是裸 traceback
+        _log_message(log_path, f"connection lost during op={payload.get('op')!r}: {exc}")
+        return {"ok": False, "error": f"ASR server connection lost: {exc}"}
     finally:
         conn.close()
     if isinstance(reply, dict):

@@ -941,7 +941,7 @@
         (function(){
           var $ = function(s){ return document.querySelector(s); };
           var msgsInner = document.querySelector('.msgs-inner');
-          var state = { history: [], recording: false, mediaRec: null, recChunks: [], cloudProviders: {}, soundOn: true, speed: 1.0, provider: 'cloud', voiceProvider: 'local', aliyunConfigured: false, minimaxConfigured: false, audioCache: {}, ttsInflight: {}, playing: null, playingBtn: null, playSeq: 0, pendingAttachments: [], attachMenuOpen: false, awaiting: {} };
+          var state = { history: [], recording: false, mediaRec: null, recChunks: [], cloudProviders: {}, soundOn: (function(){ try { return localStorage.getItem('xiaoni_sound_on') !== '0'; } catch(e) { return true; } })(), speed: (function(){ try { return parseFloat(localStorage.getItem('xiaoni_speed') || '1.0') || 1.0; } catch(e) { return 1.0; } })(), provider: 'cloud', voiceProvider: 'local', aliyunConfigured: false, minimaxConfigured: false, audioCache: {}, ttsInflight: {}, playing: null, playingBtn: null, playSeq: 0, pendingAttachments: [], attachMenuOpen: false, awaiting: {} };
           /* 当前激活角色 key：同步维护，页面加载即生效（默认与后端 config 一致为大帅），
              避免头像判断依赖异步的 /api/status 返回导致首帧渲染成首字 */
           var currentRoleKey = 'dashuai';
@@ -1051,9 +1051,12 @@
           /* ---------- 流式输出（SSE） ---------- */
           function parseSSEEvent(block) {
             var data = '';
+            /* SSE 规范：多行 data 以 \n 连接，行内空白必须保留（trim 会破坏 JSON 值内的首尾空格）；
+               当前后端单行输出，这里按规范处理避免未来埋雷 */
             block.split('\n').forEach(function(l){
-              if (l.indexOf('data:') === 0) data += l.slice(5).trim();
+              if (l.indexOf('data:') === 0) data += l.slice(5) + '\n';
             });
+            data = data.replace(/\n$/, '');
             if (!data) return null;
             try { return JSON.parse(data); } catch (e) { return null; }
           }
@@ -1249,8 +1252,12 @@
           }
           function fillConfig(s) {
             if (!document.getElementById('local_base_url')) return;
-            document.getElementById('local_base_url').value = s.local.base_url;
-            document.getElementById('local_model').value = s.local.model;
+            /* 防御：后端字段缺失/结构异常时不抛 TypeError 中断整段回填（旧实现 s.local 为
+               undefined 时整页设置面板崩溃，refreshStatus 误报"后端未连接"） */
+            s = s || {};
+            var lc = s.local || {}, cc = s.cloud || {};
+            document.getElementById('local_base_url').value = lc.base_url || '';
+            document.getElementById('local_model').value = lc.model || '';
             var sel = document.getElementById('cloud_provider_sel');
             sel.innerHTML = '';
             Object.keys(state.cloudProviders).forEach(function(k){
@@ -1258,14 +1265,14 @@
               o.value = k; o.textContent = state.cloudProviders[k].label;
               sel.appendChild(o);
             });
-            sel.value = s.cloud.provider || 'custom';
-            document.getElementById('cloud_base_url').value = s.cloud.base_url;
-            document.getElementById('cloud_model').value = s.cloud.model;
+            sel.value = cc.provider || 'custom';
+            document.getElementById('cloud_base_url').value = cc.base_url || '';
+            document.getElementById('cloud_model').value = cc.model || '';
             /* 密钥与思考开关直接回填：切换供应商后保存不会串用上一个 key */
-            document.getElementById('cloud_api_key').value = s.cloud.api_key || '';
+            document.getElementById('cloud_api_key').value = cc.api_key || '';
             var ct = document.getElementById('cloud_thinking');
             /* 仅在后端明确给出布尔值时回填：老配置缺字段时保留用户当前选择，不强制改回开启 */
-            if (ct && s.cloud && typeof s.cloud.thinking === 'boolean') ct.checked = s.cloud.thinking;
+            if (ct && typeof cc.thinking === 'boolean') ct.checked = cc.thinking;
             document.getElementById('persona').value = s.persona;
             var va = s.voice_aliyun || {};
             document.getElementById('aliyun_api_key').value = va.api_key || '';
@@ -1402,10 +1409,11 @@
               state.minimaxConfigured = !!s.minimax_configured;
               state.voiceRegistered = !!s.voice_registered;
               state.cloudProviders = s.cloud_providers || {};
-              var cp = state.cloudProviders[s.cloud.provider];
+              var cc2 = s.cloud || {};  /* 防御：后端字段缺失时不抛 TypeError */
+              var cp = state.cloudProviders[cc2.provider];
               var pName = $('.p-name'), pDetail = $('.p-detail'), cSub = $('.c-sub');
-              if (pName) pName.textContent = s.provider === 'local' ? '本地语言生成' : '云端语言生成 · ' + (cp ? cp.label : s.cloud.model);
-              if (pDetail) pDetail.textContent = s.provider === 'local' ? s.local.model : (s.cloud.model || '');
+              if (pName) pName.textContent = s.provider === 'local' ? '本地语言生成' : '云端语言生成 · ' + (cp ? cp.label : cc2.model);
+              if (pDetail) pDetail.textContent = s.provider === 'local' ? (s.local ? s.local.model : '') : (cc2.model || '');
               if (cSub) cSub.textContent = (s.provider === 'local' ? '本地对话' : '云端对话') + ' · 串行引擎';
               var nextName = s.provider === 'local' ? '云端' : '本地';
               var row = document.querySelector('.provider-row[data-kind="chat"]');
@@ -1423,11 +1431,7 @@
               if (vRow) vRow.title = '当前：' + vLabel + '，点击切换引擎';
               applyOnlineState(!!s.active_online);
               applyVoiceState();
-              var chip = document.querySelector('.top-chip.voice');
-              if (chip) {
-                var lab = chip.querySelector('span:last-child');
-                if (lab) lab.textContent = s.voice_registered ? '语音合成已启用' : '语音合成未启用';
-              }
+              /* 语音合成 chip 由 syncVoiceChipUI 统一管理（开关文案），这里不覆盖 */
               fillConfig(s);
               state.activeRole = s.active_role;
               state.roles = s.roles || [];
@@ -1505,8 +1509,16 @@
             document.querySelectorAll('.speed-btn').forEach(function(b){
               b.addEventListener('click', function(){
                 state.speed = parseFloat(b.dataset.speed) || 1.0;
+                /* 语速持久化：刷新/重开页面不再回到 1.0x */
+                try { localStorage.setItem('xiaoni_speed', String(state.speed)); } catch(e) {}
                 document.querySelectorAll('.speed-btn').forEach(function(x){ x.classList.toggle('active', x === b); });
               });
+              /* 初始化时把 active 状态同步到上次保存的语速 */
+              if (b.dataset.speed && parseFloat(b.dataset.speed) === state.speed) {
+                b.classList.add('active');
+              } else {
+                b.classList.remove('active');
+              }
             });
           }
 
@@ -1529,11 +1541,16 @@
             if (!m.scrollTo) { m.scrollTop = m.scrollHeight; }
             else { m.scrollTo({ top: m.scrollHeight, behavior: 'smooth' }); }
           }
+          /* 'instant' 是较晚加入规范的枚举值（部分旧 WebKit/Safari 抛 TypeError），
+             不支持的浏览器回退直接赋值 scrollTop（等价瞬时滚动） */
           function snapBottom(){
             var m = document.getElementById('msgs');
             if (!m) return;
-            if (m.scrollTo) m.scrollTo({ top: m.scrollHeight, behavior: 'instant' });
-            else m.scrollTop = m.scrollHeight;
+            var ok = false;
+            try {
+              if (m.scrollTo) { m.scrollTo({ top: m.scrollHeight, behavior: 'instant' }); ok = true; }
+            } catch (e) { ok = false; }
+            if (!ok) m.scrollTop = m.scrollHeight;
           }
           (function(){
             var m = document.getElementById('msgs');
@@ -1741,6 +1758,9 @@
               if (state.history[i].role === role && state.history[i].content === content) {
                 state.history.splice(i, 1);
                 saveSessions();
+                /* 必须重渲染：其余消息 DOM 的 dataset.hidx 已失效，不重渲染会导致
+                   下次按 hidx 删除时下标错位误删另一条同角色消息 */
+                renderCurrentSession();
                 return;
               }
             }
@@ -1911,6 +1931,7 @@
             var key = (style || '') + '\u0001' + text;
             var url = state.audioCache[key];
             var prog = null;
+            var a = null;  /* 先声明：合成在 new Audio 之前失败时，catch 分支可安全引用 */
             if ((!url || force) && btn) {
               setSpeak(btn, force ? '重新合成…' : '正在合成…', true);
               prog = startSynthProgress(btn);
@@ -3204,12 +3225,23 @@
           renderCurrentSession();
           syncSessionsFromServer();
 
-          /* ---------- 顶部 chip：语音合成状态 / 语音输入 ---------- */
+          /* ---------- 顶部 chip：语音合成开关 / 语音输入 ---------- */
           var voiceChip = document.querySelector('.top-chip.voice');
-          /* 提示按真实状态动态化：此前无论后端是否注册音色都固定说「已启用」 */
+          function syncVoiceChipUI(){
+            if (!voiceChip) return;
+            voiceChip.classList.toggle('voice', state.soundOn);
+            voiceChip.title = state.soundOn ? '点击关闭自动朗读' : '点击开启自动朗读';
+            var t = voiceChip.querySelector('span');
+            if (t) t.textContent = state.soundOn ? '语音合成' : '语音合成 关';
+          }
+          /* 语音合成 chip = 自动朗读开关：点击切换并持久化（此前是纯展示，误导以为可操作） */
           if (voiceChip) voiceChip.addEventListener('click', function(){
-            toast(state.voiceRegistered ? '语音合成已启用，AI 回复可朗读' : '语音合成未启用，检查音色配置');
+            state.soundOn = !state.soundOn;
+            try { localStorage.setItem('xiaoni_sound_on', state.soundOn ? '1' : '0'); } catch(e) {}
+            syncVoiceChipUI();
+            toast(state.soundOn ? '自动朗读已开启' : '自动朗读已关闭（仍可手动点喇叭朗读）');
           });
+          syncVoiceChipUI();
           var micChip = document.querySelector('.top-chip:not(.voice)');
           if (micChip) micChip.addEventListener('click', function(){ state.recording ? stopMic() : startMic(); });
 
@@ -3289,12 +3321,14 @@
             return true;
           }
           async function maybeGreet() {
-            if (!shouldGreet()) return;
-            var sessionId = currentSessionId;
+            /* 整段包 try：隐私模式/localStorage 禁用时 shouldGreet 内访问 localStorage
+               会抛异常，旧实现是 setTimeout 里的 unhandled rejection */
             try {
+              if (!shouldGreet()) return;
+              var sessionId = currentSessionId;
               var r = await api('/api/greeting', { method: 'POST' });
               if (r.reply && r.reply.trim()) {
-                localStorage.setItem(GREETING_DATE_KEY, todayStr());
+                try { localStorage.setItem(GREETING_DATE_KEY, todayStr()); } catch (e) {}
                 setTimeout(function() {
                   /* 等待期间用户可能已切会话：问候只进发起时的会话，不插错视图 */
                   if (currentSessionId !== sessionId) return;

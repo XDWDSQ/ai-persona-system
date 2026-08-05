@@ -495,15 +495,20 @@
           }
         }
 
+        /* 连续点击「重新探测」时慢响应可能晚于新请求返回并覆盖新结果：加序列号，过期响应丢弃 */
+        var _loadSeq = 0;
         async function loadAll() {
+          var seq = ++_loadSeq;
           try {
             /* 并行探测：原先串行等 /api/status 完了再等 /api/health，首屏慢一倍 */
             var res = await Promise.all([api('/api/status'), api('/api/health')]);
+            if (seq !== _loadSeq) return;
             lastStatus = res[0];
             lastHealth = res[1];
             renderSummary(lastStatus, lastHealth);
             renderDeps(lastStatus, lastHealth);
           } catch (e) {
+            if (seq !== _loadSeq) return;
             renderSummary(null, null);
             $('#dep-grid').innerHTML = '<div class="empty">无法连接后端服务<br><span style="font-size:12px;opacity:.8">请确认服务已启动（start.bat）</span></div>';
             $('#sum-sub').textContent = e.message || '连接失败';

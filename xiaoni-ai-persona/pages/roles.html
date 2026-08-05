@@ -378,7 +378,7 @@
             <div class="stat-card">
               <span class="stat-label">主动问候</span>
               <span class="stat-value ok" id="stat-greeting">已开启</span>
-              <span class="stat-hint">每天最多 1 次</span>
+              <span class="stat-hint">可在聊天页设置中关闭</span>
             </div>
           </div>
 
@@ -417,6 +417,9 @@
       (function(){
         var $ = function(s){ return document.querySelector(s); };
         var state = { roles: [], activeRole: '', activeRoleData: null };
+        /* 角色数据加载竞态保护：快速切换角色时，慢响应可能晚于新角色返回，
+           把旧角色的记忆/人设渲染到当前视图 → 每次 selectRole 递增序列号，过期响应丢弃 */
+        var _roleSeq = 0;
 
         /* ---------- toast ---------- */
         var toastsBox = null;
@@ -479,9 +482,8 @@
           add.type = 'button';
           add.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><span>新建角色</span>';
           add.addEventListener('click', function(){
-            var name = window.prompt('新角色名称（key 将自动生成）：', '');
-            if (!name || !name.trim()) return;
-            toast('角色创建需在 config.json 中配置完整人设与音色参数', 3200, '');
+            /* 后端无创建角色接口：明确指引，不再假装能创建 */
+            toast('暂不支持在页面新建角色——请在 config.json 的 roles 中配置（含人设与音色参数），重启服务后生效', 4000);
           });
           list.appendChild(add);
         }
@@ -519,8 +521,9 @@
           }
           $('#stat-memory').textContent = (st.memory_count != null ? st.memory_count : 0);
           $('#stat-emotion').textContent = emotionLabel(st.emotion);
-          var lu = st.last_update ? st.last_update.replace('T', ' ').slice(0, 16) : '—';
-          $('#stat-emotion-hint').textContent = '上次更新 ' + lu;
+          /* last_update 可能是任意类型（手改/损坏的 JSON）——String() 防御，避免 TypeError 中断渲染 */
+          var lu = String(st.last_update || '').replace('T', ' ').slice(0, 16);
+          $('#stat-emotion-hint').textContent = '上次更新 ' + (lu || '—');
           $('#mem-count-hint').textContent = '记忆库 ' + (st.memory_count || 0) + ' 条';
           if (!st.memory_count) {
             $('#mem-list').innerHTML = '<div class="empty">还没有记忆，多聊几句就有了</div>';
@@ -552,6 +555,7 @@
         function selectRole(key) {
           if (key === state.activeRole) return;
           state.activeRole = key;
+          _roleSeq++;   /* 作废在途的旧角色请求 */
           var r = state.roles.find(function(x){ return x.key === key; });
           state.activeRoleData = r || null;
           renderSidebar();
@@ -567,6 +571,14 @@
             state.roles = data.roles || [];
             state.activeRole = data.active_role || '';
             state.activeRoleData = state.roles.find(function(x){ return x.key === state.activeRole; }) || null;
+            /* 主动问候状态与聊天页设置面板同步（chat.html 的 greeting_toggle 存 localStorage） */
+            var gOn = true;
+            try { gOn = localStorage.getItem('xiaoni_greeting_enabled') !== '0'; } catch (e) {}
+            var gEl = $('#stat-greeting');
+            if (gEl) {
+              gEl.textContent = gOn ? '已开启' : '已关闭';
+              gEl.classList.toggle('ok', gOn);
+            }
             renderSidebar();
             renderDetail();
             loadState();
@@ -579,10 +591,13 @@
         }
 
         async function loadState() {
+          var seq = _roleSeq;
           try {
             var st = await api('/api/state');
+            if (seq !== _roleSeq) return;  /* 已切到其他角色，丢弃过期响应 */
             renderState(st);
           } catch (e) {
+            if (seq !== _roleSeq) return;
             $('#stat-memory').textContent = '—';
             $('#stat-emotion').textContent = '—';
           }
@@ -604,10 +619,12 @@
         }
 
         async function loadMemories() {
+          var seq = _roleSeq;
           $('#mem-list').innerHTML = '<div class="loading">记忆数据加载中…</div>';
           var items = [];
           try {
             var data = await api('/api/roles/memories?role=' + encodeURIComponent(state.activeRole) + '&top=10');
+            if (seq !== _roleSeq) return;  /* 已切到其他角色，丢弃过期响应 */
             if (data && data.enabled && data.memories) {
               items = data.memories.map(function(m){
                 return {
@@ -623,6 +640,7 @@
             /* 兜底：角色现实动态 */
             try {
               var news = await api('/api/role-news');
+              if (seq !== _roleSeq) return;
               if (news && news.enabled && news.news) {
                 items.push({ summary: '现实动态：' + news.news, time: '最近更新' });
               }
@@ -632,8 +650,10 @@
         }
 
         async function loadPersona() {
+          var seq = _roleSeq;
           try {
             var data = await api('/api/status');
+            if (seq !== _roleSeq) return;
             var p = data.persona;
             $('#persona').value = p || '';
             personaSavedValue = p || '';
