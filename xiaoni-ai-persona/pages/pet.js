@@ -1,5 +1,5 @@
 /* ==========================================================================
- * pet.js — 大帅桌面宠物渲染器
+ * pet.js — 大帅桌面宠物渲染器（v2：加载/动画性能优化）
  *
  * 用法（chat.html 集成）：
  *   1. <script src="pet.js"></script> 放在 chat.html 末尾（DOMContentLoaded 前）
@@ -9,14 +9,23 @@
  *        window.dispatchEvent(new CustomEvent('pet:state', {detail:{state:'idle'}}));
  *
  * 维护（核心）：
- *   - 换视频：把新的 pet/<state>.webp 覆盖到 pages/pet/ 目录，前端零改动
+ *   - 换视频：重跑 pet_process.py 覆盖 pages/pet/<state>.webp，然后把 ASSET_VERSION 加 1
+ *     （webp 走长缓存，靠版本号刷新；不 bump 用户会看到旧素材）
  *   - 加情绪：PET_META 数组里加一行 + 放一个 webp，菜单自动多一项
  *   - 删情绪：PET_META 删一行即可
+ *
+ * v2 性能要点：
+ *   - 去掉 Date.now() 防缓存（每次刷新都重下 8MB）→ 固定 ASSET_VERSION + 服务端长缓存
+ *   - 挂载后空闲时段预加载全部情绪，切换零等待
+ *   - 去掉 .pet-img 的 drop-shadow 滤镜（动画 WebP 每帧重绘滤镜，最贵的开销）
+ *   - speaking 无独立素材：只加 CSS 动效，不再发 404 请求
+ *   - 状态切换淡入，拖拽期间关闭过渡
  * ========================================================================== */
 (function () {
   'use strict';
 
   /* ---------- 配置：换视频不动这里；加情绪加一行 ---------- */
+  var ASSET_VERSION = '2';         // 重新生成 webp 后 bump，配合长缓存刷新
   var PET_META = [
     { state: 'idle',     label: '空闲',   group: '基础' },
     { state: 'happy',    label: '开心',   group: '基础' },
@@ -27,6 +36,9 @@
     { state: 'pat',      label: '摸头',   group: '互动' }
     /* 以后加：{ state: 'surprised', label: '惊讶', group: '基础' } */
   ];
+  var HAS_ASSET = {};              // 有 webp 素材的状态集合
+  PET_META.forEach(function (p) { HAS_ASSET[p.state] = true; });
+  var PRELOAD_ORDER = ['thinking', 'happy', 'pat', 'sad', 'angry', 'shy']; // 空闲预加载顺序
   var SIZE = 160;                  // 桌宠显示尺寸（px）
   var MINI_SIZE = 30;              // 最小化圆点尺寸（px）
   var LONG_PRESS_MS = 450;         // 长按弹菜单（移动端替代右键）
@@ -60,8 +72,9 @@
     s.textContent = [
       '#pet{position:fixed;right:18px;bottom:calc(env(safe-area-inset-bottom, 0px) + 18px);width:' + SIZE + 'px;height:' + SIZE + 'px;',
       'z-index:60;user-select:none;-webkit-user-select:none;touch-action:none;cursor:grab;',
-      'transition:transform .18s ease,width .2s ease,height .2s ease}',
+      'transition:width .2s ease,height .2s ease}',
       '#pet:active{cursor:grabbing}',
+      '#pet.dragging{transition:none}',
       '#pet .pet-stage{position:absolute;inset:0;border-radius:50%;overflow:hidden;',
       'background:radial-gradient(circle at 30% 30%, rgba(255,255,255,.08), transparent 60%);',
       'box-shadow:0 6px 22px -8px rgba(0,0,0,.45),0 0 0 1px rgba(255,255,255,.06);',
@@ -69,8 +82,10 @@
       '#pet:hover .pet-stage{transform:scale(1.04)}',
       '#pet[data-state="thinking"] .pet-stage{animation:pet-think 1.2s ease-in-out infinite}',
       '#pet[data-state="speaking"] .pet-stage{animation:pet-speak .5s ease-in-out infinite alternate}',
+      /* 注意：不加 filter/drop-shadow —— 动画 WebP 每帧重绘滤镜非常贵，
+         立体感交给 .pet-stage 的 box-shadow */
       '#pet .pet-img{width:100%;height:100%;object-fit:contain;display:block;',
-      'filter:drop-shadow(0 2px 6px rgba(0,0,0,.35))}',
+      'animation:pet-fadein .18s ease}',
       '#pet .pet-bubble{position:absolute;left:-6px;top:-14px;max-width:140px;min-width:24px;',
       'background:var(--card,#fff);color:var(--foreground,#0a0a0a);font-size:13px;line-height:1.4;',
       'padding:6px 10px;border-radius:10px;border:1px solid var(--border,#e5e5e5);',
@@ -82,6 +97,7 @@
       'border-bottom:1px solid var(--border,#e5e5e5);transform:rotate(45deg)}',
       '@keyframes pet-think{0%,100%{transform:rotate(-3deg)}50%{transform:rotate(3deg)}}',
       '@keyframes pet-speak{from{transform:scale(1)}to{transform:scale(1.03)}}',
+      '@keyframes pet-fadein{from{opacity:.35}to{opacity:1}}',
       /* 最小化圆点 */
       '#pet.mini{width:' + MINI_SIZE + 'px;height:' + MINI_SIZE + 'px;right:12px;bottom:calc(env(safe-area-inset-bottom, 0px) + 12px)}',
       '#pet.mini .pet-stage{border-radius:50%;background:var(--chart-2,#4f6ef7);',
@@ -129,7 +145,9 @@
     var p = new Promise(function (resolve) {
       var img = new Image();
       img.className = 'pet-img';
-      img.src = 'pet/' + state + '.webp?v=' + Date.now().toString(36);  // 防缓存
+      img.draggable = false;
+      img.decoding = 'async';
+      img.src = 'pet/' + state + '.webp?v=' + ASSET_VERSION;  // 固定版本，可被长缓存
       img.onload  = function () { resolve(img); };
       img.onerror = function () { resolve(null); };
     });
@@ -137,13 +155,30 @@
     return p;
   }
 
+  /* ---------- 空闲预加载：切换零等待 ---------- */
+  function preloadRest() {
+    var queue = PRELOAD_ORDER.slice();
+    function next() {
+      var st = queue.shift();
+      if (!st) return;
+      loadImg(st).then(function () {
+        if (window.requestIdleCallback) window.requestIdleCallback(next, { timeout: 2000 });
+        else setTimeout(next, 300);
+      });
+    }
+    if (window.requestIdleCallback) window.requestIdleCallback(next, { timeout: 2000 });
+    else setTimeout(next, 800);
+  }
+
   /* ---------- 状态切换 ---------- */
   function applyState(state) {
     if (!state || state === _current) return;
     _current = state;
     if (_el) _el.dataset.state = state;
+    if (!HAS_ASSET[state]) return;   // speaking 等无素材状态：只加 CSS 动效，不发 404
     loadImg(state).then(function (img) {
-      if (!img) return;             // 文件不存在
+      if (!img) return;              // 文件不存在
+      if (state !== _current) return; // 加载期间又切走了，别盖
       if (_img) _img.remove();
       _img = img;
       _stage.appendChild(_img);
@@ -183,13 +218,16 @@
     });
     _el.addEventListener('pointermove', function (e) {
       if (!drag) return;
-      if (Math.abs(e.clientX - startX) > DRAG_THRESHOLD ||
-          Math.abs(e.clientY - startY) > DRAG_THRESHOLD) {
+      if (!moved && (Math.abs(e.clientX - startX) > DRAG_THRESHOLD ||
+                     Math.abs(e.clientY - startY) > DRAG_THRESHOLD)) {
         clearPress();               // 在拖 → 不是长按
         moved = true;
+        _el.classList.add('dragging');
       }
-      var x = Math.max(0, Math.min(window.innerWidth  - SIZE, e.clientX - ox));
-      var y = Math.max(0, Math.min(window.innerHeight - SIZE, e.clientY - oy));
+      if (!moved) return;
+      var w = _el.offsetWidth, h = _el.offsetHeight;
+      var x = Math.max(0, Math.min(window.innerWidth  - w, e.clientX - ox));
+      var y = Math.max(0, Math.min(window.innerHeight - h, e.clientY - oy));
       _el.style.left = x + 'px';
       _el.style.top  = y + 'px';
       _el.style.right = 'auto'; _el.style.bottom = 'auto';
@@ -198,6 +236,7 @@
       if (!drag) return;
       drag = false;
       clearPress();
+      _el.classList.remove('dragging');
       if (moved) {
         try {
           var r = _el.getBoundingClientRect();
@@ -319,6 +358,7 @@
     });
     makeDraggable();
     applyState(_current);
+    preloadRest();
   }
 
   /* ---------- 监听外部状态事件 ---------- */
