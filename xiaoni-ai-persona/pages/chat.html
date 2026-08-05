@@ -2200,32 +2200,46 @@
             if (btn) btn.disabled = true;
             var s = currentSession();
             if (!s) { if (btn) btn.disabled = false; return; }
-            /* 在会话历史里定位这条回复（按 role+content 匹配），找不到就不动 */
-            var content = div.querySelector('.bubble').textContent;
+            /* 定位这条回复：优先用渲染下标（精确），失效时按 role+content 倒查
+               （模型偶发复读会产生多条相同 content，正序会命中更早那条导致删错位置） */
             var idx = -1;
-            for (var i = 0; i < s.history.length; i++) {
-              if (s.history[i].role === 'assistant' && s.history[i].content === content) { idx = i; break; }
+            var hidx = parseInt(div.dataset.hidx, 10);
+            var _bubbleTxt = div.querySelector('.bubble').textContent;
+            if (!isNaN(hidx) && s.history[hidx]
+                && s.history[hidx].role === 'assistant'
+                && s.history[hidx].content === _bubbleTxt) {
+              idx = hidx;
+            } else {
+              for (var i = s.history.length - 1; i >= 0; i--) {
+                if (s.history[i].role === 'assistant' && s.history[i].content === _bubbleTxt) { idx = i; break; }
+              }
             }
-            if (idx < 0) { if (btn) btn.disabled = false; return; }
+            if (idx < 0) {
+              if (btn) btn.disabled = false;
+              toast('找不到对应的消息，可能已被删除');
+              return;
+            }
             /* 往前找触发它的那条用户消息；历史里该用户消息之前的部分作为上下文 */
             var u = idx - 1;
             while (u >= 0 && s.history[u].role !== 'user') u--;
-            if (u < 0) { if (btn) btn.disabled = false; return; }
+            if (u < 0) {
+              if (btn) btn.disabled = false;
+              toast('找不到触发这条回复的消息，无法重新生成');
+              return;
+            }
             var userMsg = s.history[u];
             var userText = userMsg.content || ((userMsg.attachments && userMsg.attachments.length) ? '（发送了附件）' : '');
             var userAtts = userMsg.attachments || [];
             var hist = s.history.slice(0, u);
             s.history.splice(idx); /* 丢掉旧回复及其之后的所有消息 */
             state.history = s.history;
-            div.remove();
             markSessionActivity(s.id);
+            markAwaiting(s.id, true); /* 先标记：renderCurrentSession 末尾用户消息不会误补失败气泡 */
+            /* 整页重渲染同步 DOM 与数据：splice 后若该回复之后还有消息（用户又发了新内容），
+               仅删当前气泡会造成界面残留，必须重绘让后续消息一起消失（与编辑消息同一套逻辑） */
+            renderCurrentSession();
             showTyping();
-            if (btn) {
-              var lab = btn.querySelector('span');
-              if (lab) lab.textContent = '重新生成中…';
-            }
             var sessionId = s.id;
-            markAwaiting(sessionId, true);
             try {
               var historyPayload = hist.slice(-20).map(function(m){
                 if (m.content) return m;
@@ -2235,7 +2249,7 @@
               });
               await streamReplyInto(
                 sessionId,
-                { idx: u, text: userMsg.content || '', atts: userAtts },
+                { idx: u, text: userText, atts: userAtts },
                 { message: userText, history: historyPayload, attachments: userAtts }
               );
             } catch (e) {
