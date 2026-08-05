@@ -3549,6 +3549,8 @@ async def role_state():
             "last_update": state.get("last_update"),
             "memory_count": await asyncio.to_thread(mem.count),
         }
+    except HTTPException:
+        raise  # 角色名非法等 4xx 直接透传，不包装成 500
     except Exception as exc:  # noqa: BLE001
         _log.warning("api/state failed: %s", exc)
         raise HTTPException(500, f"读取状态失败: {exc}")
@@ -3598,6 +3600,8 @@ async def role_memories(role: str = "", top: int = 10):
                 for m in items[:top_n]
             ],
         }
+    except HTTPException:
+        raise  # 角色名非法等 4xx 直接透传，不包装成 500
     except Exception as exc:  # noqa: BLE001
         _log.warning("api/roles/memories failed: %s", exc)
         raise HTTPException(500, f"读取记忆失败: {exc}")
