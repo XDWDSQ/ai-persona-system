@@ -233,7 +233,8 @@
          工具类，已由下方兜底样式覆盖，移除后首屏与流式渲染都明显更轻 -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="preload" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" as="style" onload="this.onload=null;this.rel='stylesheet'">
+    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"></noscript>
     <style id="semantic-token-fallback">
       .bg-background { background-color: var(--vercel-background); }
       .text-background { color: var(--vercel-background); }
@@ -1667,7 +1668,7 @@
                 removeFromHistory(div);
               } }]);
             });
-            msgsInner.appendChild(div);
+            (opts.container || msgsInner).appendChild(div);
             /* 自己发的消息强制贴底；对方消息仅在已贴底时跟随（不打断上翻浏览） */
             if (!opts.noScroll) {
               if (role === 'user') stickBottom = true;
@@ -2921,9 +2922,20 @@
           }, 30000);
           /* 入场动画只播一次：收发消息触发的重渲染不要重放动画 */
           var sessionsAnimatedOnce = false;
+          /* 会话列表渲染去重：markSessionActivity 在每次收发消息都会触发 renderSessions，
+             但排序/置顶/标题/活跃时间/选中态都没变时 DOM 无需重建。
+             用轻量指纹串比对（不依赖深比较），不变直接跳过 → 连续收发消息不再反复重建列表 */
+          var sessionsRenderKey = '';
           function renderSessions() {
             if (!sessionsBox) return;
+            var key = sortSessions(sessions).map(function(x){
+              return x.id + '|' + (x.pinned ? 1 : 0) + '|' + (x.title || '') + '|' + (x.updatedAt || 0) + '|' + (x.id === currentSessionId ? 1 : 0);
+            }).join('~');
+            if (key === sessionsRenderKey && sessionsBox.childNodes.length) return;
+            sessionsRenderKey = key;
             sessionsBox.innerHTML = '';
+            /* 文档片段批量挂载：几十个会话一次性 append，只触发一次布局/重绘 */
+            var frag = document.createDocumentFragment();
             sortSessions(sessions).forEach(function(session, idx){
               var s = document.createElement('button');
               s.className = 'session' + (!sessionsAnimatedOnce ? ' side-in' : '') + (session.id === currentSessionId ? ' active' : '') + (session.pinned ? ' pinned' : '');
@@ -2940,8 +2952,9 @@
               s.querySelector('.s-time').textContent = timeLabel(session.updatedAt);
               bindSessionClick(s);
               bindSessionMenu(s);
-              sessionsBox.appendChild(s);
+              frag.appendChild(s);
             });
+            sessionsBox.appendChild(frag);
             sessionsAnimatedOnce = true;
           }
           function renderCurrentSession() {
@@ -2954,12 +2967,15 @@
             /* 有历史消息时收起欢迎区：landing 状态与聊天记录不该同屏 */
             var welcome = document.querySelector('.welcome');
             if (welcome) welcome.style.display = state.history.length ? 'none' : '';
+            /* 文档片段批量渲染：长历史一次性挂载，只触发一次布局/重绘（切会话零卡顿） */
+            var frag = document.createDocumentFragment();
             (state.history || []).forEach(function(m, i){
               /* 长历史（>16 条）瞬时渲染：不播入场动画，切会话零等待也不掉帧 */
               var animOn = state.history.length <= 16;
               var div = addMsg(m.role, m.content, {
                 delay: animOn ? Math.min(i * 45, 400) : 0, noScroll: true,
-                attachments: m.attachments || [], animate: animOn
+                attachments: m.attachments || [], animate: animOn,
+                container: frag
               });
               div.dataset.hidx = String(i);
               if (m.role === 'assistant') {
@@ -2969,6 +2985,7 @@
                 meta.appendChild(makeRegenBtn(div));
               }
             });
+            msgsInner.appendChild(frag);
             /* 历史以用户消息结尾 = 上一轮生成失败/中断，回复没入库（失败气泡不持久化）。
                补一条带「重试」按钮的失败气泡，避免只剩用户消息无法重新生成；
                正在等待回复时不补（此时末尾用户消息属于进行中的请求） */

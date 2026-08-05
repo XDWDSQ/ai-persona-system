@@ -79,8 +79,16 @@ def _atomic_write(path: Path, data) -> bool:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
-        return True
+        # Windows 上无锁读（search/load）持有的文件句柄不带 FILE_SHARE_DELETE，
+        # replace 会撞 PermissionError；读窗口仅毫秒级，短退避重试即可
+        for attempt in range(3):
+            try:
+                tmp.replace(path)
+                return True
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05)
     except OSError as exc:
         _log.warning("role_engine atomic write failed %s: %s", path, exc)
         return False
@@ -97,6 +105,14 @@ def _safe_load(path: Path, default: dict) -> dict:
         _log.warning("role_engine load %s failed (%s), resetting", path, exc)
         _atomic_write(path, default)
     return default
+
+
+def _fnum(v, default: float) -> float:
+    """float 转换防御：手改/损坏的 JSON 字段为 null/非数字时回退默认值。"""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def _shingles(text: str) -> set[str]:
@@ -140,21 +156,42 @@ class MemoryStore:
             raise ValueError(f"illegal role path: {self.path}")
         self.limit = limit
         self._lock = threading.RLock()
+        # mtime 失效缓存：chat 主链路每次请求都会 search → load，
+        # 命中缓存时省掉读盘+JSON 解析（写盘后显式失效）
+        self._cache: tuple[int, dict] | None = None
+
+    def _load_cached(self) -> dict:
+        """读取原始 JSON（mtime 失效缓存）。文件缺失/损坏返回空基底。"""
+        try:
+            mtime = self.path.stat().st_mtime_ns
+        except OSError:
+            self._cache = None
+            return {"version": 1, "memories": []}
+        if self._cache is not None and self._cache[0] == mtime:
+            return self._cache[1]
+        data = _safe_load(self.path, {"version": 1, "memories": []})
+        self._cache = (mtime, data)
+        return data
 
     def load(self) -> list[dict]:
-        data = _safe_load(self.path, {"version": 1, "memories": []})
+        data = self._load_cached()
         mems = data.get("memories", [])
-        return mems if isinstance(mems, list) else []
+        if not isinstance(mems, list):
+            return []
+        # 返回浅拷贝副本：调用方（_touch_many 等）会在元素上原地修改，
+        # 不能直接暴露缓存的原始列表（会污染后续命中的缓存读取）
+        return [dict(m) if isinstance(m, dict) else m for m in mems]
 
     def _save(self, mems: list[dict]) -> bool:
+        self._cache = None  # 写盘后失效缓存，下次读取重新加载
         return _atomic_write(self.path, {"version": 1, "memories": mems})
 
     # -- 检索 --
     def search(self, query: str, top_k: int = _MEMORY_TOP_K_DEFAULT) -> list[dict]:
         """按 关键词命中 + importance + 新鲜度 打分取 top_k。无结果时返回 []。
 
-        只读操作不加锁：load 每次读原子写入的文件快照，最坏读到写前/写后的
-        一致状态；加锁反而会与后台后处理写入竞争拖慢对话主链路。"""
+        打分阶段不加锁读快照；命中条目在返回前经 _touch_many 持锁批量刷新
+        last_hit/hit_count（一次写盘），保证高频回忆的记忆不因时间衰减被淘汰。"""
         if not query or not query.strip():
             return []
         q_sh = _shingles(query)
@@ -174,7 +211,7 @@ class MemoryStore:
                 age_days = max(0.0, (now - last_hit.timestamp()) / 86400)
                 recency = max(0.0, 1.0 - age_days / 100.0)
             score = 0.5 * (1.0 if overlap > 0 or sim > 0.4 else 0.0) \
-                + 0.3 * float(m.get("importance", 0.3)) \
+                + 0.3 * _fnum(m.get("importance", 0.3), 0.3) \
                 + 0.2 * recency
             if score > 0.05:
                 scored.append((score, m))
@@ -188,7 +225,29 @@ class MemoryStore:
                 picked.append((score, m))
             if len(picked) >= top_k:
                 break
+        # 命中即刷新 last_hit/hit_count：高频回忆的老记忆不应按创建时间衰减被淘汰
+        self._touch_many([m.get("id") for _, m in picked if m.get("id")])
         return [dict(m) for _, m in picked]
+
+    def _touch_many(self, ids: list[str]) -> None:
+        """检索命中后批量刷新 last_hit/hit_count（一次读盘一次写盘，失败静默）。"""
+        if not ids:
+            return
+        try:
+            with self._lock:
+                mems = self.load()
+                idset = set(ids)
+                now_iso = _iso()
+                hit = False
+                for m in mems:
+                    if m.get("id") in idset:
+                        m["last_hit"] = now_iso
+                        m["hit_count"] = int(_fnum(m.get("hit_count", 1), 1)) + 1
+                        hit = True
+                if hit:
+                    self._save(mems)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("touch_many skipped: %s", exc)
 
     # -- 写入（去重） --
     def add(self, text: str, importance: float = 0.5, tags: list[str] | None = None,
@@ -220,10 +279,10 @@ class MemoryStore:
                     if _DUP_LEN_RATIO[0] <= ratio <= _DUP_LEN_RATIO[1]:
                         # 更新：提升 importance、合并 tags、刷新时间戳（保留原 id）
                         old["text"] = text
-                        old["importance"] = max(float(old.get("importance", 0.3)), importance)
+                        old["importance"] = max(_fnum(old.get("importance", 0.3), 0.3), importance)
                         old["tags"] = list(dict.fromkeys((old.get("tags") or []) + (tags or [])))
                         old["last_hit"] = now_iso
-                        old["hit_count"] = int(old.get("hit_count", 1)) + 1
+                        old["hit_count"] = int(_fnum(old.get("hit_count", 1), 1)) + 1
                         self._save(mems)
                         return True
             mems.append({
@@ -244,7 +303,7 @@ class MemoryStore:
     @staticmethod
     def _score_for_evict(m: dict) -> float:
         """裁剪排序分：importance × 新鲜度（新鲜度 60 天线性衰减到 0）。"""
-        imp = float(m.get("importance", 0.3))
+        imp = _fnum(m.get("importance", 0.3), 0.3)
         last_hit = _parse_iso(m.get("last_hit"))
         recency = 1.0
         if last_hit:
@@ -259,7 +318,7 @@ class MemoryStore:
             for m in mems:
                 if m.get("id") == mem_id:
                     m["last_hit"] = _iso()
-                    m["hit_count"] = int(m.get("hit_count", 1)) + 1
+                    m["hit_count"] = int(_fnum(m.get("hit_count", 1), 1)) + 1
                     return self._save(mems)
             return False
 
@@ -279,9 +338,24 @@ class StateStore:
         if not self.path.resolve().is_relative_to(root):
             raise ValueError(f"illegal role path: {self.path}")
         self._lock = threading.RLock()
+        # mtime 失效缓存：chat 主链路每次请求 get_decayed → load，
+        # 命中缓存省读盘（load 每次构建全新 merged 返回，天然不污染缓存）
+        self._cache: tuple[int, dict] | None = None
+
+    def _load_cached(self) -> dict:
+        try:
+            mtime = self.path.stat().st_mtime_ns
+        except OSError:
+            self._cache = None
+            return dict(DEFAULT_STATE)
+        if self._cache is not None and self._cache[0] == mtime:
+            return self._cache[1]
+        data = _safe_load(self.path, dict(DEFAULT_STATE))
+        self._cache = (mtime, data)
+        return data
 
     def load(self) -> dict:
-        data = _safe_load(self.path, dict(DEFAULT_STATE))
+        data = self._load_cached()
         # 兼容缺字段：补默认
         emo = data.get("emotion") or {}
         merged = dict(DEFAULT_STATE)
@@ -305,6 +379,7 @@ class StateStore:
         return merged
 
     def _save(self, state: dict) -> bool:
+        self._cache = None  # 写盘后失效缓存
         return _atomic_write(self.path, state)
 
     def get_decayed(self) -> dict:
@@ -596,7 +671,8 @@ class PostProcessor:
             ])
             return self._parse(raw)
         except Exception as exc:  # noqa: BLE001
-            _log.debug("post_process skipped: %s", exc)
+            # warning 级：持续失败（key 失效/超时）时默认可日志可见，避免引擎静默坏死
+            _log.warning("post_process skipped: %s", exc)
             return None
 
     @staticmethod
@@ -653,8 +729,14 @@ class PostProcessor:
             energy_delta = float(data.get("energy_delta", 0))
         except (TypeError, ValueError):
             valence, arousal, energy_delta = 0.0, 0.0, 0.0
+        # 精力增量限速：与情绪平滑同量级，防 LLM 输出大数值瞬间打满/清零
+        energy_delta = max(-_EMO_MAX_DELTA, min(_EMO_MAX_DELTA, energy_delta))
+        # memories 必须是 list：LLM 输出成字符串/dict 时逐字符迭代会产生单字垃圾记忆
+        mems = data.get("memories")
+        if not isinstance(mems, list):
+            mems = []
         return {
             "emotion": {"valence": valence, "arousal": arousal},
             "energy_delta": energy_delta,
-            "memories": [t for t in (data.get("memories") or []) if isinstance(t, str) and t.strip()][:5],
+            "memories": [t for t in mems if isinstance(t, str) and t.strip()][:5],
         }

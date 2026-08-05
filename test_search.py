@@ -77,7 +77,8 @@ def test_chat_search_loop():
     search_calls = []
 
     async def fake_llm(messages, temperature=0.8, max_tokens=768, model=None,
-                       disable_thinking=False, thinking=None, anti_repeat=False):
+                       disable_thinking=False, thinking=None, anti_repeat=False,
+                       cfg=None):
         llm_calls.append(messages)
         if len(llm_calls) == 1:
             return "[style:自然][search:成都AG超玩会 大帅 最新比赛]"

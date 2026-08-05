@@ -12,6 +12,7 @@ import asyncio
 import base64
 import binascii
 import copy
+import gzip
 import hashlib
 import hmac
 import json
@@ -206,6 +207,14 @@ def _norm_tombstones(items, now_ms: float) -> dict:
     return out
 
 
+def _sess_updated_at(s: dict) -> float:
+    """会话 updatedAt 规范化：非数字（畸形数据）按 0 处理，避免 str/int 混比抛 TypeError。"""
+    try:
+        return float(s.get("updatedAt") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
     """多端合并：按 id 归并（updatedAt 新者胜，平手取 incoming），再按墓碑过滤。
 
@@ -219,18 +228,18 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
         if not isinstance(sid, str) or not sid:
             continue
         old = by_id.get(sid)
-        if old is None or (s.get("updatedAt") or 0) >= (old.get("updatedAt") or 0):
+        if old is None or _sess_updated_at(s) >= _sess_updated_at(old):
             by_id[sid] = s
     out = []
     for sid, s in by_id.items():
         ts = tombstones.get(sid)
         if ts is None:
             out.append(s)
-        elif (s.get("updatedAt") or 0) > ts:
+        elif _sess_updated_at(s) > ts:
             tombstones.pop(sid, None)
             out.append(s)
         # 其余：最后更新早于删除时间 → 维持删除状态
-    out.sort(key=lambda s: s.get("updatedAt") or 0, reverse=True)
+    out.sort(key=_sess_updated_at, reverse=True)
     return out[:500]
 
 
@@ -310,13 +319,29 @@ def _backup_sessions_before_destructive(current: list, merged: list) -> None:
     import shutil
     shutil.copy2(SESSIONS_PATH, bak)
     _log.warning("sessions backed up to %s before destructive merge", bak.name)
+    # 备份轮换：只保留最近 10 份，避免异常复发时备份无限堆积（单份可达 32MB）
+    try:
+        baks = sorted(SESSIONS_PATH.parent.glob("sessions.json.bak-*"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        for old_bak in baks[10:]:
+            old_bak.unlink(missing_ok=True)
+    except OSError as exc:
+        _log.warning("sessions backup rotate failed: %s", exc)
 
 # fire-and-forget 后台任务引用集：asyncio.create_task 的返回值若无人持有会被 GC 提前回收，
 # 导致清理任务中途消失；这里持有强引用，任务结束后自动从集合移除。
 _bg_tasks: set[asyncio.Task] = set()
 
 
+# 后台任务积压上限：异常场景下（如模型持续超时导致大量后处理任务堆积）
+# 防止 _bg_tasks 集合无限增长拖垮进程；达到上限时丢弃新任务并告警。
+_BG_TASKS_MAX = 200
+
+
 def _spawn_bg(coro) -> None:
+    if len(_bg_tasks) >= _BG_TASKS_MAX:
+        _log.warning("bg task backlog full (%d), dropping task", len(_bg_tasks))
+        return
     task = asyncio.create_task(coro)
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
@@ -400,6 +425,23 @@ _CLOUD_PROVIDER_ENV = {
 _ALIYUN_ENV_KEYS = ("ALIYUN_API_KEY", "DASHSCOPE_API_KEY")
 _MINIMAX_ENV_KEYS = ("MINIMAX_API_KEY",)
 
+# env 覆盖结果缓存：load_config(with_env=True) 每次都对整个 config deepcopy + 读 env，
+# chat 链路上一次请求会调用 3~4 次（chat → llm_chat/llm_chat_stream → 搜索/续写）。
+# env 只在进程启动后改变，签名 = (config mtime, 相关 env 值)；两者都没变时直接复用
+# 上次的合并结果，把每次请求的 deepcopy 开销归零。
+_env_keys_all = tuple(sorted(
+    set(_CLOUD_PROVIDER_ENV.values()) | set(_ALIYUN_ENV_KEYS) | set(_MINIMAX_ENV_KEYS)
+))
+# 缓存 key = (config mtime, env 签名, config 对象身份)：生产路径下 load_config
+# 命中 mtime 缓存时返回同一对象（id 稳定），env 签名不变即可复用合并结果；
+# 对象身份参与 key 保证任何调用方传入不同 cfg 时绝不串缓存。
+_env_override_cache: dict = {"key": None, "value": None}
+
+
+def _env_override_signature() -> str:
+    """所有参与合并的 env 变量值签名：env 未变化时签名不变。"""
+    return "|".join(f"{k}={os.getenv(k) or ''}" for k in _env_keys_all)
+
 
 def _env_aliyun_key() -> str:
     for name in _ALIYUN_ENV_KEYS:
@@ -417,14 +459,22 @@ def _env_minimax_key() -> str:
     return ""
 
 
-def _apply_env_overrides(cfg: dict) -> dict:
+def _apply_env_overrides(cfg: dict, mtime_ns: int = 0) -> dict:
     """把 .env / config.json 里各供应商的密钥合并进配置副本。
 
     每个 cloud provider 的 api_key 独立保存在 cloud_providers.<provider>.api_key，
     当前生效的 cloud.api_key 永远取「当前 provider 自己的 key」：provider 条目
     优先，其次对应 .env 变量，最后才兼容旧 config 的 cloud.api_key。这样切到
     deepseek 时绝不会拿 MIMO_API_KEY 去调 DeepSeek 接口，避免 401/空回复。
-    只在副本上改，不碰缓存本体，避免 update_config/roles_apply 把 env 密钥误持久化。"""
+    只在副本上改，不碰缓存本体，避免 update_config/roles_apply 把 env 密钥误持久化。
+    mtime_ns 为 config 的 mtime（load_config 已 stat 过，直接复用省一次 syscall）；
+    合并结果按 (mtime, env 签名) 缓存，命中时零 deepcopy。调用方只读返回值，
+    不得原地修改（会污染共享缓存）。"""
+    sig = _env_override_signature()
+    cached = _env_override_cache
+    ck = (mtime_ns, sig, id(cfg))
+    if cached["key"] == ck and cached["value"] is not None:
+        return cached["value"]
     out = copy.deepcopy(cfg)
     cloud_cfg = out.get("cloud") or {}
     cloud_provider = cloud_cfg.get("provider", "") or "custom"
@@ -456,6 +506,8 @@ def _apply_env_overrides(cfg: dict) -> dict:
     if minimax_key:
         voice["minimax"] = {**voice.get("minimax", {}), "api_key": minimax_key}
     out["voice"] = voice
+    _env_override_cache["key"] = ck
+    _env_override_cache["value"] = out
     return out
 
 
@@ -492,7 +544,7 @@ def load_config(with_env: bool = True) -> dict:
             return _default_config
         _cfg_cache["_mtime_ns"] = mtime
     cfg = _cfg_cache["_value"]
-    return _apply_env_overrides(cfg) if with_env else cfg
+    return _apply_env_overrides(cfg, mtime_ns=mtime) if with_env else cfg
 
 
 async def _save_config_locked(cfg: dict) -> None:
@@ -648,22 +700,47 @@ _LOCATION_DEFAULT = {
 }
 
 
+# ---- 小 JSON 文件 mtime 失效缓存 ----
+# location.json / role_news.json 在 chat 主链路每次请求都会被读取，
+# 直接 stat mtime 命中缓存即可把每次请求的读盘+解析归零；写盘后显式失效。
+_small_file_cache: dict[str, tuple[int, dict]] = {}
+
+
+def _memo_file_json(path: Path, default: dict) -> dict:
+    """读取小型 JSON 文件（mtime 失效缓存）。文件缺失/损坏返回 default 的副本。"""
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        return dict(default)
+    hit = _small_file_cache.get(str(path))
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return dict(default)
+    if not isinstance(data, dict):
+        return dict(default)
+    _small_file_cache[str(path)] = (mtime, data)
+    return data
+
+
+def _invalidate_memo(path: Path) -> None:
+    _small_file_cache.pop(str(path), None)
+
+
 def _load_auto_location() -> dict:
     """读取 data/location.json（自动定位结果），损坏/缺失返回默认（并尝试重置）。"""
-    try:
-        if _LOCATION_FILE.exists():
-            data = json.loads(_LOCATION_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-        _log.warning("location.json load failed (%s), resetting", exc)
-    try:
-        _LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _LOCATION_FILE.write_text(
-            json.dumps(_LOCATION_DEFAULT, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-    return dict(_LOCATION_DEFAULT)
+    data = _memo_file_json(_LOCATION_FILE, _LOCATION_DEFAULT)
+    if data == _LOCATION_DEFAULT:
+        # 文件缺失或损坏：尝试重置默认值（幂等，失败静默，不影响主链路）
+        try:
+            _LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _LOCATION_FILE.write_text(
+                json.dumps(_LOCATION_DEFAULT, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    return data
 
 
 def _save_auto_location(data: dict) -> bool:
@@ -673,6 +750,7 @@ def _save_auto_location(data: dict) -> bool:
         tmp = _LOCATION_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(_LOCATION_FILE)
+        _invalidate_memo(_LOCATION_FILE)
         return True
     except OSError as exc:
         _log.warning("save location failed: %s", exc)
@@ -811,13 +889,15 @@ def _location_text() -> str:
     return s["effective"] if s["enabled"] else ""
 
 
-def _location_hint() -> str:
+def _location_hint(s: dict | None = None) -> str:
     """生成「用户当前所在位置」显式指令，追加到 system prompt 末尾。
 
     与 _time_hint 同思路：位置是系统提供的唯一可信来源，放在注意力最高的位置，
     避免模型无视中段位置层、凭对话语境瞎猜用户在哪。
+    调用方已算过 _location_summary 时直接传入，避免一次请求重复读盘。
     """
-    s = _location_summary()
+    if s is None:
+        s = _location_summary()
     loc = s["effective"] if s["enabled"] else ""
     if not loc:
         return ""
@@ -1311,14 +1391,11 @@ def _role_news_config(cfg: dict | None = None) -> tuple[str, str]:
 
 
 def _load_role_news() -> dict:
-    try:
-        if _ROLE_NEWS_FILE.exists():
-            d = json.loads(_ROLE_NEWS_FILE.read_text(encoding="utf-8"))
-            if isinstance(d, dict) and d.get("text"):
-                return d
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-        _log.debug("role_news.json load failed: %s", exc)
-    return dict(_ROLE_NEWS_DEFAULT)
+    """读取角色现实动态缓存（mtime 失效缓存，chat 主链路每请求调用不重复读盘）。"""
+    data = _memo_file_json(_ROLE_NEWS_FILE, _ROLE_NEWS_DEFAULT)
+    if not data.get("text"):
+        return dict(_ROLE_NEWS_DEFAULT)
+    return data
 
 
 def _save_role_news(d: dict) -> None:
@@ -1327,6 +1404,7 @@ def _save_role_news(d: dict) -> None:
         tmp = _ROLE_NEWS_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(_ROLE_NEWS_FILE)
+        _invalidate_memo(_ROLE_NEWS_FILE)
     except OSError as exc:
         _log.debug("role_news save failed: %s", exc)
 
@@ -1413,9 +1491,11 @@ def _role_news_text() -> str:
     return ""
 
 
-def _role_news_hint() -> str:
-    """生成「你最近在忙什么（现实动态）」显式指令，追加到 system prompt 末尾。"""
-    text = _role_news_text()
+def _role_news_hint(text: str | None = None) -> str:
+    """生成「你最近在忙什么（现实动态）」显式指令，追加到 system prompt 末尾。
+    调用方已取过动态文案时直接传入，避免一次请求重复读盘。"""
+    if text is None:
+        text = _role_news_text()
     if not text:
         return ""
     return (
@@ -1810,11 +1890,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="AI 拟人系统", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    # 已启用访问口令保护（见下方 access_gate 中间件），可安全放开跨域；
-    # 页面与 API 同源访问时不受影响，口令校验兜底。
+    # 跨域放开仅在配置访问口令时安全（见下方 access_gate 中间件）；
+    # 无口令模式下 access_gate 会拒绝带跨源 Origin 的请求兜底。
     allow_origins=["*"],
     allow_methods=["*"], allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    """兜底异常处理器：未捕获异常记录完整 traceback（便于远程排查），
+    并返回统一 JSON 错误格式（不泄露内部细节）。不影响 SSE 流内错误
+    （流内异常由各生成器自行 try/except 处理）。"""
+    _log.error("unhandled exception on %s %s: %s",
+               request.method, request.url.path, exc, exc_info=True)
+    return JSONResponse({"detail": "服务器内部错误，请稍后重试"}, status_code=500)
 
 
 # ------------------------------------------------------------ 访问口令 --------
@@ -1854,8 +1944,25 @@ def _auth_ok(request: Request, token: str) -> bool:
 @app.middleware("http")
 async def access_gate(request: Request, call_next):
     """全局访问门禁：配置了口令时，除健康检查与登录页外均需通过校验。"""
+    # 请求体提前限量：Starlette 会把 JSON body 全量读进内存再解析，
+    # 在 Content-Length 层提前拒绝，防超大 body 耗尽内存。
+    # multipart 上传走流式落盘、自带单文件上限，不在此限（上限取 40MB > sessions 允许的 32MB）。
+    cl = request.headers.get("content-length")
+    if cl and "multipart/form-data" not in (request.headers.get("content-type") or ""):
+        try:
+            if int(cl) > 40 * 1024 * 1024:
+                return JSONResponse({"detail": "请求体过大（上限 40MB）"}, status_code=413)
+        except ValueError:
+            pass
     token = _access_token()
     if not token:
+        # 无口令模式（纯本机直连）收紧跨域：拒绝 Origin 与 Host 不一致的请求，
+        # 防止恶意网页经浏览器跨域驱动本机全部 API（烧配额/塞磁盘/读配置）。
+        origin = request.headers.get("origin")
+        if origin:
+            o_netloc = urlparse(origin).netloc
+            if o_netloc and o_netloc != request.headers.get("host", ""):
+                return JSONResponse({"detail": "未配置访问口令时禁止跨源访问"}, status_code=403)
         return await call_next(request)
     path = request.url.path
     if path in ("/api/health", "/api/login", "/login"):
@@ -1942,6 +2049,8 @@ async def login_page():
 async def login_api(req: Request, payload: LoginRequest):
     token = _access_token()
     if not token or not hmac.compare_digest(payload.token.strip(), token):
+        # 固定退避：经隧道暴露公网时显著拖慢在线爆破
+        await asyncio.sleep(1.0)
         raise HTTPException(401, "访问口令错误")
     resp = JSONResponse({"ok": True})
     resp.set_cookie(_COOKIE_NAME, token, httponly=True, samesite="lax",
@@ -2046,13 +2155,16 @@ def _estimate_max_tokens(user_text: str, provider: str) -> int:
 
 async def llm_chat(messages: list[dict], temperature: float = 0.8, max_tokens: int = 768,
                    model: str | None = None, disable_thinking: bool = False,
-                   thinking: bool | None = None, anti_repeat: bool = False) -> str:
+                   thinking: bool | None = None, anti_repeat: bool = False,
+                   cfg: dict | None = None) -> str:
     """按 config 里的 provider 调用本地 llama-server 或云端 OpenAI 兼容 API。
 
     temperature/max_tokens/model 可覆盖：对话用默认值；角色引擎后处理传
     disable_thinking=True 强制模型直接输出正文 JSON，避免 deepseek-v4-flash
-    思考过程吃光 max_tokens 导致 content 为空；thinking 显式覆盖 config 开关。"""
-    cfg = load_config()
+    思考过程吃光 max_tokens 导致 content 为空；thinking 显式覆盖 config 开关。
+    cfg 由调用方传入时复用（chat 链路上一次请求只 load_config 一次），
+    缺省才内部加载。"""
+    cfg = cfg if cfg is not None else load_config()
     provider = cfg.get("provider", "cloud")
     if provider not in ("local", "cloud"):
         raise HTTPException(400, f"未知 provider: {provider}")
@@ -2157,14 +2269,16 @@ async def llm_chat(messages: list[dict], temperature: float = 0.8, max_tokens: i
 
 async def llm_chat_stream(messages: list[dict], temperature: float = 0.8, max_tokens: int = 768,
                           model: str | None = None, disable_thinking: bool = False,
-                          thinking: bool | None = None, anti_repeat: bool = False):
+                          thinking: bool | None = None, anti_repeat: bool = False,
+                          cfg: dict | None = None):
     """流式版 llm_chat：逐个 yield content delta（含最终的空正文 reasoning 兜底）。
 
     与 llm_chat 共享 payload/超时/错误语义，但 SSE 场景无法撤回已输出的内容，
     因此重试仅限「尚未输出任何 delta」的阶段；一旦开始输出，中途断流直接抛错，
     由调用方把已生成部分保留并提示失败。thinking 模型的 reasoning_content 不
-    yield（用户看到的是正文），仅当全文为空时兜底输出一次 reasoning。"""
-    cfg = load_config()
+    yield（用户看到的是正文），仅当全文为空时兜底输出一次 reasoning。
+    cfg 由调用方传入时复用（与 llm_chat 相同，避免链路上重复 load_config）。"""
+    cfg = cfg if cfg is not None else load_config()
     provider = cfg.get("provider", "cloud")
     if provider not in ("local", "cloud"):
         raise HTTPException(400, f"未知 provider: {provider}")
@@ -2349,10 +2463,15 @@ async def _search_duckduckgo(query: str, timeout: float = 15.0) -> list[dict]:
         follow_redirects=True,
     )
     r.raise_for_status()
-    parser = _DDGResultParser()
-    parser.feed(r.text)
-    parser.close()
-    return parser.results
+
+    def _parse() -> list[dict]:
+        # 50-150KB HTML 走纯 Python HTMLParser，是纯 CPU 工作，丢线程池不卡事件循环
+        parser = _DDGResultParser()
+        parser.feed(r.text)
+        parser.close()
+        return parser.results
+
+    return await asyncio.to_thread(_parse)
 
 
 async def _search_bing_rss(query: str, timeout: float = 15.0) -> list[dict]:
@@ -2485,7 +2604,7 @@ async def _chat_with_search(
     searched = False
     last_raw = ""
     for _ in range(max_rounds + 1):
-        last_raw = await llm_chat(messages, temperature=temperature, anti_repeat=anti_repeat, **extra)
+        last_raw = await llm_chat(messages, temperature=temperature, anti_repeat=anti_repeat, cfg=cfg, **extra)
         query = _extract_search_query(last_raw)
         if not query:
             break
@@ -2508,6 +2627,7 @@ async def _extend_long_form(
     user_content: str,
     target_chars: float,
     max_tokens: int,
+    cfg: dict | None = None,
 ) -> str:
     """长文续写：回复离用户要求的字数还远时，让模型从上文结尾接着写。
 
@@ -2536,7 +2656,7 @@ async def _extend_long_form(
             ]
         )
         try:
-            chunk = await llm_chat(messages, max_tokens=max_tokens, thinking=False)
+            chunk = await llm_chat(messages, max_tokens=max_tokens, thinking=False, cfg=cfg)
         except HTTPException as exc:
             _log.warning("long-form continuation aborted: %s", exc)
             break
@@ -2914,8 +3034,15 @@ async def asr_transcribe_serial(audio_path: Path) -> str:
 async def llm_models(req: dict):
     """从云端 API 的 /models 接口拉取可用模型列表（用于"获取模型列表"按钮）。"""
     cfg = load_config()
-    base_url = (req.get("base_url") or cfg.get("cloud", {}).get("base_url", "")).rstrip("/")
-    api_key = req.get("api_key") or cfg.get("cloud", {}).get("api_key", "")
+    cfg_base = cfg.get("cloud", {}).get("base_url", "").rstrip("/")
+    req_base = (req.get("base_url") or "").rstrip("/")
+    base_url = req_base or cfg_base
+    api_key = req.get("api_key") or ""
+    if not api_key:
+        # 仅当请求未指定 base_url 或与已配置地址一致时才复用服务端密钥，
+        # 防止已配置的云端密钥随 Authorization 头发往请求方指定的任意 URL（SSRF 外泄）
+        if not req_base or req_base == cfg_base:
+            api_key = cfg.get("cloud", {}).get("api_key", "")
     if not base_url:
         raise HTTPException(400, "请先填写云端 API 地址")
     try:
@@ -3045,8 +3172,9 @@ async def _try_vision_chat(system: dict, history: list[dict], req: ChatRequest, 
         mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
         try:
             # 图片单张可达 15MB：读盘+base64 编码放线程池，避免事件循环被同步 IO 卡住
-            img_bytes = await asyncio.to_thread(path.read_bytes)
-            b64 = base64.b64encode(img_bytes).decode("ascii")
+            def _read_b64() -> str:
+                return base64.b64encode(path.read_bytes()).decode("ascii")
+            b64 = await asyncio.to_thread(_read_b64)
         except OSError:
             continue
         content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
@@ -3319,7 +3447,7 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
         last_flush = time.monotonic()
         try:
             async for piece in llm_chat_stream(
-                messages, max_tokens=out_tokens, thinking=chat_thinking,
+                messages, max_tokens=out_tokens, thinking=chat_thinking, cfg=cfg,
             ):
                 round_buf += piece
                 if round_no == 0:
@@ -3384,7 +3512,7 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
                 cbuf_t = time.monotonic()
                 try:
                     async for piece in llm_chat_stream(
-                        cont_msgs, max_tokens=out_tokens, thinking=False,
+                        cont_msgs, max_tokens=out_tokens, thinking=False, cfg=cfg,
                     ):
                         chunk_len += len(piece)
                         full += piece
@@ -3425,7 +3553,8 @@ async def chat(req: ChatRequest):
     # 角色引擎：启用时把 时间层/状态层/记忆层 上下文注入 system prompt（前端零改动）
     engine_cfg = cfg.get("role_engine") or {}
     engine_on = bool(engine_cfg.get("enabled", True))
-    location_text = _location_text()  # 位置感知：空串 = 位置未知，不注入
+    location_summary = _location_summary()  # 位置感知：一次请求只读盘一次，hint 复用
+    location_text = location_summary["effective"] if location_summary["enabled"] else ""
     weather_text = _weather_text()    # 天气感知：依赖位置，空串 = 未获取到，不注入
     self_loc, self_rec = _self_config(cfg)  # 角色自况：自己此刻在哪、最近在忙什么
     news_text = _role_news_text()            # 角色现实动态：联网搜索的真实最近消息
@@ -3460,8 +3589,8 @@ async def chat(req: ChatRequest):
     # 时间指令放 system 末尾：模型对末尾内容注意力最高，避免中段的时间层被忽略、顺着语境编造时间
     system = {"role": "system",
               "content": persona + ctx_block + _META_HINT + style_hint + search_hint
-                         + _time_hint() + _self_hint() + _role_news_hint()
-                         + _location_hint() + _weather_hint()}
+                         + _time_hint() + _self_hint() + _role_news_hint(news_text)
+                         + _location_hint(location_summary) + _weather_hint()}
     provider = cfg.get("provider", "cloud")
     # 云端模型上下文窗口大，超长历史回复全文保留利于追问；本地小上下文才截断
     history = _clean_history(req.history, user_text, clip_long_replies=(provider == "local"))
@@ -3507,7 +3636,7 @@ async def chat(req: ChatRequest):
     if out_tokens > _DEFAULT_MAX_TOKENS:
         raw = await _extend_long_form(
             raw, system, history, user_content,
-            _requested_char_count(user_text), out_tokens,
+            _requested_char_count(user_text), out_tokens, cfg,
         )
     fallback_style = cfg.get("voice", {}).get("style") or "自然"
     style, reply = parse_style_prefix(raw, fallback=fallback_style)
@@ -3693,7 +3822,8 @@ async def role_greeting():
     persona = current_persona(cfg)
     # 组装上下文（和 /api/chat 同一套，但不带用户消息 -- 这是主动开口）
     ctx_block = ""
-    location_text = _location_text()
+    location_summary = _location_summary()
+    location_text = location_summary["effective"] if location_summary["enabled"] else ""
     weather_text = _weather_text()
     self_loc, self_rec = _self_config(cfg)
     news_text = _role_news_text()
@@ -3718,8 +3848,8 @@ async def role_greeting():
     )
     system = {"role": "system",
               "content": persona + ctx_block + _META_HINT + greeting_instruction + style_hint
-                         + _time_hint() + _self_hint() + _role_news_hint()
-                         + _location_hint() + _weather_hint()}
+                         + _time_hint() + _self_hint() + _role_news_hint(news_text)
+                         + _location_hint(location_summary) + _weather_hint()}
     messages = [system, {"role": "user", "content": "（你主动发消息给老公）"}]
     raw = await llm_chat(messages)
     fallback_style = cfg.get("voice", {}).get("style") or "自然"
@@ -3736,6 +3866,9 @@ async def tts(req: dict):
     text = (req.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "文本不能为空")
+    # 长度上限：长文按段切分后逐段走云端计费接口，无上限会被放大消耗费用与磁盘
+    if len(text) > 5000:
+        raise HTTPException(400, "文本过长（上限 5000 字）")
     style = (req.get("style") or "").strip()
     try:
         speed = float(req.get("speed") or 1.0)
@@ -3768,7 +3901,8 @@ async def get_sessions():
     if mtime != _sess_cache["_mtime_ns"]:
         try:
             raw = await asyncio.to_thread(SESSIONS_PATH.read_text, encoding="utf-8")
-            data = json.loads(raw)
+            # 大文件解析是纯 CPU，丢线程池避免阻塞事件循环（SSE 流会跟着卡）
+            data = await asyncio.to_thread(json.loads, raw)
             sessions = data.get("sessions")
             deleted = data.get("deleted")
             value = {
@@ -3808,10 +3942,21 @@ async def put_sessions(req: SessionsRequest, client: str = ""):
     async with _io_locks["sessions"]:
         current: list = []
         file_deleted: list = []
-        if SESSIONS_PATH.exists():
+        # 内存基底优化：磁盘 mtime 与缓存一致时直接用缓存里的完整状态做合并基底，
+        # 省掉每次 PUT 的全量读盘+JSON 解析（sessions.json 可达数 MB，是多端
+        # 同步频繁写入时的主要开销）；mtime 变化（本进程外的写入）才重新读盘。
+        try:
+            disk_mtime = SESSIONS_PATH.stat().st_mtime_ns if SESSIONS_PATH.exists() else 0
+        except OSError:
+            disk_mtime = 0
+        cached_val = _sess_cache.get("_value")
+        if disk_mtime and disk_mtime == _sess_cache.get("_mtime_ns") and isinstance(cached_val, dict):
+            current = list(cached_val.get("sessions") or [])
+            file_deleted = list(cached_val.get("deleted") or [])
+        elif SESSIONS_PATH.exists():
             try:
                 raw = await asyncio.to_thread(SESSIONS_PATH.read_text, encoding="utf-8")
-                data = json.loads(raw)
+                data = await asyncio.to_thread(json.loads, raw)
                 if isinstance(data.get("sessions"), list):
                     current = data["sessions"]
                 if isinstance(data.get("deleted"), list):
@@ -3911,7 +4056,8 @@ async def asr(file: UploadFile = File(...)):
                 total += len(chunk)
                 if total > _MAX_ASR_UPLOAD_BYTES:
                     raise HTTPException(413, f"上传文件过大（上限 {_MAX_ASR_UPLOAD_BYTES // 1024 // 1024}MB）")
-                fout.write(chunk)
+                # 同步写盘丢线程池：Windows 杀软扫描下单次 write 可达数十 ms，会卡住 SSE 流
+                await asyncio.to_thread(fout.write, chunk)
     except HTTPException:
         audio_path.unlink(missing_ok=True)
         raise
@@ -4220,7 +4366,8 @@ async def upload_files(files: list[UploadFile] = File(...)):
                         raise HTTPException(
                             413, f"文件过大（上限 {_MAX_ATTACH_UPLOAD_BYTES // 1024 // 1024}MB）"
                         )
-                    fout.write(chunk)
+                    # 同步写盘丢线程池：Windows 杀软扫描下单次 write 可达数十 ms，会卡住 SSE 流
+                    await asyncio.to_thread(fout.write, chunk)
         except HTTPException:
             dest.unlink(missing_ok=True)
             _cleanup_batch()
@@ -4260,6 +4407,64 @@ async def static_cache_headers(request, call_next):
     elif p.endswith(_LONG_CACHE_EXT):
         response.headers["Cache-Control"] = "public, max-age=604800, immutable"
     return response
+
+
+# ---- GZip 压缩 + 安全响应头 ----
+# 页面 HTML（内联 JS/CSS 可达数百 KB）与 JSON 响应走 gzip 压缩，传输体积通常
+# 下降 70%+。SSE 流（text/event-stream）、音频/图片等二进制资源一律不压缩，
+# 避免流式响应被整体缓冲导致首字延迟（gzip 中间件是 SSE 卡顿的常见元凶）。
+# 只压缩有 Content-Length 且在区间内的响应，防止大文件/无限流被整段读进内存。
+_GZIP_MIN_BYTES = 512
+_GZIP_MAX_BYTES = 8 * 1024 * 1024
+_GZIP_CONTENT_TYPES = {
+    "text/html", "text/css", "text/plain", "application/javascript",
+    "application/json", "image/svg+xml",
+}
+
+
+@app.middleware("http")
+async def gzip_and_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    # 安全响应头：所有响应统一加（幂等，不覆盖已有值）
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    if request.method == "HEAD":
+        return response
+    if response.headers.get("content-encoding"):
+        return response  # 已压缩过（如 FileResponse 自带编码），跳过
+    ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype not in _GZIP_CONTENT_TYPES:
+        return response
+    try:
+        cl = int(response.headers.get("content-length") or 0)
+    except (TypeError, ValueError):
+        cl = 0
+    if cl < _GZIP_MIN_BYTES or cl > _GZIP_MAX_BYTES:
+        return response
+    try:
+        body = b"".join([chunk async for chunk in response.body_iterator])
+    except (RuntimeError, OSError):
+        return response
+    if not body:
+        return response
+    compressed = gzip.compress(body, compresslevel=6)
+    if len(compressed) >= len(body):
+        # 压缩无收益（小 HTML/JSON 常见）：回退原样返回
+        return Response(body, status_code=response.status_code,
+                        headers=dict(response.headers),
+                        media_type=response.media_type)
+    response.headers["content-encoding"] = "gzip"
+    response.headers["content-length"] = str(len(compressed))
+    existing_vary = response.headers.get("vary") or ""
+    if existing_vary:
+        if "accept-encoding" not in existing_vary.lower():
+            response.headers["vary"] = existing_vary + ", Accept-Encoding"
+    else:
+        response.headers["vary"] = "Accept-Encoding"
+    return Response(compressed, status_code=response.status_code,
+                    headers=dict(response.headers),
+                    media_type=response.media_type)
 
 
 # 静态托管新前端（挂在所有 API 路由之后，/api/* 优先匹配，其余走静态文件）

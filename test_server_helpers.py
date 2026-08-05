@@ -84,7 +84,8 @@ def test_retry_guard():
     calls = []
 
     async def fake_chat(messages, temperature=0.8, max_tokens=768, model=None,
-                        disable_thinking=False, thinking=None, anti_repeat=False):
+                        disable_thinking=False, thinking=None, anti_repeat=False,
+                        cfg=None):
         calls.append((temperature, anti_repeat))
         if len(calls) == 1:
             return "[style:自然]老公你这耳朵可真是我的命根子，我这副身子骨全靠你养着呢。"

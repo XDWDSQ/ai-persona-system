@@ -118,21 +118,26 @@ def _process_one_impl(in_path, name, out_dir, session,
 
     # ---- 第一遍：只保留低分辨率 mask（内存 ~0.4MB/帧），算全局 bbox ----
     container = av.open(in_path)
-    stream = container.streams.video[0]
-    W, H = stream.width, stream.height
-    tb = stream.time_base          # 必须在 close 前缓存（close 后旧 stream 属性失效）
-    interval = 1.0 / target_fps
-    next_t, mask_list, k = 0.0, [], 0
-    t0 = time.time()
-    for frame in container.decode(video=0):
-        t = float(frame.pts * tb) if frame.pts is not None else k / target_fps
-        if t < next_t - 1e-6:
-            continue
-        mask_list.append(session.mask(frame.to_image().convert('RGB')))
-        k += 1
-        while next_t <= t + 1e-6:
-            next_t += interval
-    container.close()
+    try:
+        stream = container.streams.video[0]
+        W, H = stream.width, stream.height
+        tb = stream.time_base          # 必须在 close 前缓存（close 后旧 stream 属性失效）
+        interval = 1.0 / target_fps
+        next_t, mask_list, k = 0.0, [], 0
+        kept_ts = []                   # 实际保留帧的时间戳（算真实帧间隔用）
+        t0 = time.time()
+        for frame in container.decode(video=0):
+            t = float(frame.pts * tb) if frame.pts is not None else k / target_fps
+            if t < next_t - 1e-6:
+                continue
+            mask_list.append(session.mask(frame.to_image().convert('RGB')))
+            kept_ts.append(t)
+            k += 1
+            while next_t <= t + 1e-6:
+                next_t += interval
+    finally:
+        # 异常路径也必须 close：否则 Windows 上输入文件被句柄锁定，且解码缓冲累积
+        container.close()
     n = len(mask_list)
     if n == 0:
         print('  × 没读到帧', flush=True)
@@ -167,41 +172,50 @@ def _process_one_impl(in_path, name, out_dir, session,
     # ---- 第二遍：重解码，逐帧精修 alpha + 裁切 + 缩放（内存恒定） ----
     pil_frames = []
     container = av.open(in_path)
-    next_t, k = 0.0, 0
-    for frame in container.decode(video=0):
-        t = float(frame.pts * tb) if frame.pts is not None else k / target_fps
-        if t < next_t - 1e-6:
-            continue
-        if k < n:
-            m = mask_list[k]
-            full = np.asarray(
-                Image.fromarray((m * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR),
-                dtype=np.float32) / 255.0
-            a = refine_alpha(full, alpha_lo, alpha_hi, feather)
-            rgb = frame.to_image().convert('RGB')
-            xs, ys = max(cx - half, 0), max(cy - half, 0)
-            xe, ye = min(cx + half, W), min(cy + half, H)
-            cw, ch = xe - xs, ye - ys
-            rgba = np.zeros((half * 2, half * 2, 4), dtype=np.uint8)
-            # margin<1 或 bbox 贴近边缘时，实际裁切区可能超出画布：clamp 防负索引
-            # （numpy 负索引会从尾部取，静默错乱），超出的部分由切片自动截断
-            px = max(0, (half * 2 - cw) // 2)
-            py = max(0, (half * 2 - ch) // 2)
-            rgba[py:py + ch, px:px + cw, :3] = np.asarray(rgb, dtype=np.uint8)[ys:ye, xs:xe]
-            rgba[py:py + ch, px:px + cw, 3] = (a[ys:ye, xs:xe] * 255).astype(np.uint8)
-            pil_frames.append(Image.fromarray(rgba, 'RGBA').resize(
-                (target_size, target_size), Image.LANCZOS))
-        k += 1
-        while next_t <= t + 1e-6:
-            next_t += interval
-    container.close()
+    try:
+        next_t, k = 0.0, 0
+        for frame in container.decode(video=0):
+            t = float(frame.pts * tb) if frame.pts is not None else k / target_fps
+            if t < next_t - 1e-6:
+                continue
+            if k < n:
+                m = mask_list[k]
+                full = np.asarray(
+                    Image.fromarray((m * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR),
+                    dtype=np.float32) / 255.0
+                a = refine_alpha(full, alpha_lo, alpha_hi, feather)
+                rgb = frame.to_image().convert('RGB')
+                xs, ys = max(cx - half, 0), max(cy - half, 0)
+                xe, ye = min(cx + half, W), min(cy + half, H)
+                cw, ch = xe - xs, ye - ys
+                rgba = np.zeros((half * 2, half * 2, 4), dtype=np.uint8)
+                # margin<1 或 bbox 贴近边缘时，实际裁切区可能超出画布：clamp 防负索引
+                # （numpy 负索引会从尾部取，静默错乱），超出的部分由切片自动截断
+                px = max(0, (half * 2 - cw) // 2)
+                py = max(0, (half * 2 - ch) // 2)
+                rgba[py:py + ch, px:px + cw, :3] = np.asarray(rgb, dtype=np.uint8)[ys:ye, xs:xe]
+                rgba[py:py + ch, px:px + cw, 3] = (a[ys:ye, xs:xe] * 255).astype(np.uint8)
+                pil_frames.append(Image.fromarray(rgba, 'RGBA').resize(
+                    (target_size, target_size), Image.LANCZOS))
+            k += 1
+            while next_t <= t + 1e-6:
+                next_t += interval
+    finally:
+        container.close()
     if not pil_frames:
         print('  × 第二遍没产出帧', flush=True)
         return None
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f'{name}.webp')
-    duration = int(1000 / target_fps)
+    # 帧时长按实际抽样间隔计算：源 fps < target 时固定 1000/target_fps 会让动画加速播放
+    if len(kept_ts) > 1:
+        duration = max(20, int(round(1000 * (kept_ts[-1] - kept_ts[0]) / (len(kept_ts) - 1))))
+        if abs(duration - 1000 / target_fps) > 20:
+            print(f'  ! 实际帧间隔 {duration}ms 与目标 {int(1000/target_fps)}ms 不符'
+                  f'（源帧率低于 --fps？），按实际间隔写入', flush=True)
+    else:
+        duration = int(1000 / target_fps)
     t0 = time.time()
     pil_frames[0].save(
         out_path, 'WEBP', save_all=True, append_images=pil_frames[1:],
@@ -251,6 +265,14 @@ def main():
         tasks.append((args.input, args.name))
     if not tasks:
         print('没有任务。用 --all 或指定 input 文件。'); sys.exit(1)
+
+    # 状态名碰撞预警：同义词文件名（如 大帅悲伤/大帅难过）映射到同一状态会互相覆盖输出
+    seen_names = {}
+    for p, name in tasks:
+        if name in seen_names:
+            print(f'  ! 状态名冲突: {os.path.basename(seen_names[name])} 与 {os.path.basename(p)}'
+                  f' 都映射到 "{name}"，后者会覆盖前者的 webp 输出', flush=True)
+        seen_names[name] = p
 
     session = MattingSession(args.model)
     print(f'计划处理 {len(tasks)} 段：{[n for _, n in tasks]}', flush=True)
