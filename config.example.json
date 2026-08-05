@@ -41,6 +41,14 @@
       "api_key": "",
       "thinking": true
     },
+    "minimax": {
+      "label": "MiniMax",
+      "base_url": "https://api.minimaxi.com/v1",
+      "model": "MiniMax-M2.5",
+      "api_key": "",
+      "thinking": true,
+      "billing_mode": "payg"
+    },
     "custom": {
       "label": "自定义",
       "base_url": "",

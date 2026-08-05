@@ -46,7 +46,6 @@ TOP_DIRS = [
 # data/ 下需要带走的（白名单）
 DATA_KEEP = [
     "sessions.json",
-    "location.json",
     "weather.json",
     "memory",      # 角色长期记忆
     "state",       # 角色状态

@@ -44,6 +44,8 @@ from pydantic import BaseModel
 import role_engine
 from role_engine import MemoryStore, StateStore, PostProcessor
 
+import minimax_llm  # MiniMax 云端文字生成适配器（OpenAI 兼容，payg / token_plan 双计费）
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -413,6 +415,7 @@ _CLOUD_PROVIDER_ENV = {
     "mimo": "MIMO_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "ark": "ARK_API_KEY",
+    "minimax": "MINIMAX_API_KEY",  # 文字模型与语音 TTS 共用同一把 MiniMax Key（含订阅 Key）
 }
 _ALIYUN_ENV_KEYS = ("ALIYUN_API_KEY", "DASHSCOPE_API_KEY")
 _MINIMAX_ENV_KEYS = ("MINIMAX_API_KEY",)
@@ -713,32 +716,13 @@ def _time_anchor(user_content: str) -> str:
 
 
 # ---------------------------------------------------------------- 位置感知 --------
-# 让角色知道用户当前所在位置，与时间层同思路：系统客观事实 + 高注意力位置显式声明。
-# 位置来源优先级：手动设置（config.location.manual）> GPS 上报 > IP 自动定位（城市级）。
-# 手动设置存在 config.json（用户显式配置，跟随配置管理）；GPS/IP 结果存在 data/location.json
-# （自动/临时数据，不污染 config）。任何一步失败都静默降级，绝不影响对话主链路。
-_LOCATION_FILE = DATA_DIR / "location.json"
-# IP 定位接口（按顺序尝试，全部失败则静默降级为「位置未知」）：
-# 1) ip-api.com：免费无需 key（45 次/分钟），返回中文 regionName（如「台北市」）
-# 2) ip.useragentinfo.com：国内直连友好，返回 province/city
-_IP_LOCATE_URLS = (
-    "http://ip-api.com/json/?lang=zh-CN",
-    "https://ip.useragentinfo.com/json",
-)
-_IP_LOCATE_MAX_AGE_H = 24                              # IP 定位结果 24h 内不重复请求
-_LOCATION_DEFAULT = {
-    "version": 1,
-    "city": "",          # 城市级描述（IP 定位 / 手动补充）
-    "lat": None,         # GPS 经纬度（前端上报）
-    "lng": None,
-    "source": "",        # "ip" | "gps"
-    "ip": "",
-    "updated_at": "",
-}
+# 位置感知已下线（2026-08-05）：不再支持 GPS/IP 自动定位。
+# 唯一位置来源 = config.json 的 location.manual（用户手动配置，供天气感知/对话注入读取）；
+# 位置未知时相关功能静默降级，绝不影响对话主链路。
 
 
 # ---- 小 JSON 文件 mtime 失效缓存 ----
-# location.json / role_news.json 在 chat 主链路每次请求都会被读取，
+# role_news.json 在 chat 主链路每次请求都会被读取，
 # 直接 stat mtime 命中缓存即可把每次请求的读盘+解析归零；写盘后显式失效。
 _small_file_cache: dict[str, tuple[int, dict]] = {}
 
@@ -764,41 +748,6 @@ def _memo_file_json(path: Path, default: dict) -> dict:
 
 def _invalidate_memo(path: Path) -> None:
     _small_file_cache.pop(str(path), None)
-
-
-def _load_auto_location() -> dict:
-    """读取 data/location.json（自动定位结果），损坏/缺失返回默认（并尝试重置）。"""
-    data = _memo_file_json(_LOCATION_FILE, _LOCATION_DEFAULT)
-    if data == _LOCATION_DEFAULT:
-        # 文件缺失或损坏：尝试重置默认值（幂等，失败静默，不影响主链路）
-        try:
-            _LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _LOCATION_FILE.write_text(
-                json.dumps(_LOCATION_DEFAULT, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError:
-            pass
-    return data
-
-
-def _save_auto_location(data: dict) -> bool:
-    """原子写 data/location.json，失败返回 False 不抛异常。"""
-    try:
-        _LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _LOCATION_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(_LOCATION_FILE)
-        _invalidate_memo(_LOCATION_FILE)
-        return True
-    except OSError as exc:
-        _log.warning("save location failed: %s", exc)
-        return False
-
-
-def _gps_text(lat: float, lng: float) -> str:
-    """经纬度 → 中文方位描述（无逆地理编码时的兜底文案）。"""
-    ns = "北纬" if lat >= 0 else "南纬"
-    ew = "东经" if lng >= 0 else "西经"
-    return f"{ns}{abs(lat):.2f}°、{ew}{abs(lng):.2f}°附近"
 
 
 def _safe_float(v, default: float = 0.0) -> float:
@@ -838,113 +787,34 @@ def _is_masked_key(value: str) -> bool:
     return bool(value) and str(value).startswith(_KEY_MASK_PREFIX)
 
 
-def _ip_locate() -> dict:
-    """IP 自动定位（城市级）。按 _IP_LOCATE_URLS 顺序尝试，全失败返回空 dict，
-    绝不抛异常（任何主链路都不依赖它）。"""
-    for url in _IP_LOCATE_URLS:
-        try:
-            resp = httpx.get(
-                url, timeout=6.0,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-            )
-            data = resp.json()
-        except Exception as exc:  # noqa: BLE001
-            _log.debug("IP locate %s failed: %s", url, exc)
-            continue
-        if isinstance(data, dict) and data.get("status") not in (None, "success"):
-            continue  # ip-api 返回 status=success 才算成功
-        if not isinstance(data, dict):
-            continue
-        # 兼容两类接口字段：regionName（ip-api）/ province+city（useragentinfo）
-        region = str(data.get("regionName") or "").strip()
-        province = str(data.get("province") or "").strip()
-        city = str(data.get("city") or "").strip()
-        ip = str(data.get("query") or data.get("ip") or "").strip()
-        text = region or city or province
-        if not text:
-            continue
-        return {"city": text, "source": "ip", "ip": ip}
-    return {}
+def _location_city() -> str:
+    """当前生效位置：仅支持 config.location.manual（GPS/IP 自动定位已下线）。
 
-
-async def _bg_ip_locate(force: bool = False) -> None:
-    """后台触发 IP 定位：已有 24h 内结果且非 force 时直接复用，不重复请求。"""
+    空串 = 位置未知（不注入对话、不查天气）。任何异常静默降级为空串，
+    绝不中断对话主链路。"""
     try:
-        if not force:
-            auto = _load_auto_location()
-            if auto.get("source") == "ip" and auto.get("city"):
-                try:
-                    updated = datetime.fromisoformat(auto["updated_at"])
-                    if (datetime.now().astimezone() - updated).total_seconds() < _IP_LOCATE_MAX_AGE_H * 3600:
-                        return  # 24h 内已有结果，不重复定位
-                except (ValueError, TypeError, KeyError):
-                    pass
-        result = await asyncio.to_thread(_ip_locate)
-        if result.get("city"):
-            result["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-            _save_auto_location(result)
-            _log.info("IP located: %s", result.get("city"))
-            # 位置变了 → 天气缓存作废，后台重新拉取
-            _spawn_bg(_bg_weather_refresh(force=True))
-    except Exception as exc:  # noqa: BLE001
-        _log.debug("bg ip locate skipped: %s", exc)
+        cfg = load_config()
+        loc = cfg.get("location") or {}
+        if not loc.get("enabled", True):
+            return ""
+        return str(loc.get("manual") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
-def _location_summary() -> dict:
-    """汇总当前位置：手动（config.location.manual）优先，其次 GPS/IP 自动定位。"""
-    cfg = load_config()
-    loc_cfg = cfg.get("location") or {}
-    manual = str(loc_cfg.get("manual") or "").strip()
-    auto = _load_auto_location()
-    auto_city = str(auto.get("city") or "").strip()
-    auto_src = str(auto.get("source") or "")
-    # GPS 只有经纬度时，用方位文本兜底；有城市描述则优先城市
-    if not auto_city and auto.get("lat") is not None and auto.get("lng") is not None:
-        try:
-            auto_city = _gps_text(_safe_float(auto["lat"]), _safe_float(auto["lng"]))
-            auto_src = "gps"
-        except (TypeError, ValueError):
-            pass  # 经纬度非法 → 按位置未知降级，绝不中断对话主链路
-    if manual:
-        effective, source = manual, "manual"
-    elif auto_city:
-        effective, source = auto_city, (auto_src or "auto")
-    else:
-        effective, source = "", ""
-    return {
-        "enabled": bool(loc_cfg.get("enabled", True)),
-        "manual": manual,
-        "auto": auto if auto_city else {},
-        "effective": effective,
-        "source": source,
-    }
-
-
-def _location_text() -> str:
-    """返回当前生效的位置描述（空串 = 位置未知，不注入）。"""
-    s = _location_summary()
-    return s["effective"] if s["enabled"] else ""
-
-
-def _location_hint(s: dict | None = None) -> str:
+def _location_hint(loc: str = "") -> str:
     """生成「用户当前所在位置」显式指令，追加到 system prompt 末尾。
 
     与 _time_hint 同思路：位置是系统提供的唯一可信来源，放在注意力最高的位置，
-    避免模型无视中段位置层、凭对话语境瞎猜用户在哪。
-    调用方已算过 _location_summary 时直接传入，避免一次请求重复读盘。
+    避免模型无视中段位置层、凭对话语境瞎猜用户在哪。loc 为空串时不注入。
     """
-    if s is None:
-        s = _location_summary()
-    loc = s["effective"] if s["enabled"] else ""
+    loc = (loc or "").strip()
     if not loc:
         return ""
-    src_map = {"manual": "手动设置", "ip": "自动定位（城市级精度）", "gps": "浏览器定位"}
-    src = src_map.get(s["source"], "系统提供")
     return (
-        f"\n\n【用户当前所在位置】{loc}（系统提供，{src}）。"
-        "这是唯一可信的位置来源。当用户提到任何与位置有关的话题（在哪、天气、通勤、出差、"
-        "旅游、附近有什么等）时，以这个位置为参照自然回应；如果用户明确说自己换了位置，"
-        "以用户说的为准，不要与他争执，并在后续对话中记住新位置。"
+        f"\n\n【用户当前所在位置】{loc}（用户手动设置）。"
+        "当用户提到任何与位置有关的话题（在哪、天气、通勤、出差、旅游、附近有什么等）时，"
+        "以这个位置为参照自然回应；如果用户明确说自己换了位置，以用户说的为准，不要与他争执。"
     )
 
 
@@ -1321,20 +1191,16 @@ async def _bg_weather_refresh(force: bool = False) -> str:
         try:
             if not force:
                 snap = _weather_snapshot()
-                s_loc = _location_summary()
-                cur_city = s_loc["effective"] if s_loc["enabled"] else ""
+                cur_city = _location_city()
                 if (snap.get("text") and snap.get("city") == cur_city
                         and (time.time() - _safe_float(snap.get("ts", 0))) < _WEATHER_MAX_AGE_S):
                     return snap["text"]  # 30 分钟内且城市未变 → 直接用缓存
             if not _weather_enabled():
                 return ""
-            s = _location_summary()
-            city = s["effective"] if s["enabled"] else ""
+            city = _location_city()
             if not city:
                 return ""
-            auto = s.get("auto") or {}
-            text = await asyncio.to_thread(
-                _fetch_weather, city, auto.get("lat"), auto.get("lng"))
+            text = await asyncio.to_thread(_fetch_weather, city, None, None)
             if text:
                 d = {"text": text, "ts": time.time(), "city": city}
                 _weather_mem.update(d)
@@ -1407,13 +1273,26 @@ def _self_hint() -> str:
 
 
 # ---------------------------------------------------------------- 角色现实动态 --------
-# 「现实世界的那种」：不是写死的扮演设定，而是联网搜索到的真实最新动态——
+# 「现实世界的那种」：不是写死的扮演设定，而是真实世界的最新动态——
 # 大帅（成都AG超玩会·孟家俊）最近在忙什么、现在可能在哪（比赛/训练/基地）。
-# 流程：web_search 抓取最新资料 → LLM 总结成 2-3 句 → 缓存 12h（data/role_news.json）。
-# 对话主链路只读缓存，刷新全部后台执行；无配置/无结果/任何失败都静默降级，绝不阻塞。
+#
+# v2 多来源聚合 + 分级展示（2026-08-05）：
+#   1) 数据来源：_collect_role_facts() 聚合 5 类现有资料——静态人设(persona)/长期记忆(memory)/
+#      情绪状态(state)/位置天气(location+weather)/联网搜索(web)，单一来源缺失不再判定「无信息」。
+#   2) 分级卡片：confirmed（已确认，有明确证据）/ inferred（推测，标注依据）/ missing（缺失+原因+补充建议）。
+#   3) 缺失日志：每次搜索无结果 / LLM 失败 / 某类别无资料，追加写 data/role_news_missing.log，
+#      便于定位资料库覆盖不足的环节。
+#   4) 刷新机制：12h 缓存 + 定时巡检（_role_news_scheduler 每 4h 检查过期）+ 事件触发
+#      （启动预取 / 切角色 / 手动刷新），全后台执行，对话主链路只读缓存绝不阻塞。
 _ROLE_NEWS_FILE = DATA_DIR / "role_news.json"
+_ROLE_NEWS_LOG_FILE = DATA_DIR / "role_news_missing.log"
 _ROLE_NEWS_MAX_AGE_S = 12 * 3600
-_ROLE_NEWS_DEFAULT = {"version": 1, "role": "", "keyword": "", "text": "", "ts": 0.0}
+_ROLE_NEWS_CHECK_INTERVAL_S = 4 * 3600          # 定时巡检间隔：每 4h 检查缓存是否过期
+_ROLE_NEWS_CATEGORIES = ("当前处境", "近期活动", "关键事件", "人物关系")
+_ROLE_NEWS_DEFAULT = {
+    "version": 2, "role": "", "keyword": "", "summary": "",
+    "cards": [], "timeline": [], "sources": {}, "ts": 0.0,
+}
 
 
 def _role_news_config(cfg: dict | None = None) -> tuple[str, str]:
@@ -1428,11 +1307,32 @@ def _role_news_config(cfg: dict | None = None) -> tuple[str, str]:
 
 
 def _load_role_news() -> dict:
-    """读取角色现实动态缓存（mtime 失效缓存，chat 主链路每请求调用不重复读盘）。"""
+    """读取角色现实动态缓存 v2（mtime 失效缓存，chat 主链路每请求调用不重复读盘）。
+
+    兼容旧版 v1 缓存（只有 text 字段）：读到时原地升级为 v2 结构，避免旧缓存被丢弃。"""
     data = _memo_file_json(_ROLE_NEWS_FILE, _ROLE_NEWS_DEFAULT)
-    if not data.get("text"):
-        return dict(_ROLE_NEWS_DEFAULT)
-    return data
+    if data.get("version") == 2:
+        return data
+    # 旧 v1 缓存升级：text 摘要 → summary，并补一份「已确认」占位卡片
+    text = str(data.get("text") or "").strip()
+    if text:
+        upgraded = dict(_ROLE_NEWS_DEFAULT)
+        upgraded.update({
+            "role": data.get("role", ""),
+            "keyword": data.get("keyword", ""),
+            "summary": text[:300],
+            "ts": _safe_float(data.get("ts")),
+            "cards": [{
+                "id": "legacy", "category": "近期活动", "status": "confirmed",
+                "content": text[:200], "source": "web",
+                "reason": "", "ts": _safe_float(data.get("ts")),
+            }],
+            "sources": {"web": "ok", "persona": "empty", "memory": "empty",
+                        "state": "empty", "location": "empty", "weather": "empty"},
+        })
+        _save_role_news(upgraded)
+        return upgraded
+    return dict(_ROLE_NEWS_DEFAULT)
 
 
 def _save_role_news(d: dict) -> None:
@@ -1446,6 +1346,80 @@ def _save_role_news(d: dict) -> None:
         _log.debug("role_news save failed: %s", exc)
 
 
+def _log_role_news_missing(reason: str, category: str = "", keyword: str = "") -> None:
+    """追加式缺失日志：每次「未找到信息」都留痕，便于定位资料库覆盖不足的环节。
+
+    写入 data/role_news_missing.log（JSON Lines，追加不覆盖），内容含时间/角色/类别/原因。"""
+    try:
+        _ROLE_NEWS_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": time.time(),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "role": _role_news_config()[1],
+            "keyword": keyword or _role_news_config()[0],
+            "category": category,
+            "reason": reason,
+        }
+        with open(_ROLE_NEWS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _collect_role_facts(role_cfg: dict, cfg: dict, role: str) -> dict:
+    """多来源数据聚合：从现有资料库收集角色相关的全部事实，避免单一字段缺失判定「无信息」。
+
+    来源（每项独立 try，单项失败不拖垮整体）：
+      persona —— config.json 角色静态设定（full_name/desc，已确认的身份与履历摘要）
+      memory  —— data/memory/{role}.json 长期记忆（近期几条，已确认的过往经历/关系）
+      state   —— data/state/{role}.json 情绪状态（已确认的当前情绪/精力/亲密度）
+      location—— config.location.manual 手动位置（已确认，未配置则空）
+      weather —— data/weather.json 天气（已确认，未配置位置则空）
+      web     —— 调用方另行传入搜索结果（最新动态）
+    返回 dict，任何来源缺失都返回空容器/空串，绝不抛异常。"""
+    facts: dict = {
+        "persona": [], "memory": [], "state": None,
+        "location": "", "weather": "",
+    }
+    # 1) persona 静态设定
+    try:
+        full = str(role_cfg.get("full_name") or "").strip()
+        desc = str(role_cfg.get("desc") or "").strip()
+        if full:
+            facts["persona"].append(f"身份：{full}")
+        if desc:
+            facts["persona"].append(f"简介：{desc}")
+    except Exception:  # noqa: BLE001
+        pass
+    # 2) 长期记忆（关系记忆）
+    try:
+        mem = _get_role_stores(role)[0].load()
+        recent = sorted(
+            (m for m in mem if str(m.get("text") or "").strip()),
+            key=lambda m: str(m.get("created_at") or ""), reverse=True,
+        )[:5]
+        for m in recent:
+            facts["memory"].append({
+                "text": str(m.get("text") or "").strip()[:120],
+                "date": str(m.get("created_at") or "")[:10],
+            })
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("role news collect memory failed: %s", exc)
+    # 3) 情绪状态
+    try:
+        facts["state"] = _get_role_stores(role)[1].get_decayed()
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("role news collect state failed: %s", exc)
+    # 4) 位置 + 天气（只读缓存，绝不阻塞）
+    facts["location"] = _location_city()
+    try:
+        w = _memo_file_json(_WEATHER_FILE, {})
+        facts["weather"] = str(w.get("text") or "").strip()[:80]
+    except Exception:  # noqa: BLE001
+        facts["weather"] = ""
+    return facts
+
+
 def _rule_news_summary(keyword: str, results: list[dict]) -> str:
     """LLM 不可用时的规则兜底：拼接标题/摘要，最多保留 200 字。"""
     parts = []
@@ -1457,29 +1431,203 @@ def _rule_news_summary(keyword: str, results: list[dict]) -> str:
     return text[:200]
 
 
-async def _summarize_role_news(keyword: str, role_name: str, results: list[dict]) -> str:
-    """用 LLM 把搜索结果总结成 2-3 句现实动态（含位置推断）。失败返回空串走规则兜底。"""
+def _emotion_text(st: dict | None) -> str:
+    """把情绪状态转成一句话（规则兜底用）。st 为 None 返回空串。"""
+    if not st:
+        return ""
+    emo = st.get("emotion") or {}
+    v = _safe_float(emo.get("valence"), 0.5)
+    a = _safe_float(emo.get("arousal"), 0.3)
+    mood = ("低落" if v < 0.35 else "不错" if v > 0.65 else "平稳")
+    energy = ("有些疲惫" if _safe_float(st.get("energy"), 0.7) < 0.4 else "精力充沛" if _safe_float(st.get("energy"), 0.7) > 0.8 else "精力正常")
+    return f"情绪{mood}、{energy}（角色引擎状态）"
+
+
+def _build_rule_cards(keyword: str, results: list[dict], facts: dict, role_name: str) -> list[dict]:
+    """规则兜底卡片：按来源逐个产出「已确认」条目，资料不足的类别降级为缺失提示。
+
+    保证任何情况下都有 4 个类别各至少一条（confirmed/inferred/missing 三态齐全），
+    绝不因单一来源缺失而整体判定「无信息」。"""
+    cards: list[dict] = []
+    now = time.time()
+    # 1) 当前处境：位置/天气/静态身份
+    loc = str(facts.get("location") or "").strip()
+    weather = str(facts.get("weather") or "").strip()
+    if loc or weather:
+        content = "当前处境：" + "；".join([p for p in (loc, weather) if p])
+        cards.append({"id": "situ", "category": "当前处境", "status": "confirmed",
+                      "content": content[:120], "source": "location/weather", "ts": now})
+    elif facts.get("persona"):
+        cards.append({"id": "situ", "category": "当前处境", "status": "inferred",
+                      "content": "推测：正在俱乐部基地训练或备战（结合其职业身份）",
+                      "reason": "依据静态设定推断，暂无实时位置数据", "source": "persona", "ts": now})
+    else:
+        cards.append({"id": "situ", "category": "当前处境", "status": "missing",
+                      "content": "", "reason": "未配置位置（config.location.manual 为空），也无角色静态设定",
+                      "suggestion": "在 config.json 中配置 location.manual 可启用位置感知", "source": "", "ts": now})
+    # 2) 近期活动：搜索最新结果
+    web_parts = []
+    for r in results[:5]:
+        t = (r.get("title") or "").strip()
+        s = (r.get("snippet") or "").strip()
+        web_parts.append(t or s)
+    if web_parts:
+        cards.append({"id": "active", "category": "近期活动", "status": "confirmed",
+                      "content": "；".join(web_parts)[:200], "source": "web", "ts": now})
+    else:
+        cards.append({"id": "active", "category": "近期活动", "status": "missing",
+                      "content": "", "reason": f"联网搜索「{keyword}」暂无结果",
+                      "suggestion": "可稍后重试，或调整 roles.*.news.keyword 关键词", "source": "web", "ts": now})
+    # 3) 关键事件：搜索中带日期的条目（规则无法可靠提取日期时标注推测）
+    if results:
+        cards.append({"id": "event", "category": "关键事件", "status": "inferred",
+                      "content": "推测：近期有比赛/训练相关安排（以搜索结果标题为准）",
+                      "reason": "仅能确认有最新资讯，具体事件需人工核实", "source": "web", "ts": now})
+    else:
+        cards.append({"id": "event", "category": "关键事件", "status": "missing",
+                      "content": "", "reason": "无搜索结果可提取关键事件",
+                      "suggestion": "补充资料：在设置中点击「搜索动态」重试", "source": "", "ts": now})
+    # 4) 人物关系：长期记忆
+    mems = facts.get("memory") or []
+    if mems:
+        cards.append({"id": "rel", "category": "人物关系", "status": "confirmed",
+                      "content": "；".join(m["text"] for m in mems[:3])[:200],
+                      "source": "memory", "ts": now})
+    else:
+        cards.append({"id": "rel", "category": "人物关系", "status": "missing",
+                      "content": "", "reason": "长期记忆库为空",
+                      "suggestion": "多与角色对话，记忆会自动积累", "source": "", "ts": now})
+    return cards
+
+
+def _cards_to_summary(cards: list[dict]) -> str:
+    """把卡片汇总成 2-3 句纯文本（注入 system prompt 用）：只取已确认/推测内容。"""
+    parts = []
+    for c in cards:
+        if c.get("status") == "missing" or not str(c.get("content") or "").strip():
+            continue
+        content = str(c["content"]).strip()
+        if c.get("status") == "inferred":
+            content = f"（推测）{content}"
+        parts.append(content)
+    text = "；".join(parts)
+    return text[:300]
+
+
+async def _summarize_role_news(keyword: str, role_name: str, results: list[dict],
+                               facts: dict) -> tuple[list[dict], str]:
+    """用 LLM 把「多来源资料」总结成分级卡片（已确认/推测/缺失），返回 (cards, summary)。
+
+    LLM 失败或输出无法解析时返回 ([], "")，调用方走规则兜底 _build_rule_cards。
+    要求 LLM 严格输出 JSON，解析带容错（剥离代码块围栏、取首个 { 到末个 }）。"""
     try:
         system = (
-            "你是信息摘要助手。根据下面搜索到的资料，总结这个人/战队「最近在忙什么、"
-            "现在可能在哪里（哪个城市/基地/场馆）」。只输出 2-3 句简洁中文，"
-            "优先使用资料里的最新信息，资料里没有的不要编造，不要罗列链接，不要用\"据报道\"之类套话。"
+            "你是信息摘要助手。根据下面提供的多来源资料，为角色生成「现实动态」分级信息卡片。\n"
+            "输出严格 JSON，不要 markdown 代码块，不要额外文字：\n"
+            '{"summary": "2-3句总览", "cards": [{"category": "当前处境|近期活动|关键事件|人物关系", '
+            '"status": "confirmed|inferred|missing", "content": "内容", "reason": "依据或缺失原因", '
+            '"date": "可选日期"}]}\n'
+            "规则：\n"
+            "1. confirmed = 资料中有明确证据的事实（搜索结果/静态设定/记忆/位置天气）；\n"
+            "2. inferred = 无直接证据但可合理推断的内容，content 以「推测：」开头，reason 写推断依据；\n"
+            "3. missing = 该类别完全没有资料时给出，content 留空，reason 写缺失原因；\n"
+            "4. 四个类别（当前处境/近期活动/关键事件/人物关系）尽量各覆盖一条；\n"
+            "5. 绝不要编造资料里没有的事实，宁可 missing 也不要虚构。"
         )
-        prompt = f"对象：{role_name}\n搜索关键词：{keyword}\n\n资料：\n{_format_search_feedback(keyword, results)}"
+        prompt = (
+            f"对象：{role_name}\n搜索关键词：{keyword}\n\n"
+            f"【联网搜索结果】\n{_format_search_feedback(keyword, results)}\n\n"
+            f"【静态设定/记忆/状态/位置/天气】\n"
+            f"{json.dumps(facts, ensure_ascii=False, indent=1)[:1500]}"
+        )
         raw = await llm_chat(
             [{"role": "system", "content": system},
              {"role": "user", "content": prompt}],
-            temperature=0.3, max_tokens=260, disable_thinking=True,
+            temperature=0.3, max_tokens=700, disable_thinking=True,
         )
-        text = _strip_meta_notes(raw or "").strip().strip("【】\"'「」")
-        return text[:300] if text else ""
+        raw = _strip_meta_notes(raw or "").strip()
+        # 容错解析：剥掉 ```json ... ``` 围栏，再取首 { 到末 }
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            _log.debug("role news LLM output not JSON: %r", raw[:120])
+            return [], ""
+        try:
+            parsed = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            _log.debug("role news LLM JSON parse failed: %r", raw[:120])
+            return [], ""
+        summary = str(parsed.get("summary") or "").strip()[:300]
+        cards = []
+        for i, c in enumerate(parsed.get("cards") or [], 1):
+            if not isinstance(c, dict):
+                continue
+            category = str(c.get("category") or "").strip()
+            if category not in _ROLE_NEWS_CATEGORIES:
+                continue
+            status = str(c.get("status") or "").strip()
+            if status not in ("confirmed", "inferred", "missing"):
+                continue
+            content = str(c.get("content") or "").strip()
+            if status == "missing":
+                content = ""  # 缺失卡片不承载内容
+            cards.append({
+                "id": f"llm{i}", "category": category, "status": status,
+                "content": content[:200],
+                "reason": str(c.get("reason") or "").strip()[:200],
+                "date": str(c.get("date") or "").strip()[:10],
+                "source": "web", "ts": time.time(),
+            })
+        if not cards:
+            return [], summary
+        return cards, summary
     except Exception as exc:  # noqa: BLE001
         _log.debug("summarize role news failed: %s", exc)
-        return ""
+        return [], ""
+
+
+def _merge_cards(llm_cards: list[dict], rule_cards: list[dict]) -> list[dict]:
+    """合并 LLM 卡片与规则兜底卡片：同一类别 LLM 缺席时用规则卡片补齐。"""
+    merged = list(llm_cards)
+    have = {c.get("category") for c in merged if c.get("status") != "missing"}
+    for rc in rule_cards:
+        if rc.get("category") not in have:
+            merged.append(rc)
+    return merged
+
+
+def _build_timeline(cards: list[dict], facts: dict) -> list[dict]:
+    """从卡片+记忆构建时间线（按 date 倒序，无日期的排最后）。"""
+    items = []
+    for c in cards:
+        if c.get("status") == "missing":
+            continue
+        date = str(c.get("date") or "").strip() or ""
+        items.append({"date": date, "category": c.get("category", ""),
+                      "content": str(c.get("content") or ""), "status": c.get("status", "confirmed")})
+    for m in (facts.get("memory") or [])[:3]:
+        date = str(m.get("date") or "")[:10]
+        items.append({"date": date, "category": "人物关系",
+                      "content": str(m.get("text") or "")[:120], "status": "confirmed"})
+    # 时间线按日期倒序；无日期条目排最后
+    def _sort_key(it: dict) -> tuple:
+        # reverse=True 时键大的在前：有日期 → (0, date) 按日期倒序；
+        # 无日期 → (-1,) 恒小于任何 (0, date) → 排最后
+        date = str(it.get("date") or "").strip()
+        return (0, date) if date else (-1, "")
+    items.sort(key=_sort_key, reverse=True)
+    seen = set()
+    out = []
+    for it in items:
+        key = (it.get("date"), it.get("content"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out[:20]
 
 
 async def _bg_role_news_refresh(force: bool = False) -> str:
-    """后台刷新角色现实动态。返回新文案（可能为空串）。
+    """后台刷新角色现实动态（v2 多来源聚合）。返回新 summary 文案（可能为空串）。
     同一时刻至多一个刷新任务：已有任务在跑直接返回，避免并发放大外部请求。"""
     if _role_news_refresh_lock.locked():
         _log.debug("role news refresh already in flight, skip")
@@ -1491,39 +1639,89 @@ async def _bg_role_news_refresh(force: bool = False) -> str:
                 return ""
             if not force:
                 snap = _load_role_news()
-                if (snap.get("text") and snap.get("keyword") == keyword
+                if (snap.get("summary") and snap.get("keyword") == keyword
                         and (time.time() - _safe_float(snap.get("ts", 0))) < _ROLE_NEWS_MAX_AGE_S):
-                    return snap["text"]  # 12h 内同关键词 → 直接用缓存
-            # 先按「最新动态」搜，再按关键词本身兜底
+                    return snap["summary"]  # 12h 内同关键词 → 直接用缓存
+            cfg = load_config()
+            role = cfg.get("active_role", "")
+            role_cfg = (cfg.get("roles") or {}).get(role) or {}
+            # 1) 多来源聚合（persona/memory/state/location/weather）
+            facts = _collect_role_facts(role_cfg, cfg, role)
+            # 2) 联网搜索最新动态
             results = await web_search(f"{keyword} 最新 动态 比赛 训练", None)
             if not results:
                 results = await web_search(keyword, None)
             if not results:
                 _log.debug("role news search empty: %s", keyword)
-                return ""
-            text = await _summarize_role_news(keyword, role_name, results)
-            if not text:
-                text = _rule_news_summary(keyword, results)
-            if text:
-                d = {"version": 1, "role": role_name, "keyword": keyword,
-                     "text": text, "ts": time.time()}
-                _save_role_news(d)
-            return text
+                _log_role_news_missing(f"联网搜索无结果（keyword={keyword}）", "近期活动", keyword)
+            # 3) LLM 结构化总结 → 失败走规则兜底
+            llm_cards, summary = await _summarize_role_news(keyword, role_name, results, facts)
+            if not llm_cards:
+                llm_cards, summary = [], ""
+                cards = _build_rule_cards(keyword, results, facts, role_name)
+            else:
+                cards = _merge_cards(llm_cards, _build_rule_cards(keyword, results, facts, role_name))
+            if not summary:
+                summary = _cards_to_summary(cards)
+            # 4) 缺失类别记录日志（定位资料覆盖不足）
+            for c in cards:
+                if c.get("status") == "missing":
+                    _log_role_news_missing(
+                        str(c.get("reason") or "资料缺失")[:200], c.get("category", ""), keyword)
+            # 5) 落盘 v2 结构化缓存
+            d = {
+                "version": 2, "role": role_name, "keyword": keyword,
+                "summary": summary, "cards": cards,
+                "timeline": _build_timeline(cards, facts),
+                "sources": {
+                    "web": "ok" if results else "empty",
+                    "persona": "ok" if facts.get("persona") else "empty",
+                    "memory": "ok" if facts.get("memory") else "empty",
+                    "state": "ok" if facts.get("state") else "empty",
+                    "location": "ok" if facts.get("location") else "empty",
+                    "weather": "ok" if facts.get("weather") else "empty",
+                },
+                "ts": time.time(),
+            }
+            _save_role_news(d)
+            return summary
         except Exception as exc:  # noqa: BLE001
             _log.debug("bg role news refresh skipped: %s", exc)
             return ""
 
 
+async def _role_news_scheduler() -> None:
+    """定时巡检：每 _ROLE_NEWS_CHECK_INTERVAL_S 检查缓存是否过期，过期则后台刷新。
+
+    与 _role_news_text 的「读时过期刷新」互补：读时刷新只覆盖被请求触发的路径，
+    定时器保证无人访问时角色动态也会随时间自动更新。"""
+    while True:
+        await asyncio.sleep(_ROLE_NEWS_CHECK_INTERVAL_S)
+        try:
+            keyword, _ = _role_news_config()
+            if not keyword:
+                continue
+            snap = _load_role_news()
+            if (time.time() - _safe_float(snap.get("ts", 0))) >= _ROLE_NEWS_MAX_AGE_S:
+                _log.debug("role news scheduler: cache expired, refresh")
+                _spawn_bg(_bg_role_news_refresh(force=True))
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("role news scheduler tick failed: %s", exc)
+
+
 def _role_news_text() -> str:
-    """返回当前角色现实动态文案（缓存优先，过期后台刷新，绝不阻塞）。"""
+    """返回当前角色现实动态文案（缓存优先，过期后台刷新，绝不阻塞）。
+
+    返回的是 summary 纯文本（已确认+推测混合），供 system prompt 注入；
+    结构化的卡片/时间线由 /api/role-news 返回给前端。"""
     keyword, _ = _role_news_config()
     if not keyword:
         return ""
     snap = _load_role_news()
-    if snap.get("text") and snap.get("keyword") == keyword:
+    if snap.get("summary") and snap.get("keyword") == keyword:
         if (time.time() - _safe_float(snap.get("ts", 0))) >= _ROLE_NEWS_MAX_AGE_S:
             _spawn_bg(_bg_role_news_refresh(force=True))
-        return snap["text"]
+        return snap["summary"]
     _spawn_bg(_bg_role_news_refresh())
     return ""
 
@@ -1911,12 +2109,12 @@ async def lifespan(app: FastAPI):
     _spawn_bg(_maybe_cleanup_tts_cache(force=True))
     # 上传附件没有 LRU，靠后台循环按保留天数清理，防磁盘无限增长
     _spawn_bg(_uploads_cleanup_loop())
-    # 启动时后台自动 IP 定位一次（用户位置供角色感知；失败静默，不影响启动）
-    _spawn_bg(_bg_ip_locate())
-    # 启动时后台预取一次天气（位置未知时自动跳过，等 IP 定位成功后再触发）
+    # 启动时后台预取一次天气（未配置手动位置时自动跳过，失败静默不影响启动）
     _spawn_bg(_bg_weather_refresh())
     # 启动时后台预取一次角色现实动态（有 news 关键词才生效）
     _spawn_bg(_bg_role_news_refresh())
+    # 定时巡检角色现实动态缓存：过期自动后台刷新，保证角色状态随时间自动变化
+    _spawn_bg(_role_news_scheduler())
     yield
     # 关闭：先等后台任务收尾（上限 5s），再关 httpx 连接池
     if _bg_tasks:
@@ -2245,6 +2443,16 @@ async def llm_chat(messages: list[dict], temperature: float = 0.8, max_tokens: i
     # 长文（max_tokens 大）非流式生成几万 token 可能要十几分钟，read 按上限放宽到最多 15 分钟
     read_to = min(900.0, max(180.0, 120.0 + max_tokens * 0.04))
     timeout = httpx.Timeout(5.0, connect=5.0, write=10.0, read=read_to, pool=15.0)
+    # MiniMax 走专属适配器：OpenAI 兼容协议 + 双计费模式（payg 按量 / token_plan 订阅），
+    # 错误码映射（1008 余额不足 / 2056 Token Plan 超限等）、空正文重试、usage 解析都在适配器内
+    if provider_name == "minimax":
+        mconf = minimax_llm.MiniMaxConf.from_cfg(conf)
+        content, usage = await minimax_llm.chat(
+            mconf, messages, temperature=temperature, max_tokens=max_tokens,
+            use_thinking=use_thinking, client=httpx_client, timeout=timeout)
+        _log.info("llm usage: provider=minimax model=%s billing=%s %s",
+                  model, mconf.billing_mode, usage)
+        return content
     last_err: Exception | None = None
     for attempt in range(3):
         try:
@@ -2350,6 +2558,14 @@ async def llm_chat_stream(messages: list[dict], temperature: float = 0.8, max_to
         headers["api-key"] = api_key
     read_to = min(900.0, max(180.0, 120.0 + max_tokens * 0.04))
     timeout = httpx.Timeout(5.0, connect=5.0, write=10.0, read=read_to, pool=15.0)
+
+    if provider_name == "minimax":
+        mconf = minimax_llm.MiniMaxConf.from_cfg(conf)
+        async for piece in minimax_llm.chat_stream(
+                mconf, messages, temperature=temperature, max_tokens=max_tokens,
+                use_thinking=use_thinking, client=httpx_client, timeout=timeout):
+            yield piece
+        return
 
     yielded = False  # 一旦输出过 delta，中途失败不再重试（内容无法撤回）
     last_err: Exception | None = None
@@ -3085,6 +3301,43 @@ async def llm_models(req: dict):
     return {"models": models}
 
 
+class QuotaRequest(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+    billing_mode: str = ""
+
+
+@app.post("/api/llm-quota")
+async def llm_quota(req: QuotaRequest):
+    """查询 MiniMax Token Plan 配额/余额（订阅 Key 调官方 /v1/token_plan/remains）。
+
+    billing_mode=token_plan 时返回套餐额度/积分余额；payg 模式无配额概念，
+    返回按量计费提示（用量见每次响应的 usage）。密钥复用规则与 /api/llm-models 一致：
+    未显式传 key 时仅在 base_url 与已配置地址一致时复用服务端密钥，防 SSRF 外泄。"""
+    cfg = load_config()
+    cfg_cloud = cfg.get("cloud", {}) or {}
+    cur_prov = cfg_cloud.get("provider", "") or "custom"
+    prov_entry = (cfg.get("cloud_providers", {}) or {}).get(cur_prov) or {}
+    cfg_base = (cfg_cloud.get("base_url") or "").rstrip("/")
+    req_base = (req.base_url or "").rstrip("/")
+    base_url = req_base or cfg_base
+    api_key = req.api_key or ""
+    if not api_key:
+        if not req_base or req_base == cfg_base:
+            api_key = cfg_cloud.get("api_key") or prov_entry.get("api_key") or ""
+    if not api_key:
+        raise HTTPException(400, "未配置 MiniMax 密钥：请先填写 API Key（Token Plan 模式填订阅 Key）")
+    billing = (req.billing_mode or prov_entry.get("billing_mode")
+               or os.getenv(minimax_llm.MINIMAX_BILLING_MODE_ENV) or "payg")
+    mconf = minimax_llm.MiniMaxConf.from_cfg({
+        "base_url": base_url, "api_key": api_key, "billing_mode": billing,
+        "quota_url": prov_entry.get("quota_url") or "",
+    })
+    result = await minimax_llm.query_quota(mconf, client=httpx_client)
+    result["usage_total"] = minimax_llm.usage_total()
+    return result
+
+
 class ChatRequest(BaseModel):
     message: str = ""
     history: list[dict] = []
@@ -3418,6 +3671,11 @@ async def status():
     mask_keys = _access_token() is None
     cloud_out = dict(cloud_cfg)
     providers_out = {k: dict(v) for k, v in cfg.get("cloud_providers", {}).items()}
+    # MiniMax 计费模式回填：cloud.billing_mode 缺省（老配置）时从当前供应商条目补
+    cur_prov = cloud_cfg.get("provider") or "custom"
+    prov_entry = cfg.get("cloud_providers", {}).get(cur_prov) or {}
+    if not cloud_out.get("billing_mode") and prov_entry.get("billing_mode"):
+        cloud_out["billing_mode"] = prov_entry["billing_mode"]
     voice_aliyun_out = dict(cfg.get("voice", {}).get("aliyun", {}))
     voice_minimax_out = dict(cfg.get("voice", {}).get("minimax", {}))
     if mask_keys:
@@ -3649,8 +3907,7 @@ async def chat(req: ChatRequest):
     # 角色引擎：启用时把 时间层/状态层/记忆层 上下文注入 system prompt（前端零改动）
     engine_cfg = cfg.get("role_engine") or {}
     engine_on = bool(engine_cfg.get("enabled", True))
-    location_summary = _location_summary()  # 位置感知：一次请求只读盘一次，hint 复用
-    location_text = location_summary["effective"] if location_summary["enabled"] else ""
+    location_text = _location_city()  # 位置感知：仅手动配置位置，自动定位已下线
     weather_text = _weather_text()    # 天气感知：依赖位置，空串 = 未获取到，不注入
     self_loc, self_rec = _self_config(cfg)  # 角色自况：自己此刻在哪、最近在忙什么
     news_text = _role_news_text()            # 角色现实动态：联网搜索的真实最近消息
@@ -3686,7 +3943,7 @@ async def chat(req: ChatRequest):
     system = {"role": "system",
               "content": persona + ctx_block + _META_HINT + style_hint + search_hint
                          + _time_hint() + _self_hint() + _role_news_hint(news_text)
-                         + _location_hint(location_summary) + _weather_hint()}
+                         + _location_hint(location_text) + _weather_hint()}
     provider = cfg.get("provider", "cloud")
     # 云端模型上下文窗口大，超长历史回复全文保留利于追问；本地小上下文才截断
     history = _clean_history(req.history, user_text, clip_long_replies=(provider == "local"))
@@ -3921,8 +4178,7 @@ async def role_greeting():
     persona = current_persona(cfg)
     # 组装上下文（和 /api/chat 同一套，但不带用户消息 -- 这是主动开口）
     ctx_block = ""
-    location_summary = _location_summary()
-    location_text = location_summary["effective"] if location_summary["enabled"] else ""
+    location_text = _location_city()  # 位置感知：仅手动配置位置，自动定位已下线
     weather_text = _weather_text()
     self_loc, self_rec = _self_config(cfg)
     news_text = _role_news_text()
@@ -3948,7 +4204,7 @@ async def role_greeting():
     system = {"role": "system",
               "content": persona + ctx_block + _META_HINT + greeting_instruction + style_hint
                          + _time_hint() + _self_hint() + _role_news_hint(news_text)
-                         + _location_hint(location_summary) + _weather_hint()}
+                         + _location_hint(location_text) + _weather_hint()}
     messages = [system, {"role": "user", "content": "（你主动发消息给老公）"}]
     raw = await llm_chat(messages)
     fallback_style = cfg.get("voice", {}).get("style") or "自然"
@@ -4186,6 +4442,7 @@ class ConfigUpdate(BaseModel):
     cloud_api_key: str = ""
     cloud_model: str = ""
     cloud_thinking: bool | None = None
+    cloud_billing_mode: str = ""  # MiniMax 计费模式：payg（按量付费）| token_plan（Token Plan），空串不修改
     persona: str = ""
     voice_language: str = "Chinese"
     voice_provider: str = ""
@@ -4244,6 +4501,10 @@ def _merge_config_update(cfg: dict, upd: ConfigUpdate) -> None:
     if upd.cloud_thinking is not None:
         cloud_cfg["thinking"] = bool(upd.cloud_thinking)
         entry["thinking"] = bool(upd.cloud_thinking)
+    # MiniMax 计费模式（payg / token_plan）：保存到当前供应商条目，切换供应商后各用各的
+    if upd.cloud_billing_mode in ("payg", "token_plan"):
+        cloud_cfg["billing_mode"] = upd.cloud_billing_mode
+        entry["billing_mode"] = upd.cloud_billing_mode
     if upd.persona:
         cfg["persona"] = upd.persona
     if upd.voice_language:
@@ -4280,10 +4541,10 @@ def _merge_config_update(cfg: dict, upd: ConfigUpdate) -> None:
         cfg.setdefault("voice", {}).setdefault("minimax", {})["pitch"] = upd.minimax_pitch
     if upd.minimax_sample_rate is not None:
         cfg.setdefault("voice", {}).setdefault("minimax", {})["sample_rate"] = upd.minimax_sample_rate
-    # 位置感知：手动位置非空才写入（清空走 POST /api/location 的 clear 标记）
+    # 位置感知（仅手动位置）：自动定位已下线，天气/对话注入只读 config.location.manual
     if upd.location_manual:
         cfg.setdefault("location", {})["manual"] = upd.location_manual.strip()
-    # location 块不存在时补默认结构，保证前端 /api/location 能正常读
+    # location 块不存在时补默认结构（enabled/weather 开关在块内）
     cfg.setdefault("location", {})
 
 
@@ -4340,64 +4601,14 @@ async def roles_apply(req: dict):
     return {"ok": True, "role": key, "persona": cfg["persona"]}
 
 
-class LocationUpdate(BaseModel):
-    """位置更新（三选一，可组合）：
-    - manual: 手动位置文本（写入 config.location.manual，最高优先级）
-    - clear:  清除手动位置（回到自动定位）
-    - lat/lng: GPS 经纬度上报（写入 data/location.json，source=gps）
-    - refresh: 强制重新 IP 定位
-    """
-    manual: str | None = None
-    clear: bool = False
-    lat: float | None = None
-    lng: float | None = None
-    refresh: bool = False
-
-
-@app.get("/api/location")
-async def location_get():
-    """查询当前位置（含来源与手动/自动各值），供前端展示。"""
-    return _location_summary()
-
-
-@app.post("/api/location")
-async def location_update(upd: LocationUpdate):
-    """更新位置：手动设置 / GPS 上报 / 重新 IP 定位 / 清除手动。"""
-    if upd.manual is not None or upd.clear:
-        # 手动位置写 config（读-改-写持锁，与保存设置同一套），清空也走这里
-        async with _io_locks["config"]:
-            cfg = copy.deepcopy(load_config(with_env=False))
-            loc = cfg.setdefault("location", {})
-            loc["manual"] = "" if upd.clear else (upd.manual or "").strip()
-            await _save_config_locked(cfg)
-    if upd.lat is not None and upd.lng is not None:
-        _save_auto_location({
-            "version": 1,
-            "city": "",
-            "lat": round(float(upd.lat), 6),
-            "lng": round(float(upd.lng), 6),
-            "source": "gps",
-            "ip": "",
-            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        })
-    if upd.refresh:
-        await _bg_ip_locate(force=True)
-    # 位置有任何变化 → 天气缓存作废，后台重新拉取（不阻塞本轮返回）
-    if upd.manual is not None or upd.clear or upd.lat is not None \
-            or upd.lng is not None or upd.refresh:
-        _spawn_bg(_bg_weather_refresh(force=True))
-    return _location_summary()
-
-
 @app.get("/api/weather")
 async def weather_get():
     """查询当前天气（缓存优先，过期自动后台刷新）。"""
     text = _weather_text()
-    s = _location_summary()
     snap = _weather_snapshot()
     return {
         "enabled": _weather_enabled(),
-        "location": s["effective"] if s["enabled"] else "",
+        "location": _location_city(),
         "weather": text,
         "cached_at": snap.get("ts") or 0,
         "city": snap.get("city") or "",
@@ -4413,7 +4624,7 @@ async def weather_refresh():
 
 @app.get("/api/role-news")
 async def role_news_get():
-    """查询当前角色的现实动态（联网搜索的最近真实消息，缓存优先）。"""
+    """查询当前角色的现实动态（v2 结构化：多来源聚合卡片 + 时间线 + 来源状态）。"""
     cfg = load_config()
     keyword, role_name = _role_news_config(cfg)
     snap = _load_role_news()
@@ -4421,16 +4632,29 @@ async def role_news_get():
         "role": role_name,
         "keyword": keyword,
         "enabled": bool(keyword),
-        "news": _role_news_text(),
+        "news": _role_news_text(),              # 兼容字段：纯文本 summary
+        "summary": snap.get("summary") or "",
+        "cards": snap.get("cards") or [],
+        "timeline": snap.get("timeline") or [],
+        "sources": snap.get("sources") or {},
+        "categories": list(_ROLE_NEWS_CATEGORIES),
         "cached_at": snap.get("ts") or 0,
     }
 
 
 @app.post("/api/role-news/refresh")
 async def role_news_refresh():
-    """强制刷新角色现实动态（等待搜索+总结结果）。"""
-    text = await _bg_role_news_refresh(force=True)
-    return {"news": text}
+    """强制刷新角色现实动态（等待搜索+总结结果），返回 v2 结构化数据。"""
+    await _bg_role_news_refresh(force=True)
+    snap = _load_role_news()
+    return {
+        "news": snap.get("summary") or "",
+        "summary": snap.get("summary") or "",
+        "cards": snap.get("cards") or [],
+        "timeline": snap.get("timeline") or [],
+        "sources": snap.get("sources") or {},
+        "cached_at": snap.get("ts") or 0,
+    }
 
 
 @app.post("/api/upload")

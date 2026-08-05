@@ -500,6 +500,19 @@
         .msg.failed .bubble{background:var(--error-subtle);border-color:color-mix(in srgb,var(--error) 38%,transparent);color:var(--error-strong)}
         .msg.failed .meta-btn:hover{color:var(--error-strong);border-color:color-mix(in srgb,var(--error) 40%,transparent);background:color-mix(in srgb,var(--error) 9%,transparent)}
         .bubble.no-text{display:none}
+        /* 消息就地编辑（右键/长按自己的消息 → 修改消息） */
+        .edit-wrap{display:flex;flex-direction:column;gap:8px;min-width:0}
+        .edit-ta{width:100%;min-height:52px;resize:vertical;box-sizing:border-box;background:var(--background);border:1px solid var(--border);border-radius:10px;color:var(--foreground);padding:10px 12px;font-size:14px;font-family:inherit;line-height:1.6}
+        .edit-ta:focus{outline:none;border-color:color-mix(in srgb,var(--chart-2) 55%,transparent);box-shadow:0 0 0 3px color-mix(in srgb,var(--chart-2) 14%,transparent)}
+        .edit-bar{display:flex;justify-content:flex-end;gap:8px}
+        /* 按钮色彩规范（全站统一）：
+           主按钮 = 前景色底 + 背景色字（主题反转模式，浅/深主题对比度均达标）；
+           次按钮 = 背景色底 + 描边 + 弱化字色，hover 提亮；
+           强调态 = chart-2 蓝底白字。严禁主按钮硬编码 #fff/#000（深色主题会白对白/黑对黑）。 */
+        .edit-bar button{flex:none;padding:7px 14px;border-radius:9px;border:1px solid var(--border);background:var(--background);color:var(--muted-foreground);font-size:12px;font-weight:600;cursor:pointer;transition:color .18s ease,border-color .18s ease,background-color .18s ease,transform .18s ease}
+        .edit-bar button:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--chart-2) 40%,transparent);transform:translateY(-1px)}
+        .edit-bar .edit-ok{color:var(--background);background:var(--foreground);border-color:var(--foreground)}
+        .edit-bar .edit-ok:hover{color:var(--background);border-color:var(--foreground)}
         .msg-meta{display:flex;align-items:center;gap:12px;margin-top:8px;font-family:var(--font-mono);font-size:10.5px;color:var(--muted-foreground);letter-spacing:.03em}
         .msg.user .msg-meta{justify-content:flex-end}
         .attachments{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;max-width:100%;min-width:0}
@@ -526,12 +539,6 @@
         .loop-btn:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--muted-foreground) 45%,transparent)}
         .loop-btn:active{transform:scale(.94)}
         .loop-btn.on{color:#fff;background:var(--chart-2);border-color:var(--chart-2)}
-        .save-btn{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;background:none;border:1px solid var(--border);border-radius:999px;color:var(--muted-foreground);cursor:pointer;flex:none;transition:color .16s ease,border-color .16s ease,background-color .16s ease,transform .12s ease}
-        .save-btn svg{width:12px;height:12px}
-        .save-btn:hover{color:var(--success);border-color:color-mix(in srgb,var(--success) 45%,transparent)}
-        .save-btn:active{transform:scale(.94)}
-        .save-btn.saving{opacity:.6;pointer-events:none}
-        .save-btn.saved{color:#fff;background:var(--success);border-color:var(--success)}
         .speak-btn:hover{color:var(--chart-2);border-color:color-mix(in srgb,var(--chart-2) 45%,transparent)}
         .speak-btn.done{color:var(--success);border-color:color-mix(in srgb,var(--success) 40%,transparent)}
         .speak-btn.playing{color:var(--chart-2);border-color:color-mix(in srgb,var(--chart-2) 45%,transparent);background:color-mix(in srgb,var(--chart-2) 10%,transparent)}
@@ -1259,6 +1266,16 @@
               sel.appendChild(o);
             });
             sel.value = cc.provider || 'custom';
+            /* MiniMax 计费模式回填：仅 MiniMax 供应商显示该行 */
+            var bmSel = document.getElementById('cloud_billing_mode');
+            var bmRow = document.getElementById('cloud-billing-row');
+            if (bmSel && bmRow) {
+              var curBilling = cc.billing_mode
+                || ((state.cloudProviders[cc.provider || 'custom'] || {}).billing_mode)
+                || 'payg';
+              bmSel.value = curBilling;
+              bmRow.style.display = (cc.provider === 'minimax') ? '' : 'none';
+            }
             document.getElementById('cloud_base_url').value = cc.base_url || '';
             document.getElementById('cloud_model').value = cc.model || '';
             /* 密钥与思考开关直接回填：切换供应商后保存不会串用上一个 key */
@@ -1652,14 +1669,51 @@
               if (av) av.style.animationDelay = opts.delay + 'ms';
               if (bd) bd.style.animationDelay = (opts.delay + 70) + 'ms';
             }
-            /* 右键消息 -> 自定义菜单（删除该条） */
-            div.addEventListener('contextmenu', function(e){
-              e.preventDefault();
-              showCtxMenu(e.clientX, e.clientY, [{ label: '删除消息', onClick: function(){
+            /* 右键/长按消息 -> 自定义菜单（自己的文本消息可修改，其余删除） */
+            var menuItems = function(){
+              var items = [];
+              if (role === 'user' && !(opts.attachments && opts.attachments.length)) {
+                items.push({ label: '修改消息', icon: 'edit', onClick: function(){ editMessage(div); } });
+              }
+              items.push({ label: '删除消息', onClick: function(){
                 div.remove();
                 removeFromHistory(div);
-              } }]);
+              } });
+              return items;
+            };
+            div.addEventListener('contextmenu', function(e){
+              if (e.target.closest && e.target.closest('.edit-wrap')) return; /* 编辑中：保留 textarea 默认右键菜单 */
+              e.preventDefault();
+              showCtxMenu(e.clientX, e.clientY, menuItems());
             });
+            /* 触屏长按 480ms 弹菜单（iOS Safari 不触发 contextmenu，与会话列表同款）；
+               移动超 12px 视为滚动取消；编辑中的 textarea 长按不弹菜单（让位文本选择） */
+            (function(){
+              var lpTimer = null, lpFired = false, lpX = 0, lpY = 0;
+              div.addEventListener('touchstart', function(e){
+                if (e.touches.length !== 1) return;
+                if (e.target.closest && e.target.closest('.edit-wrap')) return;
+                lpFired = false;
+                lpX = e.touches[0].clientX; lpY = e.touches[0].clientY;
+                lpTimer = setTimeout(function(){
+                  lpFired = true;
+                  try { if (navigator.vibrate) navigator.vibrate(12); } catch (err) {}
+                  showCtxMenu(lpX, lpY, menuItems());
+                }, 480);
+              }, { passive: true });
+              div.addEventListener('touchmove', function(e){
+                if (!lpTimer) return;
+                var t = e.touches[0];
+                if (Math.abs(t.clientX - lpX) > 12 || Math.abs(t.clientY - lpY) > 12) {
+                  clearTimeout(lpTimer); lpTimer = null;
+                }
+              }, { passive: true });
+              div.addEventListener('touchend', function(e){
+                clearTimeout(lpTimer); lpTimer = null;
+                if (lpFired) { e.preventDefault(); lpFired = false; }
+              });
+              div.addEventListener('touchcancel', function(){ clearTimeout(lpTimer); lpTimer = null; });
+            })();
             (opts.container || msgsInner).appendChild(div);
             /* 自己发的消息强制贴底；对方消息仅在已贴底时跟随（不打断上翻浏览） */
             if (!opts.noScroll) {
@@ -1766,6 +1820,89 @@
           document.addEventListener('scroll', hideCtxMenu, true);
           window.addEventListener('resize', hideCtxMenu);
 
+          /* ---------- 修改消息 ----------
+             右键/长按自己发的文本消息 → 就地编辑：更新文本 → 截断其后所有消息（上下文已变，
+             旧回复作废，与主流产品一致）→ 自动重新生成回复。 */
+          function editMessage(div) {
+            var s = currentSession();
+            if (!s) return;
+            if (div.querySelector('.edit-wrap')) return; /* 已在编辑中，防重复插入 */
+            if (state.awaiting[s.id]) { toast('回复生成中，请稍候再修改'); return; }
+            var idx = parseInt(div.dataset.hidx, 10);
+            var m = s.history[idx];
+            if (!m || m.role !== 'user') {
+              /* 下标失效兜底：按内容倒查（与重试逻辑同思路） */
+              var content = div.querySelector('.bubble').textContent;
+              idx = -1;
+              for (var i = s.history.length - 1; i >= 0; i--) {
+                if (s.history[i].role === 'user' && s.history[i].content === content) { idx = i; m = s.history[i]; break; }
+              }
+            }
+            if (idx < 0 || !m || m.role !== 'user') { toast('找不到对应的消息，可能已被删除'); return; }
+            var bubble = div.querySelector('.bubble');
+            if (!bubble) return;
+            /* 气泡替换为 textarea 就地编辑 */
+            var ta = document.createElement('textarea');
+            ta.className = 'edit-ta';
+            ta.value = m.content || '';
+            ta.rows = Math.max(2, Math.min(6, Math.ceil((m.content || '').length / 30)));
+            ta.setAttribute('aria-label', '编辑消息');
+            var wrap = document.createElement('div');
+            wrap.className = 'edit-wrap';
+            var bar = document.createElement('div');
+            bar.className = 'edit-bar';
+            var ok = document.createElement('button');
+            ok.type = 'button'; ok.className = 'edit-ok'; ok.textContent = '发送';
+            ok.title = '发送修改后的消息（Enter）';
+            var cancel = document.createElement('button');
+            cancel.type = 'button'; cancel.className = 'edit-cancel'; cancel.textContent = '取消';
+            bar.appendChild(ok); bar.appendChild(cancel);
+            wrap.appendChild(ta); wrap.appendChild(bar);
+            bubble.style.display = 'none';
+            bubble.parentNode.insertBefore(wrap, bubble);
+            ta.focus();
+            try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (err) {}
+            var done = false;
+            function finish(submit) {
+              if (done) return;
+              var newText = submit ? ta.value.trim() : '';
+              done = true;
+              wrap.remove();
+              bubble.style.display = '';
+              if (!submit) return; /* 取消：还原气泡 */
+              if (!newText) { toast('消息不能为空'); return; }
+              if (newText === (m.content || '').trim()) return; /* 内容没变，什么都不做 */
+              /* 编辑期间可能发生多端合并替换会话对象，重新取最新引用再改 */
+              var cur = findSession(s.id);
+              if (cur) { s = cur; m = s.history[idx]; }
+              if (!m || m.role !== 'user') { toast('消息已失效，无法发送'); return; }
+              m.content = newText;
+              s.history.splice(idx + 1);   /* 截断其后所有消息：上下文已变，旧回复作废 */
+              state.history = s.history;
+              markSessionActivity(s.id);
+              markAwaiting(s.id, true);    /* 先标记：renderCurrentSession 不会补失败气泡 */
+              renderCurrentSession();      /* 重渲染：新文本生效、后续消息消失 */
+              showTyping();
+              var hist = s.history.slice(0, idx).slice(-20).map(function(x){
+                if (x.content) return x;
+                var mm = Object.assign({}, x);
+                mm.content = (x.attachments && x.attachments.length) ? '（发送了附件）' : '';
+                return mm;
+              });
+              var atts = m.attachments || [];
+              streamReplyInto(s.id, { idx: idx, text: newText, atts: atts },
+                { message: newText, history: hist, attachments: atts })
+                .then(function(){ markAwaiting(s.id, false); });
+              toast('消息已修改并重新发送，正在生成回复');
+            }
+            ok.addEventListener('click', function(){ finish(true); });
+            cancel.addEventListener('click', function(){ finish(false); });
+            ta.addEventListener('keydown', function(e){
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); finish(true); }
+              else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+            });
+          }
+
           /* ---------- 朗读（TTS） ---------- */
           function setSpeak(btn, txt, playing) {
             var l = btn.querySelector('.speak-label');
@@ -1863,45 +2000,6 @@
           /* 保存/下载合成音频到本地：绕过前端内存缓存，直接请求后端
              （后端 tts_cache 磁盘缓存命中，秒回；force=false 复用原合成结果）。
              文件名带文本前缀与时间戳，方便识别。 */
-          async function saveTTSAudio(text, style, btn, msg) {
-            if (!btn) btn = null;
-            try {
-              if (btn) { btn.classList.add('saving'); btn.title = '正在保存…'; }
-              // 优先用已持久化的稳定音频 URL（刷新/切会话后仍在），否则回退 POST 合成（命中磁盘缓存）
-              var blob;
-              if (msg && msg.audio) {
-                try {
-                  var gr = await fetch(msg.audio);
-                  if (gr.ok) blob = await gr.blob();
-                } catch (e) { blob = null; }
-              }
-              if (!blob) {
-                var r = await fetch('/api/tts', {
-                  method: 'POST', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ text: text, style: style || '', speed: 1.0, force: false }),
-                });
-                if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
-                if (!r.ok) throw new Error('TTS 失败');
-                blob = await r.blob();
-              }
-              var a = document.createElement('a');
-              var prefix = (text || '').replace(/[\\/:*?"<>|\s]+/g, '').slice(0, 12) || 'tts';
-              var ts = new Date();
-              var pad = function(n){ return (n < 10 ? '0' : '') + n; };
-              var fname = prefix + '-' + ts.getFullYear() + pad(ts.getMonth()+1) + pad(ts.getDate()) + '-' +
-                          pad(ts.getHours()) + pad(ts.getMinutes()) + pad(ts.getSeconds()) + '.wav';
-              a.href = URL.createObjectURL(blob);
-              a.download = fname;
-              document.body.appendChild(a);
-              a.click();
-              setTimeout(function(){ URL.revokeObjectURL(a.href); a.parentNode.removeChild(a); }, 800);
-              if (btn) { btn.classList.remove('saving'); btn.classList.add('saved'); btn.title = '已保存'; }
-              setTimeout(function(){ if (btn) btn.classList.remove('saved'); }, 1800);
-            } catch (e) {
-              if (btn) { btn.classList.remove('saving'); btn.title = '保存失败'; }
-              toast && toast(e.message || '保存失败', 3000, 'error');
-            }
-          }
           function makeSpeakBtn(text, style, msg, sid) {
             var wrap = document.createElement('span');
             wrap.className = 'speak-wrap';
@@ -1928,18 +2026,6 @@
             };
             wrap.appendChild(b);
             wrap.appendChild(lb);
-            /* 保存/下载音频：直接走后端 /api/tts（命中磁盘缓存，秒回），
-               不依赖前端内存 audioCache，刷新页面后依然能存到本地 */
-            var sb = document.createElement('button');
-            sb.type = 'button';
-            sb.className = 'save-btn';
-            sb.title = '保存音频到本地';
-            sb.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>';
-            sb.onclick = function(ev) {
-              if (ev) { ev.preventDefault(); ev.stopPropagation(); }
-              saveTTSAudio(text, style, sb, msg);
-            };
-            wrap.appendChild(sb);
             wrap._speak = b; /* 调用处传入 wrap 时据此解包到朗读按钮 */
             return wrap;
           }
@@ -2431,27 +2517,12 @@
 
           /* ---------- 设置 ---------- */
           /* 模态框 HTML 在 </main> 之后，需等 DOMContentLoaded 才能绑定 */
-          function openSettings(){ var el = document.getElementById('settings'); if (el) { el.classList.add('show'); refreshStatus(); refreshLocationStatus(); refreshRoleNews(); } }
+          function openSettings(){ var el = document.getElementById('settings'); if (el) { el.classList.add('show'); refreshStatus(); refreshWeather(); refreshRoleNews(); } }
           function closeSettings(){
             var el = document.getElementById('settings'); if (!el) return;
             el.classList.remove('show');
           }
-          /* ---------- 位置感知 ---------- */
-          function refreshLocationStatus(){
-            api('/api/location').then(function(r){
-              if (!r) return;
-              var st = document.getElementById('loc-status');
-              var inp = document.getElementById('location_manual');
-              if (!st) return;
-              if (inp && document.activeElement !== inp) inp.value = r.manual || '';
-              if (!r.enabled) { st.textContent = '位置感知已关闭（config.json location.enabled=false）'; return; }
-              var srcMap = { manual: '手动设置', ip: 'IP 自动定位', gps: '浏览器定位' };
-              st.textContent = r.effective
-                ? '当前生效：' + r.effective + '（' + (srcMap[r.source] || r.source || '未知') + '）'
-                : '位置未知：手动填一个，或用 📡 定位 / 🌐 IP 自动获取';
-            }).catch(function(){});
-            refreshWeather();
-          }
+          /* ---------- 天气感知（位置取自 config.json 的 location.manual，自动定位已下线） ---------- */
           function refreshWeather(){
             var box = document.getElementById('loc-weather');
             if (!box) return;
@@ -2468,7 +2539,7 @@
                 if (ago >= 0) hint += '（' + (ago < 1 ? '刚刚' : ago + ' 分钟前') + '更新）';
                 sp.textContent = hint;
               } else {
-                sp.textContent = '天气暂不可用：先设置位置（手动填/📡/🌐），或点 🔄 刷新';
+                sp.textContent = '天气暂不可用：请在 config.json 的 location.manual 配置位置，或点 🔄 刷新';
               }
             }).catch(function(){
               var sp = box.querySelector('span');
@@ -2483,20 +2554,111 @@
               refreshWeather();
             }).catch(function(e){ toast(e.message || '天气刷新失败'); });
           }
-          /* ---------- 角色现实动态 ---------- */
+          /* ---------- 角色现实动态（v2：分级卡片 + 时间线） ---------- */
+          var rnView = 'cards';
+          var rnStatusName = { confirmed: '已确认', inferred: '推测', missing: '未知' };
+          var rnSourceName = { web: '联网搜索', persona: '角色设定', memory: '记忆库', state: '情绪状态', location: '位置', weather: '天气' };
+          function rnEsc(s){
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function(ch){
+              return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch];
+            });
+          }
+          function rnCardHtml(c){
+            var badge = '<span class="rn-badge">' + rnEsc(rnStatusName[c.status] || c.status) + '</span>';
+            var reason = (c.status === 'missing' && c.reason)
+              ? '<div class="rn-reason">缺失原因：' + rnEsc(c.reason) + '</div>' : '';
+            if (c.status === 'inferred' && c.reason) {
+              reason = '<div class="rn-reason">依据：' + rnEsc(c.reason) + '</div>';
+            }
+            var sug = (c.status === 'missing' && c.suggestion)
+              ? '<div class="rn-reason" style="color:color-mix(in srgb,var(--chart-3) 85%,transparent)">建议：' + rnEsc(c.suggestion) + '</div>' : '';
+            var src = c.source ? '<div class="rn-src">来源：' + rnEsc(rnSourceName[c.source] || c.source) + '</div>' : '';
+            var content = c.status === 'missing'
+              ? '<div class="rn-content">该维度暂无资料</div>'
+              : '<div class="rn-content">' + rnEsc(c.content) + '</div>';
+            return '<div class="rn-card st-' + rnEsc(c.status) + '">'
+              + '<div class="rn-cat">' + rnEsc(c.category) + badge + '</div>'
+              + content + reason + sug + src + '</div>';
+          }
+          function rnRender(r){
+            var body = document.getElementById('rn-body');
+            var tl = document.getElementById('rn-timeline');
+            var summary = document.getElementById('rn-summary');
+            var tabs = document.getElementById('rn-tabs');
+            var sources = document.getElementById('rn-sources');
+            var hint = document.getElementById('rn-missing-hint');
+            if (!body) return;
+            var cards = (r && r.cards) || [];
+            var timeline = (r && r.timeline) || [];
+            summary.textContent = (r && r.summary) ? r.summary : '暂无动态：点 🔄 搜索动态获取（首次搜索+总结约需十几秒）';
+            summary.classList.toggle('empty', !(r && r.summary));
+            tabs.style.display = (cards.length || timeline.length) ? 'flex' : 'none';
+            /* 卡片视图 */
+            body.innerHTML = '';
+            if (cards.length) {
+              cards.forEach(function(c){ body.insertAdjacentHTML('beforeend', rnCardHtml(c)); });
+            } else if (!(r && r.summary)) {
+              body.insertAdjacentHTML('beforeend',
+                '<div class="rn-card st-missing"><div class="rn-cat">当前处境<span class="rn-badge">未知</span></div>'
+                + '<div class="rn-content">该角色未配置新闻关键词（roles.*.news.keyword），跳过</div></div>');
+            }
+            /* 时间线视图 */
+            tl.innerHTML = '';
+            (timeline.length ? timeline : cards.filter(function(c){ return c.status !== 'missing'; })).forEach(function(it){
+              var date = it.date || '';
+              var label = date ? '<span class="rn-tl-date">' + rnEsc(date) + '</span>' : '';
+              var cat = it.category ? '<span class="rn-tl-cat">' + rnEsc(it.category) + '</span>' : '';
+              var badge = '<span class="rn-badge" style="font-size:10px;font-weight:700;padding:1px 7px;border-radius:99px;margin-left:6px;color:color-mix(in srgb,var(--muted-foreground) 82%,transparent);background:color-mix(in srgb,var(--muted-foreground) 12%,transparent)">'
+                + rnEsc(rnStatusName[it.status] || it.status) + '</span>';
+              tl.insertAdjacentHTML('beforeend',
+                '<div class="rn-tl-item st-' + rnEsc(it.status || 'confirmed') + '">'
+                + '<div>' + label + cat + badge + '</div>'
+                + '<div class="rn-tl-content">' + rnEsc(it.content) + '</div></div>');
+            });
+            /* 视图切换 */
+            body.style.display = rnView === 'cards' ? 'flex' : 'none';
+            tl.style.display = rnView === 'timeline' ? 'flex' : 'none';
+            tabs.querySelectorAll('.rn-tab').forEach(function(t){
+              t.classList.toggle('active', t.dataset.rnView === rnView);
+            });
+            /* 来源状态 */
+            sources.innerHTML = '';
+            var srcs = (r && r.sources) || {};
+            Object.keys(srcs).forEach(function(k){
+              var ok = srcs[k] === 'ok';
+              sources.insertAdjacentHTML('beforeend',
+                '<span class="rn-src-chip ' + (ok ? 'ok' : 'empty') + '">'
+                + rnEsc(rnSourceName[k] || k) + (ok ? ' ✓' : ' 缺') + '</span>');
+            });
+            /* 缺失提示（含补充入口建议） */
+            var missing = cards.filter(function(c){ return c.status === 'missing' && c.reason; });
+            if (missing.length) {
+              hint.style.display = 'block';
+              var reasons = missing.map(function(c){
+                return '<b>' + rnEsc(c.category) + '</b>：' + rnEsc(c.reason)
+                  + (c.suggestion ? '（' + rnEsc(c.suggestion) + '）' : '');
+              }).join('<br>');
+              hint.innerHTML = '📌 资料待补充：' + reasons
+                + '<br>可在 config.json 的 roles.*.news.keyword / location.manual 中补充关键词与位置，'
+                + '或直接在对话中告诉角色最新动态（角色会以你说的为准）。';
+            } else {
+              hint.style.display = 'none';
+            }
+          }
           function refreshRoleNews(){
             var span = document.getElementById('role-news-status');
             if (!span) return;
             api('/api/role-news').then(function(r){
               if (!r) return;
-              if (!r.enabled) { span.textContent = '该角色未配置新闻关键词（roles.*.news.keyword），跳过'; return; }
-              if (r.news) {
-                var ago = r.cached_at ? Math.round((Date.now()/1000 - r.cached_at)/60) : -1;
-                span.textContent = r.news + (ago >= 0 ? '（' + (ago < 1 ? '刚刚' : ago + ' 分钟前') + '更新）' : '');
+              if (!r.enabled) { span.textContent = '该角色未配置新闻关键词（roles.*.news.keyword），跳过'; }
+              else if (r.cached_at) {
+                var ago = Math.round((Date.now()/1000 - r.cached_at)/60);
+                span.textContent = ago < 1 ? '刚刚更新' : ago + ' 分钟前更新';
               } else {
-                span.textContent = '暂无动态：点 🔄 搜索动态获取（首次搜索+总结约需十几秒）';
+                span.textContent = '尚未获取';
               }
-            }).catch(function(){ span.textContent = '动态获取失败'; });
+              rnRender(r);
+            }).catch(function(){ span.textContent = '动态获取失败'; rnRender(null); });
           }
           function roleNewsRefresh(){
             var span = document.getElementById('role-news-status');
@@ -2504,39 +2666,10 @@
             api('/api/role-news/refresh', {
               method: 'POST', headers: { 'Content-Type': 'application/json' }
             }).then(function(r){
-              toast(r && r.news ? '已获取最新动态' : '没搜到该角色的新动态，可稍后再试');
+              var hasCards = r && r.cards && r.cards.some(function(c){ return c.status !== 'missing'; });
+              toast(hasCards ? '已获取最新动态' : '本次搜索未找到新资料，已记录缺失原因，可稍后再试');
               refreshRoleNews();
             }).catch(function(e){ toast(e.message || '搜索失败'); refreshRoleNews(); });
-          }
-          function locGps(){
-            if (!navigator.geolocation) { toast('当前浏览器不支持定位'); return; }
-            navigator.geolocation.getCurrentPosition(async function(pos){
-              try {
-                await api('/api/location', {
-                  method: 'POST', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ lat: pos.coords.latitude, lng: pos.coords.longitude })
-                });
-                toast('已用浏览器定位'); refreshLocationStatus();
-              } catch (e) { toast(e.message); }
-            }, function(err){
-              toast('定位失败：' + (err.code === 1 ? '未授权，请在浏览器/系统设置中允许位置权限' : '获取不到位置'));
-            }, { timeout: 10000 });
-          }
-          function locIp(){
-            api('/api/location', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ refresh: true })
-            }).then(function(r){
-              toast(r && r.effective ? 'IP 定位成功：' + r.effective : 'IP 定位失败，可手动填写');
-              refreshLocationStatus();
-            }).catch(function(e){ toast(e.message || 'IP 定位失败'); });
-          }
-          function locClear(){
-            api('/api/location', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ clear: true })
-            }).then(function(){ toast('已清除手动位置'); refreshLocationStatus(); })
-              .catch(function(e){ toast(e.message); });
           }
           function initSettings() {
             var settingsEl = document.getElementById('settings');
@@ -2553,16 +2686,22 @@
                 btn.textContent = hide ? '显示' : '隐藏';
               });
             });
-            var locGpsBtn = document.getElementById('loc-gps-btn');
-            if (locGpsBtn) locGpsBtn.addEventListener('click', locGps);
-            var locIpBtn = document.getElementById('loc-ip-btn');
-            if (locIpBtn) locIpBtn.addEventListener('click', locIp);
-            var locClearBtn = document.getElementById('loc-clear-btn');
-            if (locClearBtn) locClearBtn.addEventListener('click', locClear);
             var locWeatherBtn = document.getElementById('loc-weather-btn');
             if (locWeatherBtn) locWeatherBtn.addEventListener('click', locWeatherRefresh);
             var roleNewsBtn = document.getElementById('role-news-btn');
             if (roleNewsBtn) roleNewsBtn.addEventListener('click', roleNewsRefresh);
+            document.querySelectorAll('#rn-tabs .rn-tab').forEach(function(t){
+              t.addEventListener('click', function(){
+                rnView = t.dataset.rnView === 'timeline' ? 'timeline' : 'cards';
+                var body = document.getElementById('rn-body');
+                var tl = document.getElementById('rn-timeline');
+                if (body) body.style.display = rnView === 'cards' ? 'flex' : 'none';
+                if (tl) tl.style.display = rnView === 'timeline' ? 'flex' : 'none';
+                document.querySelectorAll('#rn-tabs .rn-tab').forEach(function(x){
+                  x.classList.toggle('active', x === t);
+                });
+              });
+            });
             var saveBtn = document.getElementById('save-settings');
             if (saveBtn) saveBtn.addEventListener('click', async function(){
               try {
@@ -2577,6 +2716,9 @@
                     cloud_api_key: document.getElementById('cloud_api_key').value,
                     cloud_model: document.getElementById('cloud_model').value,
                     cloud_thinking: document.getElementById('cloud_thinking').checked,
+                    /* 计费模式仅 MiniMax 供应商生效：其他供应商提交空串，避免污染其条目 */
+                    cloud_billing_mode: (document.getElementById('cloud_provider_sel').value === 'minimax')
+                      ? document.getElementById('cloud_billing_mode').value : '',
                     persona: document.getElementById('persona').value,
                     voice_provider: document.querySelector('#voice-tabs .set-tab.active').dataset.voice,
                     aliyun_api_key: document.getElementById('aliyun_api_key').value,
@@ -2591,7 +2733,6 @@
                     minimax_vol: document.getElementById('minimax_vol').value,
                     minimax_pitch: document.getElementById('minimax_pitch').value,
                     minimax_sample_rate: document.getElementById('minimax_sample_rate').value,
-                    location_manual: document.getElementById('location_manual').value.trim(),
                   }),
                 });
                 var gt = document.getElementById('greeting_toggle');
@@ -2608,6 +2749,12 @@
               document.getElementById('cloud_api_key').value = p.api_key || '';
               var ct = document.getElementById('cloud_thinking');
               if (ct) ct.checked = p.thinking !== false;
+              var bmSel = document.getElementById('cloud_billing_mode');
+              var bmRow = document.getElementById('cloud-billing-row');
+              if (bmSel && bmRow) {
+                bmSel.value = p.billing_mode || 'payg';
+                bmRow.style.display = (this.value === 'minimax') ? '' : 'none';
+              }
             });
             var modelsBtn = document.getElementById('cloud-models-btn');
             if (modelsBtn) modelsBtn.addEventListener('click', async function(){
@@ -3431,6 +3578,57 @@
       #settings .set-mini-btn{flex:none;padding:8px 14px;border-radius:9px;border:1px solid var(--border);background:var(--background);color:var(--muted-foreground);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;transition:color .2s ease,border-color .2s ease,background-color .2s ease,transform .18s ease}
       #settings .set-mini-btn:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--chart-2) 40%,transparent);transform:translateY(-1px)}
       #settings .set-mini-btn:active{transform:scale(.96)}
+      /* ===== 角色现实动态 v2：分级信息卡片 + 时间线 ===== */
+      #rn-wrap{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px}
+      #rn-summary{font-size:12.5px;line-height:1.65;color:var(--muted-foreground);background:color-mix(in srgb,var(--muted-foreground) 6%,transparent);border:1px solid var(--border);border-radius:10px;padding:8px 10px;white-space:pre-wrap;word-break:break-word}
+      #rn-summary.empty{color:color-mix(in srgb,var(--muted-foreground) 70%,transparent);font-style:italic}
+      #rn-tabs{display:flex;gap:6px;align-items:center}
+      #rn-tabs .rn-tab{padding:4px 12px;border-radius:8px;border:1px solid var(--border);background:var(--background);color:var(--muted-foreground);font-size:11.5px;cursor:pointer;transition:color .18s ease,background-color .18s ease,border-color .18s ease}
+      #rn-tabs .rn-tab.active{background:var(--foreground);color:var(--background);border-color:var(--foreground);font-weight:600}
+      #rn-body{display:flex;flex-direction:column;gap:8px;max-height:320px;overflow-y:auto;padding-right:4px}
+      #rn-body::-webkit-scrollbar{width:6px}
+      #rn-body::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--muted-foreground) 30%,transparent);border-radius:3px}
+      .rn-card{display:flex;flex-direction:column;gap:4px;border:1px solid var(--border);border-left-width:3px;border-radius:10px;padding:8px 10px;background:var(--background);font-size:12px;line-height:1.6}
+      .rn-card .rn-cat{display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;color:var(--muted-foreground)}
+      .rn-card .rn-cat .rn-badge{font-size:10px;font-weight:700;padding:1px 7px;border-radius:99px;letter-spacing:.02em}
+      .rn-card .rn-content{color:var(--foreground);word-break:break-word;white-space:pre-wrap}
+      .rn-card .rn-reason{font-size:11px;color:color-mix(in srgb,var(--muted-foreground) 82%,transparent);word-break:break-word;white-space:pre-wrap}
+      .rn-card .rn-src{font-size:10.5px;color:color-mix(in srgb,var(--muted-foreground) 65%,transparent)}
+      .rn-card.st-confirmed{border-left-color:color-mix(in srgb,var(--chart-2) 78%,transparent)}
+      .rn-card.st-confirmed .rn-badge{color:color-mix(in srgb,var(--chart-2) 92%,transparent);background:color-mix(in srgb,var(--chart-2) 13%,transparent)}
+      .rn-card.st-inferred{border-left-color:color-mix(in srgb,var(--chart-3) 78%,transparent)}
+      .rn-card.st-inferred .rn-badge{color:color-mix(in srgb,var(--chart-3) 95%,transparent);background:color-mix(in srgb,var(--chart-3) 14%,transparent)}
+      .rn-card.st-missing{border-left-color:color-mix(in srgb,var(--muted-foreground) 55%,transparent)}
+      .rn-card.st-missing .rn-badge{color:var(--muted-foreground);background:color-mix(in srgb,var(--muted-foreground) 14%,transparent)}
+      .rn-card.st-missing .rn-content{color:color-mix(in srgb,var(--muted-foreground) 85%,transparent);font-style:italic}
+      #rn-timeline{display:flex;flex-direction:column;gap:0;max-height:320px;overflow-y:auto;padding-right:4px}
+      #rn-timeline::-webkit-scrollbar{width:6px}
+      #rn-timeline::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--muted-foreground) 30%,transparent);border-radius:3px}
+      .rn-tl-item{position:relative;padding:0 0 12px 18px;border-left:2px solid color-mix(in srgb,var(--muted-foreground) 25%,transparent);font-size:12px;line-height:1.55}
+      .rn-tl-item::before{content:'';position:absolute;left:-5px;top:3px;width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}
+      .rn-tl-item.st-confirmed::before{background:var(--chart-2)}
+      .rn-tl-item.st-inferred::before{background:var(--chart-3)}
+      .rn-tl-item:last-child{border-left-color:transparent}
+      .rn-tl-item .rn-tl-date{font-size:10.5px;color:color-mix(in srgb,var(--muted-foreground) 72%,transparent)}
+      .rn-tl-item .rn-tl-cat{font-size:10.5px;font-weight:600;color:var(--muted-foreground);margin-left:6px}
+      .rn-tl-item .rn-tl-content{color:var(--foreground);word-break:break-word;white-space:pre-wrap}
+      #rn-sources{display:flex;flex-wrap:wrap;gap:4px}
+      #rn-sources .rn-src-chip{font-size:10px;padding:1px 7px;border-radius:99px;border:1px solid var(--border);color:var(--muted-foreground)}
+      #rn-sources .rn-src-chip.ok{color:color-mix(in srgb,var(--chart-2) 92%,transparent);border-color:color-mix(in srgb,var(--chart-2) 40%,transparent);background:color-mix(in srgb,var(--chart-2) 8%,transparent)}
+      #rn-sources .rn-src-chip.empty{opacity:.7}
+      #rn-missing-hint{font-size:11px;color:color-mix(in srgb,var(--muted-foreground) 85%,transparent);line-height:1.6}
+      #rn-missing-hint b{color:var(--muted-foreground)}
+      /* ===== 窄屏/移动端：set-row 纵向排布，标签独占一行，杜绝文字与控件挤压重叠 ===== */
+      @media (max-width:480px){
+        #settings .set-panel{width:94vw;max-height:92vh}
+        #settings .set-body{padding:16px 14px}
+        #settings .set-row{flex-direction:column;align-items:stretch;gap:8px}
+        #settings .set-row .set-label{width:auto}
+        #settings .set-row .set-tabs{flex:none;flex-wrap:wrap}
+        #settings .set-row .set-mini-btn{flex:none}
+        #settings #rn-wrap{flex:none}
+        #settings #loc-weather span{flex:1;min-width:0}
+      }
       /* ===== 确认弹窗 ===== */
       #confirm-modal{position:fixed;inset:0;z-index:1200;display:none;align-items:center;justify-content:center;background:rgba(8,10,14,.55);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);opacity:0;transition:opacity .2s ease}
       #confirm-modal.show{display:flex;opacity:1}
@@ -3468,6 +3666,13 @@
           </div>
           <div class="set-fields" id="cloud-fields" style="display:none">
             <label>供应商<select id="cloud_provider_sel" class="set-input"></select></label>
+            <label id="cloud-billing-row" style="display:none">计费模式
+              <select id="cloud_billing_mode" class="set-input">
+                <option value="payg">按量付费（普通 API Key，按 token 实时计费）</option>
+                <option value="token_plan">Token Plan（订阅 Key，扣套餐额度/积分）</option>
+              </select>
+              <div style="font-size:12px;color:#8a93a6;margin-top:4px">两种 Key 互不混用：按量付费填「API 管理」的 API Key；Token Plan 填「订阅管理」的订阅 Key。余额不足/额度超限会明确报错。</div>
+            </label>
             <label>API 地址<input id="cloud_base_url" class="set-input" placeholder="https://api.example.com/v1"></label>
             <label>API Key
               <span style="display:flex;gap:8px;align-items:center">
@@ -3547,28 +3752,30 @@
           <label>人设描述<textarea id="persona" class="set-input set-ta" placeholder="定义小拟的性格、语气、说话方式…"></textarea></label>
           <div class="set-row" style="margin-top:4px">
             <span class="set-label">角色现实动态</span>
-            <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0">
+            <div id="rn-wrap">
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0">
                 <button type="button" class="set-mini-btn" id="role-news-btn" style="padding:4px 10px" title="联网搜索该角色最近真实动态">🔄 搜索动态</button>
                 <span id="role-news-status" style="font-size:12px;color:#8a93a6;line-height:1.5;flex:1;min-width:0">获取中…</span>
               </div>
-              <div style="font-size:12px;color:#8a93a6">联网搜索角色在现实世界的最新动态（比赛/训练/近况），角色自己也会知道；12 小时内自动复用缓存</div>
+              <div id="rn-summary" class="empty">暂无动态：点 🔄 搜索动态获取（首次搜索+总结约需十几秒）</div>
+              <div id="rn-tabs" style="display:none">
+                <button type="button" class="rn-tab active" data-rn-view="cards">📇 信息卡片</button>
+                <button type="button" class="rn-tab" data-rn-view="timeline">🕐 时间线</button>
+              </div>
+              <div id="rn-body"></div>
+              <div id="rn-timeline" style="display:none"></div>
+              <div id="rn-sources"></div>
+              <div id="rn-missing-hint" style="display:none"></div>
+              <div style="font-size:12px;color:#8a93a6">多来源聚合：联网搜索 + 角色设定 + 记忆库 + 情绪状态 + 位置天气；已确认信息优先展示，资料不足时给出推测与缺失原因，12 小时内自动复用缓存</div>
             </div>
           </div>
           <div class="set-row" style="margin-top:4px">
-            <span class="set-label">我的位置</span>
+            <span class="set-label">天气感知</span>
             <div style="flex:1;display:flex;flex-direction:column;gap:8px;min-width:0">
-              <div id="loc-status" style="font-size:12px;color:#8a93a6;line-height:1.5"></div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap">
-                <input id="location_manual" class="set-input" style="flex:1;min-width:150px" placeholder="如：广东省深圳市南山区">
-                <button type="button" class="set-mini-btn" id="loc-gps-btn" title="用浏览器定位（经纬度）">📡 定位</button>
-                <button type="button" class="set-mini-btn" id="loc-ip-btn" title="按 IP 重新定位到城市">🌐 IP</button>
-                <button type="button" class="set-mini-btn" id="loc-clear-btn" title="清除手动位置，改用自动定位">清除</button>
+              <div id="loc-weather" style="font-size:12px;color:#8a93a6;line-height:1.5;display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0">
+                <button type="button" class="set-mini-btn" id="loc-weather-btn" style="padding:4px 10px" title="刷新天气">🔄 天气</button><span style="flex:1;min-width:0">获取天气中…</span>
               </div>
-              <div id="loc-weather" style="font-size:12px;color:#8a93a6;line-height:1.5;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                <button type="button" class="set-mini-btn" id="loc-weather-btn" style="padding:4px 10px" title="刷新天气">🔄 天气</button><span>获取天气中…</span>
-              </div>
-              <div style="font-size:12px;color:#8a93a6">角色会知道你当前所在位置和实时天气，聊到位置/天气/通勤时能自然接话；填得越细越准（省市区或详细地址均可）。位置信息仅本机保存；天气查询走 Open-Meteo 免费接口，不把位置发给其他第三方。</div>
+              <div style="font-size:12px;color:#8a93a6">角色能感知你所在地的实时天气（数据源 Open-Meteo 免费接口，位置取自 config.json 的 location.manual，仅本机保存），聊到天气/穿什么/带不带伞时能自然接话。</div>
             </div>
           </div>
           <div class="set-row" style="margin-top:4px">

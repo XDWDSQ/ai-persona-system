@@ -29,11 +29,42 @@ restart_service.bat    # 重启 8000 端口服务
 | --- | --- |
 | `provider` | 当前 LLM 供应商：`local`（本地 llama.cpp）或 `cloud`（云端） |
 | `local` | 本地 LLM 的 `base_url` / `model` / `api_key`（本地模型默认 `Qwen3.5-4B-Q4_K_M`） |
-| `cloud` | 当前云端供应商的 `provider` / `base_url` / `api_key` / `model` / `thinking` |
-| `cloud_providers` | 各云端供应商（mimo / deepseek / ark / custom）的预设参数，切换供应商时自动套用 |
+| `cloud` | 当前云端供应商的 `provider` / `base_url` / `api_key` / `model` / `thinking` / `billing_mode` |
+| `cloud_providers` | 各云端供应商（mimo / deepseek / ark / minimax / custom）的预设参数，切换供应商时自动套用 |
 | `roles` | 角色定义：名称、简介、人设提示词、角色专属语音参数 |
 | `voice` | 全局语音合成配置：`provider`（如 `aliyun`）、音色、风格与各供应商子配置；`minimax` 子配置含 `speed`（0.5~2）、`vol`（整数 0~10）、`pitch`（整数 0~10）、`sample_rate`（最高 32000） |
 | `tts_cache` | TTS 音频缓存清理策略：`max_files`（默认 500）、`max_bytes`（默认 8GB）、`clean_interval`（默认 3600 秒） |
+
+### MiniMax 云端文字模型（双计费模式）
+
+MiniMax 作为云端文字生成供应商已接入统一 OpenAI 兼容调用链（模型列表 / 生成 / 流式 / 错误处理与其他供应商一致），在设置页「供应商」下拉选择 **MiniMax** 即可，调用方业务代码零改动。支持两种计费模式（`cloud_providers.minimax.billing_mode`，两种 Key 互不混用）：
+
+| 模式 | 值 | 密钥来源 | 计费方式 |
+| --- | --- | --- | --- |
+| 按量付费（默认） | `payg` | 开放平台「账户管理 > API 管理」的 **API Key** | 按实际 token 用量实时计费，每次响应 `usage`（prompt/completion/total tokens）即本次用量，进程内自动累计 |
+| Token Plan | `token_plan` | 「订阅管理」的 **订阅 Key** | 扣减套餐额度 / 已购积分；余额不足（错误码 1008）或超出资源限制（2056）时返回明确中文错误 |
+
+配置方式（任选其一）：
+
+- **配置文件**：`config.json` 的 `cloud_providers.minimax` 条目填 `base_url` / `api_key` / `model` / `billing_mode`，切换供应商自动套用
+- **环境变量**：密钥用 `MINIMAX_API_KEY`（与 MiniMax 语音 TTS 共用），计费模式可用 `MINIMAX_BILLING_MODE=token_plan` 兜底（config 未配置时生效）
+- **设置页**：云端 API 面板选择 MiniMax 后出现「计费模式」下拉，保存即写入配置
+
+```json
+"minimax": {
+  "label": "MiniMax",
+  "base_url": "https://api.minimaxi.com/v1",
+  "model": "MiniMax-M2.5",
+  "api_key": "",
+  "thinking": true,
+  "billing_mode": "payg"
+}
+```
+
+- 默认模型 `MiniMax-M2.5`，可在设置页「🔄 获取模型列表」拉取平台全量模型后选择
+- **Token Plan 配额查询**：POST `/api/llm-quota`（或调用 `minimax_llm.query_quota`），用订阅 Key 查官方 `/v1/token_plan/remains` 套餐额度 / 积分余额；payg 模式返回按量计费提示。未配置密钥时给出明确 400 提示
+- 错误处理与其他云端供应商一致（HTTPException 502 + 中文提示）：鉴权失败（1004/2049，含按量 Key 与订阅 Key 混用提示）、余额不足（1008/402）、Token Plan 超限（2056）、限流（429/1002）与临时错误（1000/1001/1024/1033）指数退避自动重试；空回复自动重试并降级思考模式；MiniMax 不支持 `thinking` 字段时自动移除重试
+- 流式输出带 OpenAI 标准计费参数 `stream_options.include_usage`，流式用量从末尾 chunk 解析并累计
 
 ### MiniMax 声音克隆
 
@@ -64,10 +95,9 @@ python minimax_clone.py
 "location": { "enabled": true, "manual": "", "weather": true }
 ```
 
-- 来源优先级：`manual`（手动填写，如「广东省深圳市南山区」）> 浏览器 GPS 上报 > IP 自动定位（城市级）。
-- 手动位置存 `config.json`；GPS/IP 自动结果存 `data/location.json`（24h 内不重复定位）。
-- 设置面板「我的位置」可手动填写、📡 浏览器定位、🌐 IP 定位、清除；`enabled=false` 或位置未知时完全不注入。
-- 位置属隐私信息，仅本机保存；IP 定位会把请求发到 ip-api.com（免费接口，无 key，仅返回城市级位置）。
+- 位置来源：仅 `manual`（手动配置，如「广东省深圳市南山区」）；自动定位（浏览器 GPS / IP）已下线。
+- 手动位置存 `config.json` 的 `location.manual`，天气感知与对话注入只读该值；为空时位置/天气均不注入。
+- 位置属隐私信息，仅本机保存；不向任何第三方发送位置数据（天气查询走 Open-Meteo，不含位置）。
 
 天气感知（`location.weather=true` 时开启）：根据当前位置查询实时天气，注入对话上下文。
 
