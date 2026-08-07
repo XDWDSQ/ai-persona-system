@@ -1991,7 +1991,8 @@
                    不再覆盖新播放状态（原实现还调了 load()，会触发异步 error
                    事件把刚复位的按钮文案改成"朗读失败"） */
                 state.playing._stopped = true;
-                state.playing.pause();
+                if (state.playing.stop) state.playing.stop();  // APK 代理：原生真正停止
+                else state.playing.pause();
               } catch (e) {}
               state.playing = null;
             }
@@ -2002,6 +2003,88 @@
               setMsgSpeaking(state.playingBtn, false);
               state.playingBtn = null;
             }
+          }
+
+          /* APK 环境：音频播放交给原生 MediaPlayer+MediaSession（触发系统媒体控件/流体云）；
+             网页环境：退回标准 Audio。代理对象实现标准 Audio 的常用接口。
+             httpUrl：blob: URL 原生播不了，优先用后端持久化 URL（本地代理转发自动带 cookie）。 */
+          function createAudio(url, httpUrl) {
+            if (!(window.AndroidBridge && window.AndroidBridge.playAudio)) return new Audio(url);
+            var a = {
+              src: url,
+              _httpUrl: httpUrl || null,
+              _loop: false,
+              _speed: 1,
+              paused: true,
+              _stopped: false,
+              _handlers: { ended: [], error: [] },
+              addEventListener: function(type, fn) {
+                if (this._handlers[type]) this._handlers[type].push(fn);
+              },
+              play: function() {
+                var self = this;
+                if (this._stopped) return Promise.resolve();
+                var ok = false;
+                try {
+                  var src = this.src;
+                  if (src.indexOf('blob:') === 0 && this._httpUrl) src = this._httpUrl;
+                  if (src.indexOf('blob:') === 0) {
+                    // 无持久化 URL 兜底：blob 转 base64 交原生播放
+                    return fetch(src).then(function(r){ return r.arrayBuffer(); }).then(function(buf){
+                      if (self._stopped) return;
+                      var b64 = '';
+                      var bytes = new Uint8Array(buf);
+                      var chunk = 0x8000;
+                      for (var i = 0; i < bytes.length; i += chunk) {
+                        b64 += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+                      }
+                      b64 = btoa(b64);
+                      ok = window.AndroidBridge.playAudioBase64(b64, self._loop);
+                      if (!ok) throw new Error('play failed');
+                      self._registerCallbacks();
+                      return;
+                    });
+                  }
+                  ok = window.AndroidBridge.playAudio(src, this._loop);
+                } catch (e) {}
+                if (!ok) return Promise.reject(new Error('play failed'));
+                this._registerCallbacks();
+                return Promise.resolve();
+              },
+              _registerCallbacks: function() {
+                var self = this;
+                this.paused = false;
+                window.__audioEnded = function() {
+                  self.paused = true;
+                  self._handlers.ended.forEach(function(f){ try { f(); } catch (e) {} });
+                };
+                window.__audioError = function() {
+                  self.paused = true;
+                  self._handlers.error.forEach(function(f){ try { f(); } catch (e) {} });
+                };
+              },
+              pause: function() {
+                this.paused = true;
+                try { window.AndroidBridge.pauseAudio(); } catch (e) {}
+              },
+              stop: function() {
+                this._stopped = true;
+                this.paused = true;
+                try { window.AndroidBridge.stopAudio(); } catch (e) {}
+              },
+            };
+            Object.defineProperty(a, 'loop', {
+              get: function() { return this._loop; },
+              set: function(v) {
+                this._loop = !!v;
+                try { window.AndroidBridge.setLoop(!!v); } catch (e) {}
+              },
+            });
+            Object.defineProperty(a, 'playbackRate', {
+              get: function() { return this._speed; },
+              set: function(v) { this._speed = v || 1; },  // 语速已由后端按 speed 合成，原生侧不重复变速
+            });
+            return a;
           }
           /* 保存/下载合成音频到本地：绕过前端内存缓存，直接请求后端
              （后端 tts_cache 磁盘缓存命中，秒回；force=false 复用原合成结果）。
@@ -2142,7 +2225,9 @@
                  不播放、不覆盖状态，杜绝旧请求晚到造成的叠加发声 */
               if (mySeq !== state.playSeq) return;
               stopAudio();
-              var a = new Audio(url);
+              /* blob: URL 原生播不了：优先用后端持久化 URL（经本地代理自动带 cookie） */
+              var httpUrl = (msg && msg.audio) ? location.origin + msg.audio : null;
+              var a = createAudio(url, httpUrl);  // APK 环境走原生播放（流体云），网页环境退回 Audio
               a.playbackRate = state.speed;  // 前端原生调速，零延迟、不占后端缓存
               a.loop = !!(btn && btn._loop); // 该条开启循环时，播完自动从头再播
               state.playing = a;

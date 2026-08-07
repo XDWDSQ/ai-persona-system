@@ -28,6 +28,7 @@ class MainActivity : Activity() {
     private lateinit var tvHint: TextView
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private var loaded = false
+    private lateinit var audioPlayer: AudioPlayer
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -135,6 +136,7 @@ class MainActivity : Activity() {
         })
 
         // JS Bridge：聊天页设置面板 → 打开原生服务器设置页 / 读取当前地址
+        audioPlayer = AudioPlayer(this)
         webView.addJavascriptInterface(object {
             @android.webkit.JavascriptInterface
             fun openSettings() {
@@ -145,6 +147,40 @@ class MainActivity : Activity() {
 
             @android.webkit.JavascriptInterface
             fun getServerUrl(): String = AppConfig.serverUrl ?: ""
+
+            // ---- 音频播放（原生 MediaPlayer + MediaSession，支持系统媒体控件/流体云）----
+            @android.webkit.JavascriptInterface
+            fun playAudio(url: String, loop: Boolean): Boolean {
+                audioPlayer.setCallbacks("window.__audioEnded&&window.__audioEnded()", "window.__audioError&&window.__audioError()")
+                return audioPlayer.play(url, loop)
+            }
+
+            @android.webkit.JavascriptInterface
+            fun playAudioBase64(b64: String, loop: Boolean): Boolean {
+                audioPlayer.setCallbacks("window.__audioEnded&&window.__audioEnded()", "window.__audioError&&window.__audioError()")
+                return audioPlayer.playBase64(b64, loop)
+            }
+
+            @android.webkit.JavascriptInterface
+            fun setLoop(loop: Boolean) = audioPlayer.setLoop(loop)
+
+            @android.webkit.JavascriptInterface
+            fun pauseAudio() = audioPlayer.pause()
+
+            @android.webkit.JavascriptInterface
+            fun resumeAudio() = audioPlayer.resume()
+
+            @android.webkit.JavascriptInterface
+            fun stopAudio() = audioPlayer.stop()
+
+            @android.webkit.JavascriptInterface
+            fun isAudioPlaying(): Boolean = audioPlayer.isPlaying()
+
+            @android.webkit.JavascriptInterface
+            fun isAudioPaused(): Boolean = audioPlayer.isPaused()
+
+            @android.webkit.JavascriptInterface
+            fun currentAudioUrl(): String = audioPlayer.currentUrl()
         }, "AndroidBridge")
 
         // 后台预热登录（代理也会在 401 时自动重登）
@@ -184,12 +220,20 @@ class MainActivity : Activity() {
         }
     }
 
+    /** 音频播放结束/出错时回调前端 JS（必须在 UI 线程调用） */
+    fun evaluateJs(js: String) {
+        if (loaded) {
+            try { webView.evaluateJavascript(js, null) } catch (_: Exception) {}
+        }
+    }
+
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
     }
 
     override fun onDestroy() {
+        if (::audioPlayer.isInitialized) audioPlayer.stop()
         webView.destroy()
         super.onDestroy()
     }

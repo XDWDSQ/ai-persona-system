@@ -26,7 +26,7 @@ COOKIE = "ai_token"
 AUTH_FREE = ("/api/health", "/api/login", "/login")
 
 
-def make_wav(duration=1.0, freq=440.0, sample_rate=8000):
+def make_wav(duration=30.0, freq=440.0, sample_rate=8000):
     """生成一段可播放的 WAV（方波）"""
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -148,6 +148,15 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {}
             msg = (payload.get("messages") or [{}])[-1].get("content", "")
             self._send(200, {"reply": "（模拟回复）收到：%s" % msg[:80], "style": "normal"})
+        elif path == "/api/tts":
+            self._read_body()
+            wav = make_wav()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("X-TTS-Cache", "mock-hash-001")
+            self.send_header("Content-Length", str(len(wav)))
+            self.end_headers()
+            self.wfile.write(wav)
         elif path == "/api/greeting":
             self._send(200, {"reply": "（模拟问候）老公，我在呀", "style": "normal"})
         elif path == "/api/upload":
