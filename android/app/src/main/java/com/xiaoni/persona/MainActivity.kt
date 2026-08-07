@@ -134,6 +134,19 @@ class MainActivity : Activity() {
             }
         })
 
+        // JS Bridge：聊天页设置面板 → 打开原生服务器设置页 / 读取当前地址
+        webView.addJavascriptInterface(object {
+            @android.webkit.JavascriptInterface
+            fun openSettings() {
+                runOnUiThread {
+                    startActivityForResult(Intent(this@MainActivity, SettingsActivity::class.java), REQ_SETTINGS)
+                }
+            }
+
+            @android.webkit.JavascriptInterface
+            fun getServerUrl(): String = AppConfig.serverUrl ?: ""
+        }, "AndroidBridge")
+
         // 后台预热登录（代理也会在 401 时自动重登）
         Thread { LoginManager.reLogin() }.start()
 

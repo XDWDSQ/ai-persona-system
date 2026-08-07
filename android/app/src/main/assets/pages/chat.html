@@ -2537,7 +2537,14 @@
 
           /* ---------- 设置 ---------- */
           /* 模态框 HTML 在 </main> 之后，需等 DOMContentLoaded 才能绑定 */
-          function openSettings(){ var el = document.getElementById('settings'); if (el) { el.classList.add('show'); refreshStatus(); refreshWeather(); refreshRoleNews(); } }
+          function openSettings(){
+            var el = document.getElementById('settings'); if (el) { el.classList.add('show'); refreshStatus(); refreshWeather(); refreshRoleNews(); }
+            var hint = document.getElementById('server-url-hint');
+            if (hint) {
+              var cur = (window.AndroidBridge && window.AndroidBridge.getServerUrl) ? window.AndroidBridge.getServerUrl() : '';
+              hint.textContent = cur ? cur : (window.AndroidBridge ? '未配置' : '网页版（连接本机）');
+            }
+          }
           function closeSettings(){
             var el = document.getElementById('settings'); if (!el) return;
             el.classList.remove('show');
@@ -2844,6 +2851,14 @@
           }
           var settingsBtn = document.querySelector('[data-dom-id="btn-settings"]');
           if (settingsBtn) settingsBtn.addEventListener('click', openSettings);
+          var serverBtn = document.getElementById('btn-server-settings');
+          if (serverBtn) serverBtn.addEventListener('click', function(){
+            if (window.AndroidBridge && window.AndroidBridge.openSettings) {
+              window.AndroidBridge.openSettings();   // APK：打开原生服务器设置页
+            } else {
+              toast('网页版直连本机服务，无需修改；如需改地址请直接编辑 config.json');
+            }
+          });
           if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initSettings);
           else initSettings();
 
@@ -3582,6 +3597,7 @@
       #settings .set-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
       #settings .set-row > *{min-width:0}
       #settings .set-row .set-label{width:84px;flex:none;color:var(--muted-foreground);font-size:12.5px;white-space:nowrap}
+      #settings .set-sub{flex:1;min-width:0;color:var(--muted-foreground);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
       #settings .set-tabs{display:flex;gap:8px;flex:1;min-width:0}
       #settings .set-tab{padding:7px 16px;border-radius:9px;border:1px solid var(--border);background:var(--background);color:var(--muted-foreground);font-size:12.5px;cursor:pointer;transition:background-color .2s ease,color .2s ease,border-color .2s ease,transform .18s ease,box-shadow .2s ease}
       #settings .set-tab:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--muted-foreground) 38%,transparent);transform:translateY(-1px)}
@@ -3672,6 +3688,15 @@
           </button>
         </div>
         <div class="set-body">
+          <!-- 服务器连接（APK 内可改地址/口令；网页端只读提示） -->
+          <div class="set-row">
+            <span class="set-label">服务器连接</span>
+            <span class="set-sub" id="server-url-hint" title="当前连接的服务器地址">—</span>
+          </div>
+          <div class="set-fields">
+            <div style="font-size:12px;color:#8a93a6;margin-bottom:8px">手机通过此地址连接电脑/云电脑上的服务。隧道地址变化后在这里修改。</div>
+            <button id="btn-server-settings" class="set-mini-btn" type="button">✏️ 修改服务器地址 / 访问口令</button>
+          </div>
           <div class="set-row">
             <span class="set-label">文字生成模型</span>
             <div class="set-tabs" id="chat-tabs">
