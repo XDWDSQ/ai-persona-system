@@ -417,6 +417,9 @@
         .session.active{background:var(--secondary);color:var(--foreground);box-shadow:0 0 0 1px color-mix(in srgb,var(--muted-foreground) 18%,transparent)}
         .session.active svg{color:var(--chart-2);opacity:1}
         .role-list{padding:0 8px 8px;display:flex;flex-direction:column;gap:2px;max-height:230px;overflow-y:auto}
+        .story-entry{margin:2px 8px 8px;display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:10px;border:1px dashed color-mix(in srgb,var(--accent) 55%,transparent);background:color-mix(in srgb,var(--accent) 7%,transparent);color:var(--accent);font-size:12.5px;font-weight:600;text-decoration:none;transition:background .2s ease}
+        .story-entry svg{width:15px;height:15px;flex:none}
+        .story-entry:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
         .role-label{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none}
         .role-label .role-caret{font-size:9px;opacity:.7;transition:transform .15s ease}
         .role-item{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;border-radius:8px;border:1px solid transparent;background:transparent;color:var(--muted-foreground);font-size:13px;text-align:left;cursor:pointer;transition:background-color .14s ease,color .14s ease;margin-bottom:2px}
@@ -500,6 +503,11 @@
         .msg:hover .bubble{box-shadow:0 8px 22px -14px rgba(0,0,0,.35)}
         .msg.ai .bubble{background:var(--card);border:1px solid var(--border);border-top-left-radius:5px}
         .msg.user .bubble{background:color-mix(in srgb,var(--chart-2) 16%,var(--card));border:1px solid color-mix(in srgb,var(--chart-2) 30%,transparent);border-top-right-radius:5px}
+        /* 旁白（双声部叙事层）：灰色小字、无头像、无气泡框，像电影字幕，只推剧情不抢戏 */
+        .msg.narration{gap:0;margin-bottom:12px}
+        .msg.narration .avatar{display:none}
+        .msg.narration .msg-body{max-width:100%}
+        .msg.narration .bubble{background:transparent;border:none;box-shadow:none;padding:0 2px;color:var(--muted-foreground);font-size:12.5px;line-height:1.7;font-style:italic;opacity:.85}
         /* 生成失败的提示气泡：红色系弱化样式 + 下方带「重试」按钮 */
         .msg.failed .bubble{background:var(--error-subtle);border-color:color-mix(in srgb,var(--error) 38%,transparent);color:var(--error-strong)}
         .msg.failed .meta-btn:hover{color:var(--error-strong);border-color:color-mix(in srgb,var(--error) 40%,transparent);background:color-mix(in srgb,var(--error) 9%,transparent)}
@@ -829,6 +837,10 @@
             <span>角色</span><span class="role-caret" id="role-caret">▾</span>
           </div>
           <div class="role-list" id="role-list"></div>
+          <a class="story-entry" id="story-entry" href="/pages/story.html" style="display:none" title="2027 KPL 赛季赛程表：跳转任意日期、查看战绩与剧情进度">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M9 16l2 2 4-4"/></svg>
+            <span>2027 赛季赛程表</span>
+          </a>
           <div class="side-foot">
             <button class="provider-row" data-kind="chat" type="button" title="点击切换本地/云端">
               <span class="p-dot checking"></span>
@@ -959,7 +971,18 @@
             var total = state.playingText ? state.playingText.length : 0;
             if (dur <= 0 || !total) return;
             var ms = Math.floor(parseInt(seg.dataset.cs, 10) / total * dur);
+            if (ms >= dur - 200) ms = Math.max(0, dur - 200); /* 末尾段别 seek 到终点直接触发 ended */
             window.AndroidBridge.seekAudio(ms);
+            /* 暂停中点击：跳到目标位置并继续播放，让跳转有实际反馈 */
+            if (state.playing.paused) {
+              try { window.AndroidBridge.resumeAudio(); } catch (e) {}
+              state.playing.paused = false;
+              if (state.playingBtn) {
+                setSpeak(state.playingBtn, '播放中…', true);
+                setBtnWave(state.playingBtn, true);
+                setMsgSpeaking(state.playingBtn, true);
+              }
+            }
           }
           /* 真机触屏滚动/微动后浏览器可能不合成 click，必须走 touchend 判定 tap；
              移动 <10px 且按住 <300ms 才算点击（滚动/长按不触发）；桌面保留 click */
@@ -1140,13 +1163,13 @@
                   fullRaw = '';
                   if (onDelta) onDelta(fullRaw);
                 } else if (ev.done) {
-                  out = { clean: ev.clean, style: ev.style || '', searched: !!ev.searched, vision_used: !!ev.vision_used };
+                  out = { clean: ev.clean, style: ev.style || '', narration: ev.narration || '', searched: !!ev.searched, vision_used: !!ev.vision_used };
                 } else if (ev.err) {
                   throw new Error(ev.err);
                 }
               }
             }
-            if (!out) out = { clean: stripStyleTag(fullRaw), style: '', searched: false, vision_used: false };
+            if (!out) out = { clean: stripStyleTag(fullRaw), style: '', narration: '', searched: false, vision_used: false };
             return out;
           }
 
@@ -1196,10 +1219,15 @@
                 return;
               }
               s = fresh;
-              var aiMsg = { role: 'assistant', content: clean, style: style };
+              var aiMsg = { role: 'assistant', content: clean, style: style, narration: res.narration || '' };
               s.history.push(aiMsg);
               markSessionActivity(sessionId);
               if (currentSessionId === sessionId) {
+                /* 旁白双声部：旁白气泡插在 AI 气泡之前（灰色小字推剧情，大帅气泡说台词） */
+                if (res.narration) {
+                  var narrDiv = addMsg('narration', res.narration);
+                  if (div && div.parentNode) div.parentNode.insertBefore(narrDiv, div);
+                }
                 if (!div) {
                   div = addMsg('assistant', clean);
                 } else {
@@ -1386,7 +1414,7 @@
               b.title = (r.full_name ? r.full_name + '：' : '') + (r.desc || '');
               var ava = document.createElement('span');
               ava.className = 'r-ava';
-              if (r.key === 'dashuai') {
+              if (r.key.indexOf('dashuai') === 0) {
                 var img = document.createElement('img');
                 img.src = 'avatar_dashuai.jpg';
                 img.alt = '大帅';
@@ -1493,6 +1521,8 @@
               state.roles = s.roles || [];
               renderRoles(s.roles, s.active_role);
               renderSideRoles(s.roles, s.active_role);
+              updateStoryEntry(s.active_role);
+              syncSessionForRole();
               var role = (s.roles || []).find(function(r){ return r.key === s.active_role; });
               var wl = document.querySelector('.welcome .eyebrow');
               if (wl && role) {
@@ -1587,7 +1617,7 @@
 
           /* ---------- 消息渲染 ---------- */
           function aiAvatarHtml() {
-            if (currentRoleKey === 'dashuai') return '<img src="avatar_dashuai.jpg" alt="大帅">';
+            if (currentRoleKey.indexOf('dashuai') === 0) return '<img src="avatar_dashuai.jpg" alt="大帅">';
             var r = (state.roles || []).find(function(x){ return x.key === currentRoleKey; });
             return String((r && r.name ? r.name : 'AI').slice(0, 1))
               .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -1703,7 +1733,7 @@
                避免几百个元素同时播动画导致切会话掉帧 */
             div.className = 'msg ' + (role === 'assistant' ? 'ai' : role) + (opts.animate === false ? '' : ' anim');
             div.dataset.role = role;
-            div.innerHTML = '<div class="avatar">' + (role === 'user' ? '我' : aiAvatarHtml()) + '</div><div class="msg-body"><div class="bubble"></div><div class="msg-meta"></div></div>';
+            div.innerHTML = '<div class="avatar">' + (role === 'user' ? '我' : (role === 'narration' ? '' : aiAvatarHtml())) + '</div><div class="msg-body"><div class="bubble"></div><div class="msg-meta"></div></div>';
             /* 头像图片失效（文件被删/404）时回退为角色首字，不露裂图图标 */
             var _avaImg = div.querySelector('.avatar img');
             if (_avaImg) {
@@ -3071,7 +3101,8 @@
               updatedAt: Date.now(),
               history: [],
               pinned: false,       /* 置顶会话：列表优先展示 */
-              manualTitle: false   /* 手动重命名后不再被首条消息自动覆盖标题 */
+              manualTitle: false,  /* 手动重命名后不再被首条消息自动覆盖标题 */
+              role: state.activeRole || ''  /* 会话归属角色：2027 分支会话只属于自己，旧角色互不隔离（保持原行为） */
             };
           }
           function normalizeSession(s) {
@@ -3081,12 +3112,18 @@
               updatedAt: s.updatedAt || Date.now(),
               history: Array.isArray(s.history) ? s.history : [],
               pinned: !!s.pinned,
-              manualTitle: !!s.manualTitle
+              manualTitle: !!s.manualTitle,
+              role: s.role || ''
             };
           }
           /* 旧版曾用 seed-* 假会话填充首次体验，会随自动同步写入服务端形成垃圾记录，一律过滤 */
           function isSeedSession(x) {
             return /^seed-\d+$/.test((x && x.id) || '');
+          }
+          /* 测试脚本/验证脚本写入的会话（id 以 t- 开头）：服务端 GET 已过滤，前端再兜底一层，
+             即使本地缓存里混入也绝不显示、不参与合并 */
+          function isTestSession(x) {
+            return /^t-/.test((x && x.id) || '');
           }
           function loadSessions() {
             var list = [];
@@ -3097,7 +3134,7 @@
                 if (Array.isArray(arr)) list = arr;
               }
             } catch (e) {}
-            list = list.map(normalizeSession).filter(function(s){ return !isSeedSession(s); });
+            list = list.map(normalizeSession).filter(function(s){ return !isSeedSession(s) && !isTestSession(s); });
             /* 存储为空或只剩垃圾记录时，自动建一个干净的新对话，保证页面始终有当前会话 */
             if (!list.length) list.push(makeSession('新对话'));
             return list;
@@ -3118,8 +3155,17 @@
                   method: 'PUT', headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ sessions: sessions, deleted: loadTombstones() }),
                   keepalive: true, /* 页面关闭时的刷盘请求也能发出去 */
-                }).then(function(r){ if (r && r.status === 401) location.href = '/login'; })
-                  .catch(function(){});
+                }).then(function(r){
+                    if (r && r.status === 401) { location.href = '/login'; return; }
+                    if (r && !r.ok) throw new Error('HTTP ' + r.status);
+                }).catch(function(e){
+                    /* 保存失败必须可见：服务挂了/网络断时若静默吞错，用户会误以为
+                       已保存，重开页面/换设备后聊天记录就"消失"了。限频提示避免刷屏。 */
+                    if (!saveSessions._lastErrAt || Date.now() - saveSessions._lastErrAt > 10000) {
+                      saveSessions._lastErrAt = Date.now();
+                      try { toast('记录保存失败，仅存本机：' + ((e && e.message) || '网络异常')); } catch (_) {}
+                    }
+                });
               } catch (e) {}
             };
             if (immediate) doSave();
@@ -3134,7 +3180,7 @@
             return null;
           }
           function currentSession() {
-            return findSession(currentSessionId) || sessions[0] || null;
+            return ensureMainSession();
           }
           /* 会话列表排序：置顶优先，组内按最近活跃时间倒序。
              渲染、删除后选会话、服务端合并三处共用，保证顺序一致 */
@@ -3176,6 +3222,45 @@
               s.pinned ? 1 : 0, s.manualTitle ? 1 : 0,
               last ? ((last.content || '').length + '|' + (last.role || '')) : '-'].join('~');
           }
+          /* 竞态防御：shorter 是否严格是 longer 的消息序列前缀（逐条 role+content 一致）。
+             多端同会话并发写/时钟偏移时，持旧快照的一端 updatedAt 可能更新但消息更少，
+             若允许它覆盖另一端，会把刚保存的消息整段抹掉（与后端 _merge_sessions 同一规则） */
+          function isPrefixSeq(shorter, longer) {
+            if (!shorter || !shorter.length || !longer) return false;
+            if (shorter.length >= longer.length) return false;
+            for (var i = 0; i < shorter.length; i++) {
+              var a = shorter[i], b = longer[i];
+              if (!a || !b) return false;
+              if (a.role !== b.role || (a.content || '') !== (b.content || '')) return false;
+            }
+            return true;
+          }
+          /* shorter 是否严格是 longer 的有序子序列（允许跳过若干消息）。
+             删除消息后提交的剩余序列恰为此形态——用于区分「删除操作」与「并发分歧」。 */
+          function isSubsequenceSeq(shorter, longer) {
+            if (!shorter || !shorter.length || !longer) return false;
+            if (shorter.length >= longer.length) return false;
+            var j = 0, n = longer.length;
+            for (var i = 0; i < shorter.length; i++) {
+              var a = shorter[i], found = false;
+              while (j < n) {
+                var b = longer[j++];
+                if (a && b && a.role === b.role && (a.content || '') === (b.content || '')) { found = true; break; }
+              }
+              if (!found) return false;
+            }
+            return true;
+          }
+          /* 消息级合并：保留 base 顺序，extra 中不在 base 里的消息按原顺序追加（去重）。 */
+          function unionHistory(base, extra) {
+            var seen = {}, out = (base || []).slice();
+            (base || []).forEach(function(m){ seen[m.role + '\u0000' + (m.content || '')] = true; });
+            (extra || []).forEach(function(m){
+              var k = m.role + '\u0000' + (m.content || '');
+              if (!seen[k]) { seen[k] = true; out.push(m); }
+            });
+            return out;
+          }
           var _syncRetry = 0;
           function syncSessionsFromServer() {
             fetch('/api/sessions').then(function(r){
@@ -3185,7 +3270,7 @@
               if (!data || !Array.isArray(data.sessions)) return;
               // 按 id 合并而非直接覆盖：同 id 取 updatedAt 更新的一份，
               // 本地独有的新会话保留，避免服务端旧快照吞掉本地刚产生的消息
-              var remote = data.sessions.map(normalizeSession).filter(function(s){ return !isSeedSession(s); });
+              var remote = data.sessions.map(normalizeSession).filter(function(s){ return !isSeedSession(s) && !isTestSession(s); });
               /* 删除墓碑合并：任一端删过的会话，所有端都保持删除（防旧快照复活） */
               var dead = {};
               (Array.isArray(data.deleted) ? data.deleted : []).forEach(function(t){
@@ -3204,11 +3289,38 @@
                 var dt = dead[r.id];
                 if (dt !== undefined && (r.updatedAt || 0) <= dt) return; /* 最后更新早于删除 → 保持删除 */
                 var l = localById[r.id];
-                var localWins = l && (l.updatedAt || 0) > (r.updatedAt || 0);
+                var mergedObj = r;
+                if (l) {
+                  var lh = l.history || [], rh = r.history || [];
+                  var localNewer = (l.updatedAt || 0) > (r.updatedAt || 0);
+                  /* 本地是服务端纯旧快照（消息更少且为其前缀）且 updatedAt 比服务端新
+                     超过 60s（时钟偏移）→ 用服务端，不允许本地旧副本覆盖；
+                     60s 内的前缀变更视为「删除最后一条消息」的快速操作，删除生效 */
+                  var localStale = rh.length > lh.length && isPrefixSeq(lh, rh)
+                                   && localNewer && ((l.updatedAt || 0) - (r.updatedAt || 0)) > 60000;
+                  /* 分歧：两端各有对方没有的消息（并发各发各话）→ 消息级合并双方都不丢 */
+                  var diverge = !localStale && lh.length !== rh.length
+                                && !isSubsequenceSeq(lh, rh) && !isSubsequenceSeq(rh, lh);
+                  if (localStale) {
+                    mergedObj = r;
+                  } else if (diverge) {
+                    var base = localNewer ? l : r, extra = localNewer ? r : l;
+                    mergedObj = normalizeSession({
+                      id: r.id, title: (localNewer ? l : r).title,
+                      updatedAt: Math.max(l.updatedAt || 0, r.updatedAt || 0),
+                      history: unionHistory(base.history || [], extra.history || []),
+                      pinned: !!(localNewer ? l : r).pinned,
+                      manualTitle: !!(localNewer ? l : r).manualTitle
+                    });
+                  } else {
+                    mergedObj = localNewer ? l : r; /* 删除/正常演进：时间新者胜 */
+                  }
+                }
+                var localWins = mergedObj === l;
                 if (!l) changed = true;
-                else if (!localWins && sessionFingerprint(l) !== sessionFingerprint(r)) changed = true;
-                if (!localWins && r.id === currentSessionId && l && sessionFingerprint(l) !== sessionFingerprint(r)) activeReplaced = true;
-                merged.push(localWins ? l : r);
+                else if (!localWins && sessionFingerprint(l) !== sessionFingerprint(mergedObj)) changed = true;
+                if (!localWins && r.id === currentSessionId && l && sessionFingerprint(l) !== sessionFingerprint(mergedObj)) activeReplaced = true;
+                merged.push(mergedObj);
               });
               sessions.forEach(function(l){
                 if (mergedIds[l.id]) return;
@@ -3300,9 +3412,50 @@
              但排序/置顶/标题/活跃时间/选中态都没变时 DOM 无需重建。
              用轻量指纹串比对（不依赖深比较），不变直接跳过 → 连续收发消息不再反复重建列表 */
           var sessionsRenderKey = '';
+          /* ---- 主对话模式：每角色一个固定主对话（id=main_{role}），禁新建、不切换 ----
+             首次进入某角色时，若存在旧会话，取最新一个的内容迁移进主对话（旧数据保留不显示）。 */
+          function mainSessionId(){ return 'main_' + (currentRoleKey || 'role'); }
+          function ensureMainSession(){
+            var mid = mainSessionId();
+            var main = findSession(mid);
+            if (main) return main;
+            var latest = sortSessions(sessions.filter(function(x){ return x.id !== mid; }))[0];
+            var s = makeSession('新对话');
+            s.id = mid;
+            var roleName = '';
+            var rr = (state.roles || []).find(function(x){ return x.key === currentRoleKey; });
+            if (rr) roleName = rr.name;
+            s.title = (roleName || currentRoleKey) + '·主对话';
+            s.manualTitle = true;           /* 主对话标题固定，不被首条消息覆盖 */
+            s.role = currentRoleKey || '';  /* 与主对话 id 对应的角色一致 */
+            s.history = latest ? latest.history.slice() : [];
+            s.updatedAt = latest ? latest.updatedAt : Date.now();
+            sessions.push(s);
+            persistLocal();
+            return s;
+          }
+          /* 会话按角色可见性：2027 分支会话只归自己；其余角色互相可见（旧行为不变） */
+          function visibleSessions() {
+            return [ensureMainSession()];
+          }
+          /* 切角色后校正当前会话归属：始终指向当前角色的主对话；
+             仅归属变化时重渲染聊天区，避免每次状态刷新闪屏/打断朗读 */
+          function syncSessionForRole() {
+            var main = ensureMainSession();
+            var changed = currentSessionId !== main.id;
+            currentSessionId = main.id;
+            if (changed) renderCurrentSession();
+            renderSessions();
+          }
+          /* 2027 赛季入口：仅 dashuai2027 角色激活时显示（跳赛程表页面） */
+          function updateStoryEntry(activeRole) {
+            var el = document.getElementById('story-entry');
+            if (el) el.style.display = (activeRole === 'dashuai2027') ? 'flex' : 'none';
+          }
           function renderSessions() {
             if (!sessionsBox) return;
-            var key = sortSessions(sessions).map(function(x){
+            var vis = visibleSessions();
+            var key = sortSessions(vis).map(function(x){
               return x.id + '|' + (x.pinned ? 1 : 0) + '|' + (x.title || '') + '|' + (x.updatedAt || 0) + '|' + (x.id === currentSessionId ? 1 : 0);
             }).join('~');
             if (key === sessionsRenderKey && sessionsBox.childNodes.length) return;
@@ -3310,7 +3463,7 @@
             sessionsBox.innerHTML = '';
             /* 文档片段批量挂载：几十个会话一次性 append，只触发一次布局/重绘 */
             var frag = document.createDocumentFragment();
-            sortSessions(sessions).forEach(function(session, idx){
+            sortSessions(vis).forEach(function(session, idx){
               var s = document.createElement('button');
               s.className = 'session' + (!sessionsAnimatedOnce ? ' side-in' : '') + (session.id === currentSessionId ? ' active' : '') + (session.pinned ? ' pinned' : '');
               if (!sessionsAnimatedOnce) s.style.animationDelay = Math.min(idx * 30, 300) + 'ms';
@@ -3325,7 +3478,7 @@
               }
               s.querySelector('.s-time').textContent = timeLabel(session.updatedAt);
               bindSessionClick(s);
-              bindSessionMenu(s);
+              /* 主对话模式：不绑定右键/长按菜单（禁删除/重命名/置顶主对话） */
               frag.appendChild(s);
             });
             sessionsBox.appendChild(frag);
@@ -3346,6 +3499,12 @@
             (state.history || []).forEach(function(m, i){
               /* 长历史（>16 条）瞬时渲染：不播入场动画，切会话零等待也不掉帧 */
               var animOn = state.history.length <= 16;
+              /* 旁白双声部：assistant 消息带 narration 时先渲染旁白气泡（不占 hidx、不带按钮） */
+              if (m.role === 'assistant' && m.narration) {
+                addMsg('narration', m.narration, {
+                  noScroll: true, animate: animOn, container: frag
+                });
+              }
               var div = addMsg(m.role, m.content, {
                 delay: animOn ? Math.min(i * 45, 400) : 0, noScroll: true,
                 attachments: m.attachments || [], animate: animOn,
@@ -3603,11 +3762,19 @@
             renderCurrentSession();
           }
           var newBtn = document.querySelector('[data-dom-id="btn-new"]');
-          if (newBtn) newBtn.addEventListener('click', newSession);
-          var savedActive = localStorage.getItem(ACTIVE_KEY);
-          if (savedActive && sessions.some(function(x){ return x.id === savedActive; })) {
-            currentSessionId = savedActive;
+          if (newBtn) {
+            /* 主对话模式：每角色一个主对话，禁新建（按钮隐藏 + 事件拦截双保险） */
+            newBtn.style.display = 'none';
+            newBtn.addEventListener('click', function(e){
+              e.preventDefault();
+              e.stopPropagation();
+              toast('主对话模式：所有消息都在与当前角色的主对话里');
+            });
           }
+          var savedActive = localStorage.getItem(ACTIVE_KEY);
+          /* 主对话模式：忽略历史保存的会话 id，统一指向当前角色主对话（服务端真实角色由 refreshStatus 同步校正） */
+          ensureMainSession();
+          currentSessionId = mainSessionId();
           /* 初始化只写本地：若 localStorage 为空而服务端有真实历史，
              此时 PUT 会把种子会话推上去覆盖历史（GET/PUT 竞态）。
              真正的服务端同步由 syncSessionsFromServer 合并后回传 */
@@ -3723,7 +3890,9 @@
                   if (currentSessionId !== sessionId) return;
                   var s = findSession(sessionId);
                   if (!s) return;
-                  var gMsg = { role: 'assistant', content: r.reply, style: r.style || '' };
+                  var gMsg = { role: 'assistant', content: r.reply, style: r.style || '', narration: r.narration || '' };
+                  /* 旁白双声部：先渲染灰色旁白气泡，再渲染大帅的问候气泡 */
+                  if (r.narration) addMsg('narration', r.narration);
                   var div = addMsg('assistant', r.reply);
                   var meta = div.querySelector('.msg-meta');
                   var spk = null;

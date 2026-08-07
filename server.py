@@ -43,11 +43,14 @@ from pydantic import BaseModel
 
 import role_engine
 from role_engine import MemoryStore, StateStore, PostProcessor
+import story_kpl2027  # 2027 KPL 赛季剧情分支引擎
 
 import minimax_llm  # MiniMax 云端文字生成适配器（OpenAI 兼容，payg / token_plan 双计费）
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+# 数据目录可用环境变量 AI_DATA_DIR 覆盖：测试专用实例（start_test_server.bat）
+# 指向 data-test/，会话/上传/缓存与真实服务完全隔离，测试不污染真实数据。
+DATA_DIR = Path(os.getenv("AI_DATA_DIR") or (BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 TTS_CACHE_DIR = DATA_DIR / "tts_cache"
@@ -217,8 +220,62 @@ def _sess_updated_at(s: dict) -> float:
 def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
     """多端合并：按 id 归并（updatedAt 新者胜，平手取 incoming），再按墓碑过滤。
 
+    竞态防御（防止聊天记录被旧快照整段抹掉）：
+    同 id 会话的 incoming 与 current 出现三种关系，分别处理：
+    1. incoming 是 current 的"严格前缀"（消息数更少且逐条一致）→ incoming 是纯旧
+       快照（时钟偏移/并发双写，没带来任何新消息）→ 保留 current，绝不覆盖；
+       例外：updatedAt 仅比 current 新 ≤60s（用户刚删除最后一条消息的快速操作）时
+       视为删除、生效。阈值权衡：防静默丢数据优先于删除最后一条的精确性。
+    2. incoming 是 current 的"有序子序列"（允许跳项，即删除后的剩余序列）→ 这是
+       用户删除消息/清空的操作 → updatedAt 新者胜（删除生效）。
+    3. 其余（分歧：两端各有对方没有的消息，如并发各发各话）→ 消息级合并：以
+       updatedAt 新者的消息顺序为基底，把另一端独有的消息按原顺序补回，双方消息
+       都不丢（顺序以新者为准，独有消息追加在后）。
+    真实事故背景：手机持 130 条旧副本、时钟超前，覆盖了服务端 131 条，丢 2 条。
+
     会话 updatedAt 新于墓碑时间视为"复活"（保留会话并移除墓碑）；
     返回按 updatedAt 倒序的前 500 条。会就地修改 tombstones（弹出失效项）。"""
+
+    def _msg_key(m: dict):
+        return (m.get("role"), m.get("content"), m.get("style") or "")
+
+    def _is_strict_prefix(shorter: list, longer: list) -> bool:
+        """shorter 是否严格是 longer 的前缀（按消息指纹逐条比对）。"""
+        if not shorter or len(shorter) >= len(longer):
+            return False
+        for i, m in enumerate(shorter):
+            if _msg_key(m) != _msg_key(longer[i]):
+                return False
+        return True
+
+    def _is_subsequence(sub: list, sup: list) -> bool:
+        """sub 是否严格是 sup 的有序子序列（允许跳过 sup 中的若干消息）。
+        删除消息后提交的序列恰为此形态。"""
+        if not sub or len(sub) >= len(sup):
+            return False
+        i, n = 0, len(sup)
+        for m in sub:
+            k = _msg_key(m)
+            while i < n and _msg_key(sup[i]) != k:
+                i += 1
+            if i >= n:
+                return False
+            i += 1
+        return True
+
+    def _union_history(base: list, extra: list) -> list:
+        """消息级合并：保留 base 顺序，extra 中不在 base 里的消息按原顺序追加。"""
+        seen = set()
+        for m in base:
+            seen.add(_msg_key(m))
+        out = list(base)
+        for m in extra:
+            k = _msg_key(m)
+            if k not in seen:
+                seen.add(k)
+                out.append(m)
+        return out
+
     by_id: dict = {}
     for s in [*current, *incoming]:
         if not isinstance(s, dict):
@@ -227,8 +284,37 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
         if not isinstance(sid, str) or not sid:
             continue
         old = by_id.get(sid)
-        if old is None or _sess_updated_at(s) >= _sess_updated_at(old):
+        if old is None:
             by_id[sid] = s
+            continue
+        # old=已入桶（current 优先），s=当前遍历项（incoming 在后）
+        old_hist = old.get("history") or []
+        new_hist = s.get("history") or []
+        new_wins = _sess_updated_at(s) >= _sess_updated_at(old)
+        if _is_strict_prefix(new_hist, old_hist):
+            # incoming 是 old 的纯旧快照：默认保留 old 防时钟偏移覆盖；
+            # 例外：updatedAt 仅比 old 新 ≤60s（用户刚删除最后一条消息的快速操作）→ 删除生效
+            if _sess_updated_at(s) - _sess_updated_at(old) > 60000:
+                continue
+            if new_wins:
+                by_id[sid] = s
+            continue
+        if new_hist == [] and old_hist:
+            # 清空全部消息：视为删除操作
+            if new_wins:
+                by_id[sid] = s
+            continue
+        if _is_subsequence(new_hist, old_hist) or _is_subsequence(old_hist, new_hist):
+            # 删除后的剩余序列 → 正常删除语义，updatedAt 新者胜
+            if new_wins:
+                by_id[sid] = s
+            continue
+        # 分歧：双方各有独有消息 → 消息级合并，双方都不丢
+        base, extra = (s, old) if new_wins else (old, s)
+        merged_s = dict(base)
+        merged_s["history"] = _union_history(base.get("history") or [], extra.get("history") or [])
+        merged_s["updatedAt"] = max(_sess_updated_at(s), _sess_updated_at(old))
+        by_id[sid] = merged_s
     out = []
     for sid, s in by_id.items():
         ts = tombstones.get(sid)
@@ -349,6 +435,28 @@ def _spawn_bg(coro) -> None:
 # 角色引擎：按 active_role 懒创建 (MemoryStore, StateStore) 缓存，切角色即换存储
 _role_stores: dict[str, tuple[MemoryStore, StateStore]] = {}
 _post_processor: PostProcessor | None = None
+
+# 2027 赛季剧情分支：懒加载 StoryManager（首启生成日历/状态，失败不阻塞主链路）
+_story_manager: story_kpl2027.StoryManager | None = None
+
+
+def _get_story_manager() -> story_kpl2027.StoryManager | None:
+    global _story_manager
+    if _story_manager is None:
+        try:
+            _story_manager = story_kpl2027.StoryManager(str(DATA_DIR))
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("story manager init failed: %s", exc)
+            return None
+    return _story_manager
+
+
+def _story_role() -> bool:
+    """当前激活角色是否启用剧情分支（roles.<role>.story.enabled）。"""
+    cfg = load_config()
+    role = cfg.get("active_role", "")
+    r = (cfg.get("roles") or {}).get(role) or {}
+    return bool((r.get("story") or {}).get("enabled"))
 
 # 角色名白名单：仅字母/数字/下划线/连字符/中文，最长 64。
 # role 会拼进 data/memory/{role}.json / data/state/{role}.json 文件路径，
@@ -1792,6 +1900,109 @@ def _role_news_hint(text: str | None = None) -> str:
         "如果用户提到你更新的消息，以用户说的为准。"
     )
 
+
+def _story_hint() -> str:
+    """2027 赛季剧情分支注入块：虚拟日历/赛段/今日事件/战绩/情感阶段行为指令。
+    仅对 story 角色生效（roles.<role>.story.enabled），其他角色返回空串。"""
+    if not _story_role():
+        return ""
+    sm = _get_story_manager()
+    if sm is None:
+        return ""
+    try:
+        return "\n\n" + sm.story_context() + _narration_hint()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("story hint failed: %s", exc)
+        return ""
+
+
+# ---- 旁白（双声部）模式：仅 dashuai2027 生效 ----
+_NARRATION_TAG = "dashuai2027"
+
+_NARRATION_RULE = (
+    "\n\n【旁白模式·双声部演出】你是「大帅·2027」剧情里的双声部演出者："
+    "回复时把内容分成两段，严格用下面的标记分隔：\n"
+    "【旁白】第三视角叙述段：描写环境、动作、氛围、大帅的微表情与小动作，"
+    "偶尔可写大帅的内心戏（心里想什么），但不得直白说出他是否喜欢对方、"
+    "不得替任何角色说台词。用「大帅」「岚风」称呼，1-3 句，客观克制、有画面感，"
+    "像小说叙述层。\n"
+    "【大帅】大帅本人的台词段：用第一人称「我」说话，保持大帅人设（场下别扭隐忍、"
+    "场上倔强较真、嘴硬心软），括号里可以描写他自己的动作表情，但心里话只能侧面流露。\n"
+    "规则：旁白只叙述、不评价、不替大帅回答；大帅只说自己的话、不念旁白该念的稿。"
+    "每天首次对话、比赛日、剧情节点、跳转日期后的回复**必须带旁白**；"
+    "普通日常闲聊可以省略旁白段，直接输出【大帅】段。"
+)
+
+_NARR_TAG_RE = re.compile(r"【\s*旁白\s*】")
+_TALK_TAG_RE = re.compile(r"【\s*大帅\s*】")
+
+
+def _narration_hint() -> str:
+    """旁白模式指令：仅 dashuai2027 角色注入，其他角色空串。"""
+    try:
+        return _NARRATION_RULE if load_config().get("active_role") == _NARRATION_TAG else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _split_narration(raw: str) -> tuple[str, str]:
+    """拆分双声部回复：返回 (旁白文本, 大帅台词)。
+    兼容【旁白】段在前、【大帅】段在后的任意排版（同行/换行/带前缀）；
+    无旁白标记时（空, 剥掉【大帅】标记后的原文）。"""
+    if not raw:
+        return "", raw
+    m = _NARR_TAG_RE.search(raw)
+    if not m:
+        # 无旁白段：仅剥掉开头的【大帅】标记（若有），其余全文为台词
+        t = _TALK_TAG_RE.match(raw)
+        return "", raw[t.end():].strip() if t else raw.strip()
+    head = raw[:m.start()].strip()
+    tail = raw[m.end():].strip()
+    tm = _TALK_TAG_RE.search(tail)
+    if tm:
+        narr = (head + " " + tail[:tm.start()]).strip()
+        talk = tail[tm.end():].strip()
+    else:
+        # 有旁白标记但模型漏写【大帅】段：整段按旁白处理，台词留空（前端不渲染空台词）
+        narr = (head + " " + tail).strip()
+        talk = ""
+    narr = re.sub(r"\s+", " ", narr).strip()
+    talk = re.sub(r"\s+", " ", talk).strip()
+    return narr, talk
+
+
+# 剧情分支比赛结果兜底识别：消息同时含「赢/胜或输/负」与「数字:数字」比分时记录
+_STORY_SCORE_RE = re.compile(r"(\d+)\s*[:：]\s*(\d+)")
+
+
+def _story_record_from_talk(win: bool, score: str = "", mvp: str = "") -> None:
+    """记录剧情分支比赛结果：默认记当前虚拟日期，当天无未记录比赛则回溯最近一场。"""
+    sm = _get_story_manager()
+    if sm is None:
+        return
+    try:
+        d = sm.resolve_result_date(sm.current_date())
+        sm.record_result(story_kpl2027._s(d), win, score, mvp)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("story record failed: %s", exc)
+
+
+def _story_result_regex_handle(user_msg: str) -> None:
+    """正则兜底：LLM 抽取失败时，从用户消息里识别「赢/输 + 比分」并记录。"""
+    try:
+        m = _STORY_SCORE_RE.search(user_msg or "")
+        if not m:
+            return
+        if re.search(r"赢|胜", user_msg):
+            win = True
+        elif re.search(r"输|负", user_msg):
+            win = False
+        else:
+            return
+        _story_record_from_talk(win, f"{m.group(1)}:{m.group(2)}")
+    except Exception:  # noqa: BLE001
+        pass
+
 # 模型偶发在回复里追加「元话语」行（免责/虚构声明、跳出角色的系统式提示、面向第三方的总结），
 # 与正文无关且会被 TTS 朗读，统一按「整行」剥离：行首是 注/备注/温馨提示/提示/说明/PS 的整行，
 # 或包含免责/虚构/跳出角色关键词的短行（≤120 字）。只删整行，绝不动正文，避免误伤台词。
@@ -2169,6 +2380,8 @@ async def lifespan(app: FastAPI):
     # 定时巡检角色现实动态缓存：过期自动后台刷新，保证角色状态随时间自动变化
     # （按需模式 auto_refresh=false 时巡检器内部直接跳过）
     _spawn_bg(_role_news_scheduler())
+    # 2027 赛季剧情分支：首启后台生成日历/状态文件（幂等，不阻塞启动）
+    _spawn_bg(asyncio.to_thread(_get_story_manager))
     yield
     # 关闭：先等后台任务收尾（上限 5s），再关 httpx 连接池
     if _bg_tasks:
@@ -3840,8 +4053,11 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
             clean = _strip_meta_notes(clean)
             if active_role == "dashuai":
                 clean = _fix_addressing(clean)
+            narration = ""
+            if active_role == _NARRATION_TAG:
+                narration, clean = _split_narration(clean)
             style, _ = parse_style_prefix(full)
-            yield ev({"done": True, "clean": clean, "style": style,
+            yield ev({"done": True, "clean": clean, "narration": narration, "style": style,
                       "searched": False, "vision_used": True})
             return
         if any(a.get("kind") == "image" for a in req.attachments):
@@ -3952,8 +4168,11 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
     # 称呼纠错仅对大帅角色生效（自称老婆/称用户老公/男性自称），其他角色会误伤
     if active_role == "dashuai":
         clean = _fix_addressing(clean)
+    narration = ""
+    if active_role == _NARRATION_TAG:
+        narration, clean = _split_narration(clean)
     style, _ = parse_style_prefix(full)
-    yield ev({"done": True, "clean": clean, "style": style,
+    yield ev({"done": True, "clean": clean, "narration": narration, "style": style,
               "searched": searched, "vision_used": vision_used})
 
 
@@ -4004,7 +4223,7 @@ async def chat(req: ChatRequest):
     system = {"role": "system",
               "content": persona + ctx_block + _META_HINT + style_hint + search_hint
                          + _time_hint() + _self_hint() + _role_news_hint(news_text)
-                         + _location_hint(location_text) + _weather_hint()}
+                         + _location_hint(location_text) + _weather_hint() + _story_hint()}
     provider = cfg.get("provider", "cloud")
     # 云端模型上下文窗口大，超长历史回复全文保留利于追问；本地小上下文才截断
     history = _clean_history(req.history, user_text, clip_long_replies=(provider == "local"))
@@ -4090,6 +4309,12 @@ async def chat(req: ChatRequest):
     )
     # 剥离模型偶发追加的元话语（免责/虚构声明、跳出角色的提示），拿到干净文本再入库与展示
     reply = _strip_meta_notes(reply)
+    # 旁白双声部拆分：dashuai2027 角色的回复拆成（旁白, 大帅台词）两段，前端分泡渲染
+    narration = ""
+    if active_role == _NARRATION_TAG:
+        narration, reply = _split_narration(reply)
+        if narration:
+            narration = _strip_meta_notes(narration)
     # 对话后处理（异步，不阻塞）：更新情绪状态 + 抽取长期记忆写回
     if engine_on and mem is not None and st is not None and reply:
         _spawn_bg(_post_process_chat(active_role, post_text, reply))
@@ -4098,7 +4323,7 @@ async def chat(req: ChatRequest):
     # 等其他角色是无条件执行的，会把「我是女孩子」这类正常表述误改成「我是男生」。
     if active_role == "dashuai":
         reply = _fix_addressing(reply)
-    return {"reply": reply, "style": style, "vision_used": vision_used, "searched": searched}
+    return {"reply": reply, "narration": narration, "style": style, "vision_used": vision_used, "searched": searched}
 
 
 async def _post_process_chat(role: str, user_msg: str, reply: str) -> None:
@@ -4113,9 +4338,20 @@ async def _post_process_chat(role: str, user_msg: str, reply: str) -> None:
         ann = await _get_post_processor().run(user_msg, reply, state.get("emotion") or {},
                                               existing_memories=existing)
         if not ann:
+            # LLM 标注失败时，剧情分支用正则兜底识别比赛结果
+            if _story_role():
+                _story_result_regex_handle(user_msg)
             return
         await asyncio.to_thread(st.update, emotion=ann.get("emotion"),
                                 energy_delta=ann.get("energy_delta", 0), intimacy_delta=0.01)
+        # 剧情分支：抽取用户宣布的比赛结果并记录（仅在明确 win 布尔时记录）
+        if _story_role():
+            sr = ann.get("story_result")
+            if isinstance(sr, dict) and isinstance(sr.get("win"), bool):
+                _story_record_from_talk(sr["win"], str(sr.get("score") or ""),
+                                        str(sr.get("mvp") or ""))
+            else:
+                _story_result_regex_handle(user_msg)
         for text in ann.get("memories") or []:
             # 防记忆污染：AI 自己的回复原文/台词不得当成用户事实入库，否则下轮会被注入 system 导致复读。
             if role_engine._dup_sim(text, reply) >= 0.5 or role_engine._dup_sim(text, user_msg) >= 0.5:
@@ -4256,25 +4492,49 @@ async def role_greeting():
         except Exception as exc:  # noqa: BLE001
             _log.warning("greeting context build failed: %s", exc)
     style_hint = _STYLE_HINT
-    greeting_instruction = (
-        "\n\n【任务】现在是你主动找老公说话的时刻。没有人先开口，是你想找他聊两句。"
-        "可以是一句关心、一个分享、或者想起之前聊过的事顺嘴提一句。"
-        "就像真人微信里突然发来一条消息一样自然，1-3 句话，别太长，别像系统通知。"
-        "不要用'你好'这种客套开场。"
-    )
+    if _story_role():
+        # 2027 剧情分支：队友+暗恋者身份的主动问候（绝不能用「老公」文案）
+        greeting_instruction = (
+            "\n\n【任务】现在是你主动找岚风说话的时刻。没有人先开口，是你想找他聊两句。"
+            "以队友+暗恋者的身份自然开口：可以是训练赛/比赛的事、一句别扭的关心、"
+            "或者你们昨天吵过架你想找台阶下又拉不下脸。记住：场上争、场下护，嘴上硬、心里软。"
+        )
+        if active_role == _NARRATION_TAG:
+            # 旁白双声部：问候也分两段输出，旁白铺场景、大帅开口
+            greeting_instruction += (
+                "\n回复请分两段输出：【旁白】段用第三视角写当前场景（1-2 句，"
+                "基地/训练室/房间的氛围或大帅的小动作）；【大帅】段才是你发出去的消息"
+                "（1-3 句，别太长，别像系统通知，不要用'你好'开场）。"
+            )
+        greeting_user = "（你主动发消息给岚风）"
+        greeting_fallback = "岚风，训练呢？"
+    else:
+        greeting_instruction = (
+            "\n\n【任务】现在是你主动找老公说话的时刻。没有人先开口，是你想找他聊两句。"
+            "可以是一句关心、一个分享、或者想起之前聊过的事顺嘴提一句。"
+            "就像真人微信里突然发来一条消息一样自然，1-3 句话，别太长，别像系统通知。"
+            "不要用'你好'这种客套开场。"
+        )
+        greeting_user = "（你主动发消息给老公）"
+        greeting_fallback = "老公，在忙吗？"
     system = {"role": "system",
               "content": persona + ctx_block + _META_HINT + greeting_instruction + style_hint
                          + _time_hint() + _self_hint() + _role_news_hint(news_text)
-                         + _location_hint(location_text) + _weather_hint()}
-    messages = [system, {"role": "user", "content": "（你主动发消息给老公）"}]
+                         + _location_hint(location_text) + _weather_hint() + _story_hint()}
+    messages = [system, {"role": "user", "content": greeting_user}]
     raw = await llm_chat(messages)
     fallback_style = cfg.get("voice", {}).get("style") or "自然"
     style, reply = parse_style_prefix(raw, fallback=fallback_style)
     reply = _strip_meta_notes(reply)
+    narration = ""
+    if active_role == _NARRATION_TAG:
+        narration, reply = _split_narration(reply)
+        if narration:
+            narration = _strip_meta_notes(narration)
     if not reply.strip():
-        reply = "老公，在忙吗？"
+        reply = greeting_fallback
         style = fallback_style
-    return {"reply": reply, "style": style}
+    return {"reply": reply, "narration": narration, "style": style}
 
 
 @app.post("/api/tts")
@@ -4341,11 +4601,25 @@ class SessionsRequest(BaseModel):
     deleted: list[dict] = []
 
 
+# 测试会话标记：id 以 t- 开头。真实 App 生成的 id 恒为 's' + base36（见前端
+# makeSession），旧版 seed-* 假会话已被前端过滤，故 t- 前缀不会与真实会话冲突。
+# 约定：测试脚本/验证脚本写入的会话一律用 t- 前缀，服务端 GET 默认过滤，
+# 前端永远看不到；?include_test=1 可显式查看（供测试往返验证）。
+_TEST_SESSION_PREFIX = "t-"
+
+
+def _is_test_session(item) -> bool:
+    """判断会话或墓碑是否为测试数据（id 以 t- 开头）。"""
+    sid = (item or {}).get("id") if isinstance(item, dict) else None
+    return isinstance(sid, str) and sid.startswith(_TEST_SESSION_PREFIX)
+
+
 @app.get("/api/sessions")
-async def get_sessions():
+async def get_sessions(include_test: int = 0):
     """读取持久化的会话历史（data/sessions.json），文件不存在或损坏时返回空列表。
     带 mtime 缓存：不频繁读盘，且并发安全。
-    deleted 为删除墓碑列表（多端同步用：任一端删除的会话不应被另一端复活）。"""
+    deleted 为删除墓碑列表（多端同步用：任一端删除的会话不应被另一端复活）。
+    默认过滤测试会话（id 以 t- 开头），include_test=1 时全部返回。"""
     if not SESSIONS_PATH.exists():
         return {"sessions": [], "deleted": []}
     try:
@@ -4378,7 +4652,14 @@ async def get_sessions():
                 _sess_cache["_value"] = value
                 _sess_cache["_mtime_ns"] = mtime
     value = _sess_cache["_value"]
-    return {"sessions": list(value.get("sessions", [])), "deleted": list(value.get("deleted", []))}
+    sessions = list(value.get("sessions", []))
+    deleted = list(value.get("deleted", []))
+    if not include_test:
+        # 测试会话只留在服务端文件里（等待 cleanup_test_sessions.py 清理），
+        # 真实前端（手机/桌面）永远收不到，也就不会显示在会话列表。
+        sessions = [s for s in sessions if not _is_test_session(s)]
+        deleted = [t for t in deleted if not _is_test_session(t)]
+    return {"sessions": sessions, "deleted": deleted}
 
 
 @app.put("/api/sessions")
@@ -4662,6 +4943,79 @@ async def roles_apply(req: dict):
     if _role_news_auto_refresh():
         _spawn_bg(_bg_role_news_refresh(force=True))
     return {"ok": True, "role": key, "persona": cfg["persona"]}
+
+
+# ------------------------------------------------------------ 2027 赛季剧情分支 --------
+
+def _story_api_manager() -> story_kpl2027.StoryManager:
+    """剧情 API 公共检查：非 story 角色 404，引擎不可用 500。"""
+    if not _story_role():
+        raise HTTPException(404, "当前角色未启用剧情分支")
+    sm = _get_story_manager()
+    if sm is None:
+        raise HTTPException(500, "剧情引擎不可用")
+    return sm
+
+
+@app.get("/api/story/calendar")
+async def story_calendar():
+    """2027 赛程表：赛段 + AG 全年比赛 + 事件（团综/铺垫期节点）。"""
+    sm = _story_api_manager()
+    return sm.calendar_payload()
+
+
+@app.get("/api/story/status")
+async def story_status():
+    """剧情当前状态：虚拟日期/模式/今日事件/战绩/情感阶段/下一场比赛。"""
+    sm = _story_api_manager()
+    return sm.status_payload()
+
+
+@app.post("/api/story/jump")
+async def story_jump(req: dict):
+    """跳转到赛程任意日期（2026-08-08 ~ 2027-12-31），剧情暂停在该日。"""
+    sm = _story_api_manager()
+    ds = (req.get("date") or "").strip()
+    if not sm.jump(ds):
+        raise HTTPException(400, "无效日期（范围 2026-08-08 ~ 2027-12-31）")
+    return sm.status_payload()
+
+
+@app.post("/api/story/resume")
+async def story_resume():
+    """回到「跟随现实」模式：虚拟日期恢复与现实同步推进。"""
+    sm = _story_api_manager()
+    sm.resume()
+    return sm.status_payload()
+
+
+@app.post("/api/story/result")
+async def story_result(req: dict):
+    """记录比赛结果（对话识别失败时的兜底入口）。date 缺省 = 当天或最近一场未记录比赛。"""
+    sm = _story_api_manager()
+    ds = (req.get("date") or "").strip()
+    win = bool(req.get("win"))
+    score = str(req.get("score") or "")
+    mvp = str(req.get("mvp") or "")
+    if ds:
+        r = sm.record_result(ds, win, score, mvp)
+    else:
+        d = sm.resolve_result_date(sm.current_date())
+        r = sm.record_result(story_kpl2027._s(d), win, score, mvp)
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("msg", "记录失败"))
+    return {"ok": True, "stage": r.get("stage"), **sm.status_payload()}
+
+
+@app.post("/api/story/flag")
+async def story_flag(req: dict):
+    """手动触发剧情 flag（command_win 指挥权归岚风 / confession 攻略成功 等），兜底/测试用。"""
+    sm = _story_api_manager()
+    flag = (req.get("flag") or "").strip()
+    detail = str(req.get("detail") or "")
+    if not sm.set_flag(flag, True, detail):
+        raise HTTPException(400, f"未知剧情 flag: {flag}")
+    return {"ok": True, **sm.status_payload()}
 
 
 @app.get("/api/weather")

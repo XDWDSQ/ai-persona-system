@@ -198,9 +198,12 @@ class LocalServer private constructor() {
         "host", "connection", "content-length", "transfer-encoding", "accept-encoding",
         "origin", "referer", "cookie", "proxy-connection", "upgrade", "keep-alive", "user-agent",
     )
-    /** 转发响应时跳过的头 */
+    /** 转发响应时跳过的头。
+     *  注意：Content-Length 必须透传——MediaPlayer 播放 WAV 音频时依赖它拿到总时长，
+     *  丢了会导致 audioDurationMs()=-1，前端"点击文字跳转音频位置"直接失效；
+     *  SSE 等无长度响应里该头本来就不存在，透传无副作用。 */
     private val SKIP_RESP_HEADERS = setOf(
-        "transfer-encoding", "connection", "keep-alive", "date", "content-length", "set-cookie",
+        "transfer-encoding", "connection", "keep-alive", "date", "set-cookie",
     )
 
     private fun proxy(

@@ -1,6 +1,8 @@
 # 敏感信息
 .env
 config.json
+config.json.bak*
+config.example.json.bak*
 
 # Python
 __pycache__/
@@ -10,6 +12,8 @@ __pycache__/
 
 # 运行时数据（会话、音频输出、缓存）
 data/
+# 测试专用隔离实例数据目录（start_test_server.bat）
+data-test/
 
 # 临时分段目录与空静态目录
 temp_seg/

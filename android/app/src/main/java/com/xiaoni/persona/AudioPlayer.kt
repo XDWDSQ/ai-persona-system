@@ -117,7 +117,11 @@ class AudioPlayer(private val activity: MainActivity) {
     }
 
     /** 音频总时长（毫秒），未就绪返回 -1 */
-    fun durationMs(): Long = try { player?.duration?.toLong() ?: -1L } catch (_: Exception) { -1L }
+    fun durationMs(): Long {
+        val d = try { player?.duration?.toLong() ?: -1L } catch (_: Exception) { -1L }
+        android.util.Log.d("AudioPlayer", "durationMs=$d")
+        return d
+    }
 
     /** 当前播放位置（毫秒） */
     fun positionMs(): Long = try { player?.currentPosition?.toLong() ?: -1L } catch (_: Exception) { -1L }
