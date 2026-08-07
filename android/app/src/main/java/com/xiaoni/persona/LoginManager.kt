@@ -15,19 +15,22 @@ object LoginManager {
     @Volatile var token: String = ""
 
     private val cookies = HashMap<String, String>()
-    private val lock = Any()
+    /** 保护 cookies 读写（短暂持锁，毫秒级） */
+    private val cookieLock = Any()
+    /** 保护登录流程（网络 I/O 期间持锁，最多数十秒；与 cookieLock 分离避免阻塞主线程） */
+    private val loginLock = Any()
 
     /** 配置变化时调用：清空旧 cookie，下次请求自动重新登录 */
     fun updateConfig(url: String?, tok: String) {
-        synchronized(lock) {
-            serverUrl = url
-            token = tok
+        serverUrl = url
+        token = tok
+        synchronized(cookieLock) {
             cookies.clear()
         }
     }
 
     fun attachCookie(conn: HttpURLConnection) {
-        synchronized(lock) {
+        synchronized(cookieLock) {
             if (cookies.isNotEmpty()) {
                 conn.setRequestProperty(
                     "Cookie",
@@ -41,16 +44,16 @@ object LoginManager {
         val pair = setCookie.substringBefore(';')
         val eq = pair.indexOf('=')
         if (eq > 0) {
-            synchronized(lock) {
+            synchronized(cookieLock) {
                 cookies[pair.substring(0, eq).trim()] = pair.substring(eq + 1).trim()
             }
         }
     }
 
-    fun isLoggedIn(): Boolean = synchronized(lock) { cookies.isNotEmpty() }
+    fun isLoggedIn(): Boolean = synchronized(cookieLock) { cookies.isNotEmpty() }
 
-    /** 重新登录（代理在 401/跳登录页时调用）。成功返回 true。 */
-    fun reLogin(): Boolean = synchronized(lock) { doLogin() }
+    /** 重新登录（代理在 401/跳登录页时调用）。成功返回 true。登录期间不阻塞 cookie 读写。 */
+    fun reLogin(): Boolean = synchronized(loginLock) { doLogin() }
 
     /** 只测试连接是否可用（不写 cookie、不影响当前会话），用于设置页「测试连接」。 */
     fun testLogin(url: String, tok: String): String? {

@@ -2701,6 +2701,14 @@
           function initSettings() {
             var settingsEl = document.getElementById('settings');
             if (!settingsEl) return;
+            var serverBtn = document.getElementById('btn-server-settings');
+            if (serverBtn) serverBtn.addEventListener('click', function(){
+              if (window.AndroidBridge && window.AndroidBridge.openSettings) {
+                window.AndroidBridge.openSettings();   // APK：打开原生服务器设置页
+              } else {
+                toast('网页版直连本机服务，无需修改；如需改地址请直接编辑 config.json');
+              }
+            });
             var closeBtn = settingsEl.querySelector('[data-close]');
             if (closeBtn) closeBtn.addEventListener('click', closeSettings);
             settingsEl.addEventListener('click', function(e){ if (e.target === settingsEl) closeSettings(); });
@@ -2851,14 +2859,6 @@
           }
           var settingsBtn = document.querySelector('[data-dom-id="btn-settings"]');
           if (settingsBtn) settingsBtn.addEventListener('click', openSettings);
-          var serverBtn = document.getElementById('btn-server-settings');
-          if (serverBtn) serverBtn.addEventListener('click', function(){
-            if (window.AndroidBridge && window.AndroidBridge.openSettings) {
-              window.AndroidBridge.openSettings();   // APK：打开原生服务器设置页
-            } else {
-              toast('网页版直连本机服务，无需修改；如需改地址请直接编辑 config.json');
-            }
-          });
           if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initSettings);
           else initSettings();
 

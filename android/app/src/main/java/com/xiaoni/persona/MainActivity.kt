@@ -161,7 +161,10 @@ class MainActivity : Activity() {
                     finish()
                 } else {
                     LoginManager.updateConfig(AppConfig.serverUrl, AppConfig.token)
-                    if (loaded) webView.reload() else initWebView()
+                    // 延迟 reload：等窗口焦点切换完成（慢速设备上立即 reload 可能触发输入分发超时）
+                    webView.postDelayed({
+                        if (loaded) webView.reload() else initWebView()
+                    }, 400)
                 }
             }
             REQ_FILE -> {
