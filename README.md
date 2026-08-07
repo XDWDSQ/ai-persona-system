@@ -10,6 +10,8 @@
 - 联网搜索：模型判断知识过时时会自动搜索最新消息（默认 DuckDuckGo，Bing RSS 兜底），尤其适合查自己的比赛、战队与近况
 - 语音合成与音色克隆：支持本地 Qwen3-TTS、阿里云千问（qwen3-tts-flash）与 MiniMax 海螺（T2A v2）三条链路（MiMo TTS 已下线，不再支持）；MiniMax 支持声音克隆，合成采样参数（语速/音量/音调/采样率）可在设置页调整
 - 人设、语音参数可视化配置
+- **2027 赛季剧情分支**：大帅·2027 独立角色——虚拟 KPL 赛程（55 场预生成）、剧情时钟（现实一天=虚拟一天 + 任意跳转）、情感状态机（暗恋隐忍→相爱相杀→暧昧升温→在一起）、旁白双声部、今日剧情引导卡
+- **主对话模式**：每个角色固定一个主对话（不能新建/删除），切角色自动切换，聊天记录零散落
 
 ## 快速开始
 
@@ -20,6 +22,50 @@ restart_service.bat    # 重启 8000 端口服务
 ```
 
 启动后访问 http://127.0.0.1:8000
+
+## 2027 赛季剧情分支（大帅·2027）
+
+给「大帅」角色做的独立剧情分支：新增角色 `dashuai2027`（「大帅·2027」），原「大帅」角色完全不受影响。设定：2026 年打完一诺退役，玩家扮演 19 岁高分段路人王「岚风」入队接替一诺，与大帅（游走位）开启虚拟 2027 KPL 赛季——场下暗恋隐忍、场上游戏理解分歧与指挥权争夺，相爱相杀后被玩家攻略。
+
+### 剧情系统（story_kpl2027.py）
+
+- **2027 赛程**：55 场比赛预生成（春季 23 + 夏季 23 + 年总 9），真实队名、固定随机种子（同一天跳转两次结果一致），赛制参照真实 KPL（常规赛 BO5 分组 / 季后赛 BO7 / 年总）
+- **剧情时钟**：现实一天 = 虚拟一天（锚点 2026-08-08）；跳转任意日期进入 `override` 模式（剧情暂停），「回到今天」恢复与现实同步
+- **比赛模拟**：胜负由岚风在对话中宣布（如「赢了 3:1」），系统自动识别记录战绩并推进剧情（LLM 抽取 + 正则兜底）；也可手动调接口
+- **情感状态机**：0 暗恋隐忍 → 1 相爱相杀（首次输球复盘大吵触发）→ 2 暧昧升温（指挥权归岚风）→ 3 在一起（岚风攻略成功）；各阶段行为指令随虚拟日期注入模型
+- **今日剧情指引**：按日期/赛段生成详细可演剧情（背景 + 可演选项 + 大帅状态，七套模板），注入模型上下文 + 前端引导卡展示
+- **旁白双声部**：模型回复拆分为【旁白】（第三视角叙事，灰色小字气泡）与【大帅】（台词气泡）两段；旁白随消息持久化（刷新/切会话不丢）、不进 LLM 上下文、不参与朗读；旁白只推进剧情、不替大帅说话
+- **记忆预热**：剧情节点（巅峰赛撞车、一诺退役、官宣入队等）写入大帅记忆库，保证剧情连贯
+
+### 使用
+
+1. 聊天页左侧切到「大帅·2027」（新角色 tab 自动出现，头像/音色复用大帅）
+2. 侧栏点「2027 赛季赛程表」打开 `pages/story.html`：月历视图（比赛日/训练日/休赛/团综标记），点任意日期跳转，「回到今天」恢复同步；页面含今日剧情卡、战绩与情感阶段
+3. 空主对话打开时自动显示「剧情引导卡」（今日日期/事件/可演剧情/开场提示），发第一条消息后自动消失
+4. 每个角色固定一个主对话（不能新建/删除/改名，旧记录自动迁移），切角色自动切换
+
+### 配置
+
+```json
+"roles": {
+  "dashuai2027": {
+    "name": "大帅·2027",
+    "story": { "enabled": true },
+    "news": { "enabled": false }
+  }
+}
+```
+
+- 角色含 `story.enabled=true` 时启用剧情系统；剧情数据存 `data/story/`（日历 + 状态，首次启动自动生成；改赛程/事件后需删 `data/story/kpl2027_calendar.json` 并重启重建）
+- 剧情日期以「虚拟日历」块注入 system prompt，与真实时间明确区分，避免模型混淆
+- 剧情接口（仅 story 角色可用，其他角色 404）：
+  - `GET /api/story/status` 今日剧情/战绩/情感阶段/剧情指引
+  - `GET /api/story/calendar` 全年赛程
+  - `POST /api/story/jump` 跳转日期（`{"date":"2027-01-14"}`）
+  - `POST /api/story/resume` 回到现实今天
+  - `POST /api/story/result` 记录比赛结果（`{"date","win","score","mvp"}`）
+  - `POST /api/story/flag` 推进剧情标志位（如 `{"flag":"command_win"}`）
+- 分支人设与剧情设定（用户逐条确认定稿）：[docs-specs/大帅2027人设档案.md](docs-specs/大帅2027人设档案.md)（全网搜集的大帅真实资料 + 分支人设 + 玩家卡「岚风」+ 训练室排布 + 情感线设定）
 
 ## 手机 App（Android APK）
 
@@ -183,13 +229,14 @@ python minimax_clone.py
 
 ## API
 
-- `POST /api/chat` 对话（注入角色上下文，返回 `{reply, style}`）
+- `POST /api/chat` 对话（注入角色上下文，返回 `{reply, narration?, style}`；旁白分支角色返回 `narration`）
 - `POST /api/greeting` 主动问候；`GET/DELETE /api/state` 查看/重置角色状态
 - `POST /api/tts` 语音合成
 - `POST /api/upload` 附件上传；`GET /uploads/...` 附件访问
 - `POST /api/search` 联网搜索；对话中模型输出 `[search:关键词]` 会自动触发
 - `GET /api/status`、`GET/POST /api/config`、`GET /api/roles`、`POST /api/roles/apply`
 - `GET/PUT /api/sessions` 会话持久化；`POST /api/llm-models` 拉取云端模型列表
+- `GET /api/story/status`、`GET /api/story/calendar`、`POST /api/story/jump|resume|result|flag` 2027 剧情分支（仅 story 角色）
 - `GET /api/health` 健康检查
 
 ## 目录
@@ -197,10 +244,11 @@ python minimax_clone.py
 ```
 server.py               FastAPI 后端主程序（端口 8000）
 role_engine.py          角色运行引擎（记忆/状态/时间/位置/天气/后处理）
+story_kpl2027.py        2027 赛季剧情分支引擎（赛程生成/剧情时钟/情感状态机/剧情指引）
 config.example.json     配置模板（复制为 config.json 使用）
 llm/                    llama.cpp 运行时（llm/bin）、模型（llm/models）与启动脚本
-xiaoni-ai-persona/      前端页面源码
-docs-specs/             角色引擎设计文档
+xiaoni-ai-persona/      前端页面源码（pages/chat.html、pages/story.html 赛程表）
+docs-specs/             设计文档（角色引擎设计、大帅2027人设档案）
 data/                   运行时数据（会话、音频、记忆、状态，不入库）
 ```
 
@@ -220,6 +268,9 @@ REM 联网搜索（DuckDuckGo / Bing RSS 解析逻辑）
 
 REM 附件上传与处理
 "%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_attachments.py
+
+REM 2027 赛季剧情分支（赛程生成/种子确定性/跳转/情感状态机，12 用例）
+"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_story_kpl2027.py
 ```
 
 需要真实云端密钥才能运行的脚本：
@@ -268,4 +319,5 @@ REM 附件上传与处理
 ## 文档
 
 - 角色引擎设计与实现：[docs-specs/2026-08-03-role-engine-design.md](docs-specs/2026-08-03-role-engine-design.md)
+- 大帅·2027 分支人设与剧情设定（用户逐条确认定稿）：[docs-specs/大帅2027人设档案.md](docs-specs/大帅2027人设档案.md)
 - 本地视觉模型（VLM）使用说明：[llm/README_VL.md](llm/README_VL.md)

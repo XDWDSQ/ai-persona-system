@@ -508,6 +508,11 @@
         .msg.narration .avatar{display:none}
         .msg.narration .msg-body{max-width:100%}
         .msg.narration .bubble{background:transparent;border:none;box-shadow:none;padding:0 2px;color:var(--muted-foreground);font-size:12.5px;line-height:1.7;font-style:italic;opacity:.85}
+        /* 剧情引导卡：2027 分支空主对话时显示今日剧情与开场提示（非气泡，不占对话流） */
+        .msg-guide{margin:6px 0 22px;padding:13px 15px;border:1px dashed var(--border);border-radius:12px;background:color-mix(in srgb,var(--chart-2) 5%,transparent);color:var(--muted-foreground);font-size:12.5px;line-height:1.85}
+        .msg-guide .g-date{font-weight:650;color:var(--foreground);font-size:13px;letter-spacing:.01em}
+        .msg-guide .g-tag{display:inline-block;padding:1px 9px;border-radius:99px;background:color-mix(in srgb,var(--chart-2) 14%,transparent);color:var(--chart-2);font-size:11px;font-weight:600;margin-left:8px;vertical-align:1px}
+        .msg-guide .g-tip{margin-top:7px;opacity:.88}
         /* 生成失败的提示气泡：红色系弱化样式 + 下方带「重试」按钮 */
         .msg.failed .bubble{background:var(--error-subtle);border-color:color-mix(in srgb,var(--error) 38%,transparent);color:var(--error-strong)}
         .msg.failed .meta-btn:hover{color:var(--error-strong);border-color:color-mix(in srgb,var(--error) 40%,transparent);background:color-mix(in srgb,var(--error) 9%,transparent)}
@@ -1189,6 +1194,9 @@
                 if (!started) {
                   started = true;
                   hideTyping();
+                  /* 开始演出：移除剧情引导卡，让位给真实对话 */
+                  var _g = msgsInner.querySelector('.msg-guide');
+                  if (_g) _g.remove();
                   div = addMsg('assistant', fullText);
                   bubble = div.querySelector('.bubble');
                   renderer = makeStreamRenderer(bubble, function(){
@@ -3496,6 +3504,30 @@
             if (welcome) welcome.style.display = state.history.length ? 'none' : '';
             /* 文档片段批量渲染：长历史一次性挂载，只触发一次布局/重绘（切会话零卡顿） */
             var frag = document.createDocumentFragment();
+            /* 2027 剧情分支：空主对话时显示今日剧情引导卡（数据来自 /api/story/status） */
+            if (currentRoleKey === 'dashuai2027' && !state.history.length) {
+              var gc = document.createElement('div');
+              gc.className = 'msg-guide';
+              gc.textContent = '剧情加载中…';
+              frag.appendChild(gc);
+              api('/api/story/status').then(function(d){
+                if (!d || !gc.parentNode) return;
+                var vd = d.virtual_date || '', sn = d.stage_name || '';
+                var t = (d.today && d.today.title) || '';
+                var body = d.guide || ((d.today && d.today.event && d.today.event.desc) || t);
+                var tip = '在下面用（括号）描写动作/环境开始演出，例如：（我拖着行李箱站在 AG 楼下）。旁白会铺场景，大帅会接住你的戏。';
+                if (d.stage === 0) tip = '你们还没线下见过面。用（括号）开场：进基地报到、刷官宣微博、或者先跟队友打个照面。';
+                var h1 = document.createElement('div'); h1.className = 'g-date';
+                h1.textContent = vd + ' · ' + sn;
+                var tag = document.createElement('span'); tag.className = 'g-tag'; tag.textContent = t;
+                h1.appendChild(tag);
+                var h2 = document.createElement('div'); h2.className = 'g-desc'; h2.textContent = body;
+                var h3 = document.createElement('div'); h3.className = 'g-tip'; h3.textContent = '开始：' + tip;
+                gc.innerHTML = '';
+                gc.appendChild(h1); gc.appendChild(h2); gc.appendChild(h3);
+                if (stickBottom) snapBottom();
+              }).catch(function(){});
+            }
             (state.history || []).forEach(function(m, i){
               /* 长历史（>16 条）瞬时渲染：不播入场动画，切会话零等待也不掉帧 */
               var animOn = state.history.length <= 16;
@@ -3890,6 +3922,9 @@
                   if (currentSessionId !== sessionId) return;
                   var s = findSession(sessionId);
                   if (!s) return;
+                  /* 问候入场：移除剧情引导卡，让位给真实对话 */
+                  var _g = msgsInner.querySelector('.msg-guide');
+                  if (_g) _g.remove();
                   var gMsg = { role: 'assistant', content: r.reply, style: r.style || '', narration: r.narration || '' };
                   /* 旁白双声部：先渲染灰色旁白气泡，再渲染大帅的问候气泡 */
                   if (r.narration) addMsg('narration', r.narration);
