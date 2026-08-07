@@ -183,8 +183,8 @@ class MainActivity : Activity() {
             fun currentAudioUrl(): String = audioPlayer.currentUrl()
         }, "AndroidBridge")
 
-        // 后台预热登录（代理也会在 401 时自动重登）
-        Thread { LoginManager.reLogin() }.start()
+        // 后台预热登录（单次快速失败；代理会在 401 时自动重登并内部重试）
+        Thread { LoginManager.reLoginOnce() }.start()
 
         webView.loadUrl(CHAT_URL)
     }

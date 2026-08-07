@@ -191,10 +191,12 @@ class LocalServer private constructor() {
 
     // ------------------------------------------------------------- 远程转发
 
-    /** 转发时跳过 hop-by-hop / 敏感请求头，避免污染远程请求 */
+    /** 转发时跳过的请求头：hop-by-hop / 敏感头，以及浏览器 UA——
+     *  ngrok 免费版对浏览器 UA 返回 ERR_NGROK_6024 警告页（不走代理的直连/下载不受影响）；
+     *  改用 HttpURLConnection 默认 UA（Java/...）可绕过该拦截。 */
     private val SKIP_REQ_HEADERS = setOf(
         "host", "connection", "content-length", "transfer-encoding", "accept-encoding",
-        "origin", "referer", "cookie", "proxy-connection", "upgrade", "keep-alive",
+        "origin", "referer", "cookie", "proxy-connection", "upgrade", "keep-alive", "user-agent",
     )
     /** 转发响应时跳过的头 */
     private val SKIP_RESP_HEADERS = setOf(

@@ -52,8 +52,24 @@ object LoginManager {
 
     fun isLoggedIn(): Boolean = synchronized(cookieLock) { cookies.isNotEmpty() }
 
-    /** 重新登录（代理在 401/跳登录页时调用）。成功返回 true。登录期间不阻塞 cookie 读写。 */
-    fun reLogin(): Boolean = synchronized(loginLock) { doLogin() }
+    /** 预热登录（应用启动时后台执行）：单次尝试、快速失败；失败由代理路径的 reLogin 兜底 */
+    fun reLoginOnce(): Boolean = synchronized(loginLock) { doLogin() }
+
+    /** 重新登录（代理在 401/跳登录页时调用）。成功返回 true。登录期间不阻塞 cookie 读写。
+     *  内部重试：ngrok 等慢速通道首次连接可能失败/超时，重试两次再判定失败。 */
+    fun reLogin(): Boolean = synchronized(loginLock) {
+        var ok = false
+        for (i in 0..2) {
+            if (doLogin()) {
+                ok = true
+                break
+            }
+            if (i < 2) {
+                try { Thread.sleep(1500L * (i + 1)) } catch (_: InterruptedException) {}
+            }
+        }
+        ok
+    }
 
     /** 只测试连接是否可用（不写 cookie、不影响当前会话），用于设置页「测试连接」。 */
     fun testLogin(url: String, tok: String): String? {

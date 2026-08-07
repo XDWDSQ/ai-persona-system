@@ -1413,12 +1413,14 @@
              手机弱网或隧道延迟下旧请求可能晚于新请求返回，若不丢弃过期响应，
              fillConfig 会把刚保存的思考模式等设置回填成旧值（关了又自动开启） */
           var _statusSeq = 0;
+          var _statusRetry = 0;  /* refreshStatus 失败重试计数（成功时重置） */
           async function refreshStatus() {
             var seq = ++_statusSeq;
             setDotsChecking();
             try {
               var s = await api('/api/status');
               if (seq !== _statusSeq) return;  /* 过期响应：丢弃，不覆盖新状态 */
+              _statusRetry = 0;  /* 成功重置重试计数 */
               state.provider = s.provider;
               state.voiceProvider = s.voice_provider || 'local';
               state.aliyunConfigured = !!s.aliyun_configured;
@@ -1464,6 +1466,13 @@
               }
             } catch (e) {
               if (seq !== _statusSeq) return;  /* 过期错误同样丢弃 */
+              /* 首次连接时登录可能尚未就绪（APK 预热登录/代理自动重登进行中）：
+                 延迟重试，避免误报"后端未连接"；401 已跳登录页，不再重试 */
+              if (e && e.message !== '未登录' && _statusRetry < 6) {
+                _statusRetry++;
+                setTimeout(function(){ refreshStatus(); }, 2000);
+                return;
+              }
               var pn = $('.p-name');
               if (pn) pn.textContent = '后端未连接';
               var pd = $('.p-detail');
