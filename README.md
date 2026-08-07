@@ -21,6 +21,14 @@ restart_service.bat    # 重启 8000 端口服务
 
 启动后访问 http://127.0.0.1:8000
 
+## 手机 App（Android APK）
+
+项目内置手机端 Android 应用（`android/` 目录）：**界面打包在 APK 里（秒开、离线可见），数据接口经 APK 内本地代理转发到远程服务器**（隧道/云电脑地址）。前端与服务端零改动。
+
+- 已构建好的 APK 在 `release/` 目录（debug 调试版 + release 正式签名版），直接拷到手机安装（允许未知来源）
+- 安装后填「服务器地址 + 访问口令」即用；服务器重启后隧道地址变了，在应用「⚙ 设置」里更新即可
+- 构建/更新/签名说明见 [android/README.md](android/README.md)
+
 ## 配置参考
 
 复制 `config.example.json` 为 `config.json` 后按需修改。主要字段：

@@ -11,9 +11,16 @@ import os
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
+import ipaddress
+import socket
 from pathlib import Path
 
-BASE = os.getenv("VERIFY_BASE", "http://127.0.0.1:8000")
+_BASE = os.getenv("VERIFY_BASE", "http://127.0.0.1:8000")
+_parsed_base = urllib.parse.urlparse(_BASE)
+if _parsed_base.scheme not in ("http", "https") or not _parsed_base.hostname:
+    raise SystemExit(f"VERIFY_BASE 必须是 http/https 地址: {_BASE}")
+BASE = _BASE.rstrip("/")
 # 支持访问口令：VERIFY_TOKEN 环境变量 → Authorization: Bearer
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
 OUT_DIR = Path(__file__).resolve().parent / "data"   # 基于本文件路径，不依赖 CWD
@@ -36,8 +43,15 @@ def _http_error(e: urllib.error.HTTPError) -> str:
 
 
 def post(path, payload=None, binary=False):
+    url = BASE + path
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise RuntimeError(f"非法地址: {url}")
+    ip = ipaddress.ip_address(socket.gethostbyname(p.hostname))
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        raise RuntimeError(f"禁止访问内网地址: {url}")
     data = json.dumps(payload).encode() if payload is not None else b""
-    req = urllib.request.Request(BASE + path, data=data, headers=_headers())
+    req = urllib.request.Request(url, data=data, headers=_headers())
     try:
         r = urllib.request.urlopen(req, timeout=180)
     except urllib.error.HTTPError as e:
@@ -51,7 +65,14 @@ def post(path, payload=None, binary=False):
 
 
 def get(path):
-    req = urllib.request.Request(BASE + path, headers=_headers())
+    url = BASE + path
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise RuntimeError(f"非法地址: {url}")
+    ip = ipaddress.ip_address(socket.gethostbyname(p.hostname))
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        raise RuntimeError(f"禁止访问内网地址: {url}")
+    req = urllib.request.Request(url, headers=_headers())
     try:
         r = urllib.request.urlopen(req, timeout=30)
     except urllib.error.HTTPError as e:

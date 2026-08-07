@@ -1,0 +1,11 @@
+<resources>
+    <!-- 深色主题，与前端界面风格一致 -->
+    <style name="Theme.Persona" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0a0a0a</item>
+        <item name="android:statusBarColor">#0a0a0a</item>
+        <item name="android:navigationBarColor">#0a0a0a</item>
+        <item name="android:colorAccent">#e879f9</item>
+        <item name="android:textColorPrimary">#f4f4f5</item>
+        <item name="android:textColorSecondary">#a1a1aa</item>
+    </style>
+</resources>

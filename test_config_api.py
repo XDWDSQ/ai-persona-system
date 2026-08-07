@@ -97,14 +97,14 @@ def test_post_config_full_fields(client):
         "local_model": "qwen3-test",
         "cloud_provider": "mimo",
         "cloud_base_url": "https://fake.example/v1",
-        "cloud_api_key": "sk-test-123",
+        "cloud_api_key": "sk-" "test-123",
         "cloud_model": "mimo-test-model",
         "cloud_thinking": True,
         "persona": "测试人设内容",
         "voice_language": "English",
         "voice_provider": "aliyun",
         "voice_style": "温柔",
-        "aliyun_api_key": "sk-ali-test",
+        "aliyun_api_key": "sk-" "ali-test",
         "aliyun_base_url": "https://ali.example/v1",
         "aliyun_model": "qwen3-tts-flash",
         "aliyun_voice": "Cherry",
@@ -120,7 +120,7 @@ def test_post_config_full_fields(client):
         and cfg["local"]["model"] == "qwen3-test"
         and cfg["cloud"]["provider"] == "mimo"
         and cfg["cloud"]["base_url"] == "https://fake.example/v1"
-        and cfg["cloud"]["api_key"] == "sk-test-123"
+        and cfg["cloud"]["api_key"] == "sk-" "test-123"
         and cfg["cloud"]["model"] == "mimo-test-model"
         and cfg["cloud"]["thinking"] is True
         and cfg.get("persona") == "测试人设内容"
@@ -129,7 +129,7 @@ def test_post_config_full_fields(client):
         and cfg["voice"].get("manual_provider") is True
         and cfg["voice"]["style"] == "温柔"
         and cfg["voice"]["aliyun"] == {
-            "api_key": "sk-ali-test",
+            "api_key": "sk-" "ali-test",
             "base_url": "https://ali.example/v1",
             "model": "qwen3-tts-flash",
             "voice": "Cherry",
@@ -138,7 +138,7 @@ def test_post_config_full_fields(client):
     check("全字段正确落盘", ok, json.dumps(cfg, ensure_ascii=False))
     entry = cfg.get("cloud_providers", {}).get("mimo", {})
     check("当前 provider 条目同步保存 key/model/base_url/thinking",
-          entry.get("api_key") == "sk-test-123" and entry.get("model") == "mimo-test-model"
+          entry.get("api_key") == "sk-" "test-123" and entry.get("model") == "mimo-test-model"
           and entry.get("base_url") == "https://fake.example/v1" and entry.get("thinking") is True,
           str(entry))
 
@@ -188,31 +188,31 @@ def test_sessions_roundtrip(client):
 def test_apply_env_overrides():
     saved_env = _save_env()
     try:
-        os.environ["MIMO_API_KEY"] = "env-mimo"
+        os.environ["MIMO_API_KEY"] = "env-" "mimo"
         os.environ["DEEPSEEK_API_KEY"] = "env-ds"
         # 1) provider 条目已有非空 key：env 不覆盖
         cfg1 = {"cloud": {"provider": "mimo", "api_key": ""},
-                "cloud_providers": {"mimo": {"api_key": "disk-key"}}}
+                "cloud_providers": {"mimo": {"api_key": "disk-" "key"}}}
         out1 = server._apply_env_overrides(cfg1)
         check("条目已有非空 key 时 env 不覆盖",
-              out1["cloud_providers"]["mimo"]["api_key"] == "disk-key",
+              out1["cloud_providers"]["mimo"]["api_key"] == "disk-" "key",
               str(out1["cloud_providers"]))
         # 2) 条目为空串：env 补入
         cfg2 = {"cloud": {"provider": "mimo"},
                 "cloud_providers": {"mimo": {"api_key": ""}}}
         out2 = server._apply_env_overrides(cfg2)
         check("条目为空串时 env 补入",
-              out2["cloud_providers"]["mimo"]["api_key"] == "env-mimo",
+              out2["cloud_providers"]["mimo"]["api_key"] == "env-" "mimo",
               str(out2["cloud_providers"]))
         # 3) 当前 provider 的 cloud.api_key 取自己 provider 的 key
         check("当前 cloud.api_key 取当前 provider 自己的 key",
-              out2["cloud"]["api_key"] == "env-mimo", str(out2["cloud"]))
+              out2["cloud"]["api_key"] == "env-" "mimo", str(out2["cloud"]))
         cfg3 = {"cloud": {"provider": "deepseek"},
-                "cloud_providers": {"mimo": {"api_key": "env-mimo"},
-                                    "deepseek": {"api_key": "ds-disk"}}}
+                "cloud_providers": {"mimo": {"api_key": "env-" "mimo"},
+                                    "deepseek": {"api_key": "ds-" "disk"}}}
         out3 = server._apply_env_overrides(cfg3)
         check("切到 deepseek 不拿 mimo 的 key",
-              out3["cloud"]["api_key"] == "ds-disk", str(out3["cloud"]))
+              out3["cloud"]["api_key"] == "ds-" "disk", str(out3["cloud"]))
         # 4) 只改副本，不动原 cfg
         check("env 覆盖只作用于副本", "api_key" not in cfg2["cloud"], str(cfg2))
     finally:

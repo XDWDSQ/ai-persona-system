@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 允许：本地代理服务(127.0.0.1 明文 HTTP)、用户配置的远程服务器(可能是 http 局域网地址) -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

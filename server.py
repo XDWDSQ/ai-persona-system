@@ -2790,7 +2790,14 @@ async def _search_bing_rss(query: str, timeout: float = 15.0) -> list[dict]:
         follow_redirects=True,
     )
     r.raise_for_status()
-    root = ET.fromstring(r.content)
+    # 解析 Bing RSS：先拒绝 DTD/实体声明（防 XXE 与实体膨胀），并限制响应大小
+    content = r.content
+    if len(content) > 2 * 1024 * 1024:
+        raise ValueError(f"搜索响应过大（{len(content)} bytes）")
+    head = content[:4096].lower()
+    if b"<!doctype" in head or b"<!entity" in head:
+        raise ValueError("搜索响应包含 DTD/实体声明，已拒绝解析")
+    root = ET.fromstring(content)
     out: list[dict] = []
     for item in root.findall(".//item")[:10]:
         title = (item.findtext("title") or "").strip()

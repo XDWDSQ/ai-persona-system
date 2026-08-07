@@ -22,25 +22,53 @@
 """
 
 import argparse
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data")
-SECRET_FILE = os.path.join(DATA_DIR, "webhook_secret.txt")
-TUNNEL_LOG = os.path.join(DATA_DIR, "webhook_tunnel.log")
+
+
+def _safe_data_path(name: str) -> str:
+    """data 目录内路径校验：规范化后必须位于 DATA_DIR 内（禁止 ../ 越界）。"""
+    p = os.path.realpath(os.path.join(DATA_DIR, name))
+    data_root = os.path.realpath(DATA_DIR)
+    if not (p == data_root or p.startswith(data_root + os.sep)):
+        raise ValueError(f"路径越界: {p}")
+    return p
+
+
+SECRET_FILE = _safe_data_path("webhook_secret.txt")
+TUNNEL_LOG = _safe_data_path("webhook_tunnel.log")
 GITEE_API = "https://gitee.com/api/v5"
+
+
+def _check_https_api(url: str) -> str:
+    """仅允许 HTTPS 的 API 地址，解析后阻断私网/环回/链路本地地址。"""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError(f"非法 API 地址: {url}")
+    try:
+        ip = ipaddress.ip_address(socket.gethostbyname(parsed.hostname))
+    except (socket.gaierror, ValueError):
+        raise ValueError(f"无法解析主机: {parsed.hostname}")
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        raise ValueError(f"禁止访问内网地址: {url}")
+    return url
 
 
 def log(msg):
@@ -80,7 +108,7 @@ def detect_repo():
 
 
 def gitee_api(method, path, token, payload=None):
-    url = f"{GITEE_API}{path}?access_token={token}"
+    url = f"{_check_https_api(GITEE_API)}{path}?access_token={token}"
     data = json.dumps(payload).encode() if payload is not None else None
     req = Request(url, data=data, method=method)
     if payload is not None:
@@ -258,12 +286,12 @@ def main():
         return 1
 
     os.makedirs(DATA_DIR, exist_ok=True)
-    if os.path.exists(SECRET_FILE):
-        secret = open(SECRET_FILE, encoding="utf-8").read().strip()
+    secret_file = Path(DATA_DIR) / "webhook_secret.txt"
+    if secret_file.exists():
+        secret = secret_file.read_text(encoding="utf-8").strip()
     else:
         secret = secrets.token_hex(16)
-        with open(SECRET_FILE, "w", encoding="utf-8") as f:
-            f.write(secret + "\n")
+        secret_file.write_text(secret + "\n", encoding="utf-8")
         log(f"已生成回调密码（保存于 data/webhook_secret.txt）")
 
     cfd = find_cloudflared()

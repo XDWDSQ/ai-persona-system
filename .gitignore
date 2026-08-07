@@ -49,3 +49,12 @@ _pet_preview/
 /_t.out
 /_t2.out
 /_tts_test.json
+
+# ZCode 客户端工作目录（不入库）
+/.zcode/
+
+# APK 构建产物（从 android/ 工程重新构建即可，不入库）
+release/
+
+# Mimosa 安全扫描历史（不入库）
+.mimosa/

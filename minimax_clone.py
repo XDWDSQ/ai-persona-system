@@ -17,9 +17,12 @@ status_code=2038（voice clone user forbidden），请在 platform.minimaxi.com
 用法：python minimax_clone.py
 """
 import base64
+import ipaddress
 import json
+import socket
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -49,7 +52,22 @@ def get_key() -> str:
     return key or input("请输入 MiniMax API Key: ").strip()
 
 
+def _check_api_url(url: str) -> str:
+    """MiniMax API 地址校验：仅 HTTP(S)，解析后阻断私网/环回/链路本地地址。"""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+        raise ValueError(f"非法 API 地址: {url}")
+    try:
+        ip = ipaddress.ip_address(socket.gethostbyname(parsed.hostname))
+    except (socket.gaierror, ValueError):
+        raise ValueError(f"无法解析主机: {parsed.hostname}")
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        raise ValueError(f"禁止访问内网地址: {url}")
+    return url
+
+
 def post_json(url: str, payload: dict, key: str):
+    url = _check_api_url(url)
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=body,
@@ -66,6 +84,7 @@ def post_json(url: str, payload: dict, key: str):
 
 
 def upload_file(url: str, key: str, purpose: str, path: Path):
+    url = _check_api_url(url)
     import uuid
     boundary = "----mm" + uuid.uuid4().hex
     data = path.read_bytes()

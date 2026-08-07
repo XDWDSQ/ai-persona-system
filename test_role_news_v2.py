@@ -102,7 +102,11 @@ def _load_functions():
     # 截取角色现实动态区块（从 _ROLE_NEWS_FILE = 到 _role_news_hint 前）
     start = src.index("_ROLE_NEWS_FILE = DATA_DIR")
     end = src.index("def _role_news_hint(")
+    # 安全说明：block 仅截取自本仓库 server.py 的固定标记区间，不包含任何外部输入；
+    # exec 仅用于测试中提取纯函数定义，并限制截取区间大小
+    assert start >= 0 and end > start and end - start < 64 * 1024
     block = src[start:end]
+    assert block in SRC  # 来源固定：必须是 server.py 原文件内容的一部分
     # 去掉 async 函数（依赖 llm_chat/web_search 的 _summarize 不需要测试）
     block = block.replace("async def _bg_role_news_refresh", "def _bg_role_news_refresh_placeholder")
     block = block.replace("async def _role_news_scheduler", "def _role_news_scheduler_placeholder")

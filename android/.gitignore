@@ -1,0 +1,11 @@
+# Android 构建产物（相对本 android/ 目录）
+.gradle/
+build/
+app/build/
+local.properties
+
+# release 签名（含密码，不入库）
+keystore.properties
+keystore/
+
+*.keystore

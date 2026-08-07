@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">AI 拟人系统</string>
+    <string name="shortcut_settings_short">服务器设置</string>
+    <string name="shortcut_settings_long">服务器地址与访问口令设置</string>
+</resources>
