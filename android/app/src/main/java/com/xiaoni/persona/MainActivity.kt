@@ -181,6 +181,16 @@ class MainActivity : Activity() {
 
             @android.webkit.JavascriptInterface
             fun currentAudioUrl(): String = audioPlayer.currentUrl()
+
+            // ---- 播放中对齐：点击文字跳转对应音频位置 ----
+            @android.webkit.JavascriptInterface
+            fun seekAudio(ms: Long) = audioPlayer.seekTo(ms)
+
+            @android.webkit.JavascriptInterface
+            fun audioDurationMs(): Long = audioPlayer.durationMs()
+
+            @android.webkit.JavascriptInterface
+            fun audioPositionMs(): Long = audioPlayer.positionMs()
         }, "AndroidBridge")
 
         // 后台预热登录（单次快速失败；代理会在 401 时自动重登并内部重试）

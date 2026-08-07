@@ -493,6 +493,10 @@
         .msg-body{max-width:76%;min-width:0}
         .msg.user .msg-body{display:flex;flex-direction:column;align-items:flex-end}
         .bubble{padding:12px 16px;border-radius:14px;font-size:14.5px;line-height:1.7;word-break:break-word;white-space:pre-wrap;transition:box-shadow .25s ease,border-color .25s ease,background-color .25s ease}
+        /* 播放中对齐：消息文字分段，点击跳转对应音频位置 */
+        .tts-seg{cursor:pointer;border-radius:4px;transition:background-color .15s ease}
+        .tts-seg:hover{background:rgba(255,255,255,.09)}
+        .tts-seg:active{background:rgba(255,255,255,.18)}
         .msg:hover .bubble{box-shadow:0 8px 22px -14px rgba(0,0,0,.35)}
         .msg.ai .bubble{background:var(--card);border:1px solid var(--border);border-top-left-radius:5px}
         .msg.user .bubble{background:color-mix(in srgb,var(--chart-2) 16%,var(--card));border:1px solid color-mix(in srgb,var(--chart-2) 30%,transparent);border-top-right-radius:5px}
@@ -946,6 +950,18 @@
         (function(){
           var $ = function(s){ return document.querySelector(s); };
           var msgsInner = document.querySelector('.msgs-inner');
+          /* 播放中对齐：点击当前播放消息的分段文字 → 按字符比例 seek 到对应音频位置（APK 环境） */
+          msgsInner.addEventListener('click', function(e){
+            var seg = e.target && e.target.closest ? e.target.closest('.tts-seg') : null;
+            if (!seg || !state.playing) return;
+            if (!seg.closest('.msg') || seg.closest('.msg') !== state.playingMsg) return;
+            if (!window.AndroidBridge || !window.AndroidBridge.audioDurationMs) return;
+            var dur = window.AndroidBridge.audioDurationMs();
+            var total = state.playingText ? state.playingText.length : 0;
+            if (dur <= 0 || !total) return;
+            var ms = Math.floor(parseInt(seg.dataset.cs, 10) / total * dur);
+            window.AndroidBridge.seekAudio(ms);
+          });
           var state = { history: [], cloudProviders: {}, soundOn: (function(){ try { return localStorage.getItem('xiaoni_sound_on') !== '0'; } catch(e) { return true; } })(), speed: (function(){ try { return parseFloat(localStorage.getItem('xiaoni_speed') || '1.0') || 1.0; } catch(e) { return 1.0; } })(), provider: 'cloud', voiceProvider: 'local', aliyunConfigured: false, minimaxConfigured: false, audioCache: {}, ttsInflight: {}, playing: null, playingBtn: null, playSeq: 0, pendingAttachments: [], attachMenuOpen: false, awaiting: {} };
           /* 当前激活角色 key：同步维护，页面加载即生效（默认与后端 config 一致为大帅），
              避免头像判断依赖异步的 /api/status 返回导致首帧渲染成首字 */
@@ -1675,8 +1691,29 @@
               });
             }
             var bubble = div.querySelector('.bubble');
-            if (text) bubble.textContent = text;
-            else bubble.classList.add('no-text');
+            if (text && window.AndroidBridge && role === 'assistant') {
+              /* APK 播放中对齐：assistant 消息文字按句切块，点击跳转对应音频位置 */
+              var parts = [], cur = '', _i;
+              for (_i = 0; _i < text.length; _i++) {
+                cur += text[_i];
+                if (/[。！？…；\n]/.test(text[_i]) || cur.length >= 24) { parts.push(cur); cur = ''; }
+              }
+              if (cur) parts.push(cur);
+              var cs = 0, frag = document.createDocumentFragment();
+              parts.forEach(function(p){
+                var sp = document.createElement('span');
+                sp.className = 'tts-seg';
+                sp.dataset.cs = cs;  /* 该块在全文中的字符起始偏移 */
+                sp.textContent = p;
+                frag.appendChild(sp);
+                cs += p.length;
+              });
+              bubble.appendChild(frag);
+            } else if (text) {
+              bubble.textContent = text;
+            } else {
+              bubble.classList.add('no-text');
+            }
             renderAttachments(div, opts.attachments);
             /* 历史渲染的错峰入场：每条延迟一点，封顶 400ms，避免长历史等太久 */
             if (opts.delay) {
@@ -2004,6 +2041,8 @@
                 else state.playing.pause();
               } catch (e) {}
               state.playing = null;
+              state.playingMsg = null;
+              state.playingText = null;
             }
             /* 被新播放掐断的旧按钮要复位，否则会永远停在"播放中…" */
             if (state.playingBtn) {
@@ -2241,6 +2280,9 @@
               a.loop = !!(btn && btn._loop); // 该条开启循环时，播完自动从头再播
               state.playing = a;
               state.playingBtn = btn || null;
+              /* 播放中对齐：记录当前播放消息与全文（点击分段跳转用） */
+              state.playingMsg = btn ? btn.closest('.msg') : null;
+              state.playingText = text;
               var finish = function(label) {
                 if (a._stopped) return; /* 被 stopAudio 掐断的旧音频，事件忽略 */
                 if (state.playing === a) state.playing = null;

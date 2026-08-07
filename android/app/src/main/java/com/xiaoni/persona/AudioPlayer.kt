@@ -107,6 +107,21 @@ class AudioPlayer(private val activity: MainActivity) {
 
     fun currentUrl(): String = currentUrl ?: ""
 
+    /** 播放中对齐：跳到指定毫秒位置（播放中调用保持继续播放） */
+    @Synchronized
+    fun seekTo(ms: Long) {
+        try {
+            player?.seekTo(ms.toInt())
+            android.util.Log.d("AudioPlayer", "seekTo $ms")
+        } catch (_: Exception) {}
+    }
+
+    /** 音频总时长（毫秒），未就绪返回 -1 */
+    fun durationMs(): Long = try { player?.duration?.toLong() ?: -1L } catch (_: Exception) { -1L }
+
+    /** 当前播放位置（毫秒） */
+    fun positionMs(): Long = try { player?.currentPosition?.toLong() ?: -1L } catch (_: Exception) { -1L }
+
     /** 前端注册 JS 回调（每次 play 时由前端设置） */
     fun setCallbacks(endedJs: String, errorJs: String) {
         this.endedJs = endedJs

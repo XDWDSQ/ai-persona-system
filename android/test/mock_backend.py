@@ -158,7 +158,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(wav)
         elif path == "/api/greeting":
-            self._send(200, {"reply": "（模拟问候）老公，我在呀", "style": "normal"})
+            self._send(200, {"reply": "老公，你来了啊。今天下午训练刚结束，我复盘完就一直在等你。外面天气不错，晚上要不要一起出去走走？我刚拿到新的高达模型，拼了一半放在桌上，你要是想看的话我拍照给你。对了，你吃饭了吗？别总熬夜，记得早点休息。", "style": "自然"})
         elif path == "/api/upload":
             body = self._read_body()
             m = re.search(rb'filename="([^"]*)"', body)
