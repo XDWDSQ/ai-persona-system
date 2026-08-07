@@ -39,12 +39,12 @@ class MainActivity : Activity() {
         webView = findViewById(R.id.webview)
         progress = findViewById(R.id.progress)
         tvHint = findViewById(R.id.tv_hint)
-        // 未配置时点击提示进入设置页（已配置后无悬浮按钮，设置入口为长按桌面图标快捷方式）
+        // 未配置时点击提示进入设置页（内置默认服务器地址，只需填访问口令）
         tvHint.setOnClickListener {
             startActivityForResult(Intent(this, SettingsActivity::class.java), REQ_SETTINGS)
         }
 
-        if (AppConfig.serverUrl.isNullOrBlank()) {
+        if (!AppConfig.isConfigured()) {
             tvHint.visibility = View.VISIBLE
         } else {
             initWebView()
@@ -193,7 +193,7 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         when (requestCode) {
             REQ_SETTINGS -> {
-                if (AppConfig.serverUrl.isNullOrBlank()) {
+                if (!AppConfig.isConfigured()) {
                     finish()
                 } else {
                     LoginManager.updateConfig(AppConfig.serverUrl, AppConfig.token)

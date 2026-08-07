@@ -12,6 +12,9 @@ object AppConfig {
     private const val K_URL = "server_url"
     private const val K_TOKEN = "access_token"
 
+    /** 内置默认服务器地址（ngrok 固定域名，重启不变）；用户可在设置页改为其他地址 */
+    const val DEFAULT_SERVER_URL = "https://filling-smirk-sternness.ngrok-free.dev"
+
     @Volatile private var prefs: SharedPreferences? = null
 
     fun init(context: Context) {
@@ -20,8 +23,12 @@ object AppConfig {
         }
     }
 
+    /** 当前生效地址：用户已配置的优先，未配置时用内置默认地址 */
     val serverUrl: String?
-        get() = prefs?.getString(K_URL, null)?.takeIf { it.isNotBlank() }
+        get() = prefs?.getString(K_URL, null)?.takeIf { it.isNotBlank() } ?: DEFAULT_SERVER_URL
+
+    /** 是否已由用户显式配置过（决定首启是否进设置引导） */
+    fun isConfigured(): Boolean = !prefs?.getString(K_URL, null).isNullOrBlank()
 
     val token: String
         get() = prefs?.getString(K_TOKEN, "") ?: ""

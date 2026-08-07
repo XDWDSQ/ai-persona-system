@@ -212,10 +212,16 @@ class LocalServer private constructor() {
     ) {
         val base = LoginManager.serverUrl
         if (base.isNullOrBlank()) {
-            writeJsonError(out, 503, "未配置服务器地址，请点击右下角「⚙」设置")
+            writeJsonError(out, 503, "未配置服务器地址，请在设置中填写")
             return
         }
         val urlStr = base + path + if (query.isNotEmpty()) "?$query" else ""
+        // 转发目标仅允许 http/https（配置入口 normalizeUrl 已强制前缀；此处防御）
+        // 注意：不拒绝 localhost/私有地址——本机、局域网、模拟器(10.0.2.2)访问是设计需求
+        if (!urlStr.startsWith("http://") && !urlStr.startsWith("https://")) {
+            writeJsonError(out, 400, "非法服务器地址")
+            return
+        }
 
         val hasBody = method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE"
         // 请求体预先缓冲（≤8MB），保证鉴权失败重试时 body 可重放；超大上传流式透传、失败不重试

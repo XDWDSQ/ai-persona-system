@@ -25,7 +25,7 @@
         android:layout_height="wrap_content"
         android:layout_gravity="center"
         android:padding="24dp"
-        android:text="尚未配置服务器，\n点击此处设置服务器地址和访问口令\n（已配置后：长按桌面图标 → 服务器设置）"
+        android:text="首次使用：\n点击此处设置访问口令\n（服务器地址已内置，无需填写）"
         android:textColor="#a1a1aa"
         android:textSize="15sp"
         android:gravity="center"
