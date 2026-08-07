@@ -951,8 +951,7 @@
           var $ = function(s){ return document.querySelector(s); };
           var msgsInner = document.querySelector('.msgs-inner');
           /* 播放中对齐：点击当前播放消息的分段文字 → 按字符比例 seek 到对应音频位置（APK 环境） */
-          msgsInner.addEventListener('click', function(e){
-            var seg = e.target && e.target.closest ? e.target.closest('.tts-seg') : null;
+          function seekBySeg(seg) {
             if (!seg || !state.playing) return;
             if (!seg.closest('.msg') || seg.closest('.msg') !== state.playingMsg) return;
             if (!window.AndroidBridge || !window.AndroidBridge.audioDurationMs) return;
@@ -961,6 +960,29 @@
             if (dur <= 0 || !total) return;
             var ms = Math.floor(parseInt(seg.dataset.cs, 10) / total * dur);
             window.AndroidBridge.seekAudio(ms);
+          }
+          /* 真机触屏滚动/微动后浏览器可能不合成 click，必须走 touchend 判定 tap；
+             移动 <10px 且按住 <300ms 才算点击（滚动/长按不触发）；桌面保留 click */
+          var _tSeg = null, _tX = 0, _tY = 0, _tT = 0, _justSeeked = 0;
+          msgsInner.addEventListener('touchstart', function(e){
+            if (e.touches.length !== 1) { _tSeg = null; return; }
+            _tX = e.touches[0].clientX; _tY = e.touches[0].clientY; _tT = Date.now();
+            _tSeg = e.target && e.target.closest ? e.target.closest('.tts-seg') : null;
+          }, { passive: true });
+          msgsInner.addEventListener('touchend', function(e){
+            if (!_tSeg) return;
+            var t = e.changedTouches && e.changedTouches[0];
+            if (t && Date.now() - _tT < 300 &&
+                Math.abs(t.clientX - _tX) < 10 && Math.abs(t.clientY - _tY) < 10) {
+              seekBySeg(_tSeg);
+              _justSeeked = Date.now();
+            }
+            _tSeg = null;
+          }, { passive: true });
+          msgsInner.addEventListener('click', function(e){
+            if (Date.now() - _justSeeked < 500) return;  /* touchend 已处理，防重复 */
+            var seg = e.target && e.target.closest ? e.target.closest('.tts-seg') : null;
+            if (seg) seekBySeg(seg);
           });
           var state = { history: [], cloudProviders: {}, soundOn: (function(){ try { return localStorage.getItem('xiaoni_sound_on') !== '0'; } catch(e) { return true; } })(), speed: (function(){ try { return parseFloat(localStorage.getItem('xiaoni_speed') || '1.0') || 1.0; } catch(e) { return 1.0; } })(), provider: 'cloud', voiceProvider: 'local', aliyunConfigured: false, minimaxConfigured: false, audioCache: {}, ttsInflight: {}, playing: null, playingBtn: null, playSeq: 0, pendingAttachments: [], attachMenuOpen: false, awaiting: {} };
           /* 当前激活角色 key：同步维护，页面加载即生效（默认与后端 config 一致为大帅），
@@ -3154,9 +3176,10 @@
               s.pinned ? 1 : 0, s.manualTitle ? 1 : 0,
               last ? ((last.content || '').length + '|' + (last.role || '')) : '-'].join('~');
           }
+          var _syncRetry = 0;
           function syncSessionsFromServer() {
             fetch('/api/sessions').then(function(r){
-              if (r.status === 401) { location.href = '/login'; return null; }
+              if (r.status === 401) throw new Error('未登录');  /* 不跳页：首启登录可能未就绪，走重试 */
               return r.ok ? r.json() : null;
             }).then(function(data){
               if (!data || !Array.isArray(data.sessions)) return;
@@ -3225,7 +3248,15 @@
               /* 合并结果回传服务端，让本地独有的会话/消息在另一端也可见；
                  服务端广播会跳过本设备，不会触发自己再同步 */
               saveSessions();
-            }).catch(function(){});
+              _syncRetry = 0;  /* 同步成功，重置重试计数 */
+            }).catch(function(){
+              /* 失败重试：重装/首启时登录可能尚未就绪（预热登录/代理自动重登进行中），
+                 最多重试 3 次，避免会话历史静默丢失（本地只剩"新对话"） */
+              if (_syncRetry < 3) {
+                _syncRetry++;
+                setTimeout(function(){ syncSessionsFromServer(); }, 2000);
+              }
+            });
           }
           /* ---------- 多端实时同步：SSE 推送 + 可见性/定时兜底 ---------- */
           function isSyncBusy() {
