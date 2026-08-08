@@ -1,0 +1,52 @@
+- main [ref=f3e2]:
+  - generic [ref=f3e3]:
+    - complementary "会话栏" [ref=f3e4]:
+      - link "小拟 AI Persona" [ref=f3e6] [cursor=pointer]:
+        - /url: /pages/index.html
+        - generic [ref=f3e13]:
+          - generic [ref=f3e14]: 小拟
+          - generic [ref=f3e15]: AI Persona
+      - generic [ref=f3e16]: 最近会话
+      - button "dashuai·主对话 3 分钟前" [ref=f3e18] [cursor=pointer]:
+        - generic [ref=f3e21]: dashuai·主对话
+        - generic [ref=f3e22]: 3 分钟前
+      - generic "点击折叠/展开" [ref=f3e23] [cursor=pointer]:
+        - generic [ref=f3e24]: 角色
+        - generic [ref=f3e25]: ▾
+      - generic [ref=f3e27]:
+        - button "云端语言生成 正在探测" [ref=f3e28] [cursor=pointer]:
+          - generic [ref=f3e30]: 云端语言生成
+          - generic [ref=f3e31]: 正在探测
+        - button "音频合成 检测中…" [ref=f3e32] [cursor=pointer]:
+          - generic [ref=f3e34]: 音频合成
+          - generic [ref=f3e35]: 检测中…
+        - link "技术架构" [ref=f3e36] [cursor=pointer]:
+          - /url: /pages/architecture.html
+        - link "角色管理" [ref=f3e40] [cursor=pointer]:
+          - /url: /pages/roles.html
+        - link "系统状态" [ref=f3e44] [cursor=pointer]:
+          - /url: /pages/status.html
+        - link "返回官网" [ref=f3e47] [cursor=pointer]:
+          - /url: /pages/index.html
+    - generic [ref=f3e51]:
+      - generic [ref=f3e52]:
+        - button "打开会话列表" [ref=f3e53] [cursor=pointer]
+        - generic [ref=f3e56]: dashuai·主对话
+        - generic "点击关闭自动朗读" [ref=f3e59] [cursor=pointer]
+        - generic "朗读语速" [ref=f3e63]:
+          - button "0.8x" [ref=f3e64] [cursor=pointer]
+          - button "1.0x" [ref=f3e65] [cursor=pointer]
+          - button "1.2x" [ref=f3e66] [cursor=pointer]
+        - button "设置" [ref=f3e67] [cursor=pointer]
+      - generic [ref=f3e73]:
+        - generic [ref=f3e74]: 小拟 · 在线
+        - heading "嗨，我是小拟 你的 AI 分身" [level=1] [ref=f3e76]
+        - paragraph [ref=f3e77]: 你的 AI 分身。我已经学会了你的声音，接下来，我们就像老朋友一样聊天吧。直接打字开聊，我的声音，就是你的声音。
+        - generic [ref=f3e78]:
+          - button "用我的声音读一段话" [ref=f3e79] [cursor=pointer]
+          - button "聊聊今天的心情" [ref=f3e83] [cursor=pointer]
+          - button "我的声音安全吗" [ref=f3e86] [cursor=pointer]
+      - generic [ref=f3e91]:
+        - button "发送文件" [ref=f3e92] [cursor=pointer]
+        - textbox "说点什么…" [ref=f3e95]
+        - button "发送" [ref=f3e96] [cursor=pointer]

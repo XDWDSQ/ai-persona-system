@@ -1,0 +1,6 @@
+- generic [ref=e2]:
+  - generic [ref=e3]: AI 拟人系统 · 远程访问
+  - generic [ref=e4]: 请输入访问口令以继续口令在 config.json 的 access_token 中配置
+  - textbox "访问口令" [ref=e5]
+  - button "进入系统" [ref=e6] [cursor=pointer]
+  - generic [ref=e8]: 口令用于保护远端访问，本机直连同样生效

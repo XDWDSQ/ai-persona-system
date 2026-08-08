@@ -3516,7 +3516,13 @@
                 var t = (d.today && d.today.title) || '';
                 var body = d.guide || ((d.today && d.today.event && d.today.event.desc) || t);
                 var tip = '在下面用（括号）描写动作/环境开始演出，例如：（我拖着行李箱站在 AG 楼下）。旁白会铺场景，大帅会接住你的戏。';
-                if (d.stage === 0) tip = '你们还没线下见过面。用（括号）开场：进基地报到、刷官宣微博、或者先跟队友打个照面。';
+                /* 见面与否按虚拟日期判断（2027-01-05 冬训集结才首次见面），不能用情感阶段——
+                   首败前 stage 恒为 0，若用 stage 判断，见面后仍会误提示「还没见过面」 */
+                if (d.virtual_date && d.virtual_date < '2026-12-20') {
+                  tip = '你们还没见过面，他只是巅峰赛里风头正盛的路人王 ID。用（括号）开场：巅峰赛撞车、刷到他的操作集锦、或者听圈内人议论「岚风是谁」。';
+                } else if (d.virtual_date && d.virtual_date < '2027-01-05') {
+                  tip = '他官宣当天就进了基地，正坐在一诺的旧工位（左边长生、右边大帅），你俩还没正式说过话。用（括号）开场：训练室报到日的第一面、被起哄「诺哥的位置坐得稳吗」、或围观他开播时弹幕刷屏。';
+                }
                 var h1 = document.createElement('div'); h1.className = 'g-date';
                 h1.textContent = vd + ' · ' + sn;
                 var tag = document.createElement('span'); tag.className = 'g-tag'; tag.textContent = t;
