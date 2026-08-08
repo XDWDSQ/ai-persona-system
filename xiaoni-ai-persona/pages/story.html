@@ -104,6 +104,42 @@
   .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:9px 16px;border-radius:10px;font-size:13px;font-weight:600;box-shadow:var(--shadow);opacity:0;pointer-events:none;transition:opacity .25s;z-index:99}
   .toast.show{opacity:1}
   .loading{text-align:center;padding:60px 0;color:var(--muted);font-size:14px}
+
+  /* 今日剧情指引（折叠）：今日卡底部展开，文案来自后端 guide */
+  .today-card details{margin-top:10px}
+  .today-card summary{display:inline-block;font-size:12px;font-weight:700;cursor:pointer;opacity:.9;padding:4px 10px;border-radius:99px;background:rgba(255,255,255,.14);user-select:none}
+  .today-card summary:hover{background:rgba(255,255,255,.24)}
+  .today-card .guide-body{margin-top:9px;font-size:12.5px;line-height:1.75;opacity:.96}
+
+  /* 剧情时间线：倒序展示赛果/首败大吵/阶段推进/撤销等系统日志 */
+  .loglist{padding:6px 0}
+  .log-item{display:flex;gap:10px;padding:9px 16px;border-bottom:1px solid var(--border);font-size:12.5px;line-height:1.6}
+  .log-item:last-child{border-bottom:none}
+  .log-item .ld{flex:none;color:var(--muted);font-weight:600;font-size:11.5px;padding-top:1px}
+  .log-item .lt{color:var(--fg)}
+  .log-item.stage .lt{color:var(--accent);font-weight:700}
+  .log-empty{padding:22px 16px;text-align:center;color:var(--muted);font-size:12.5px}
+
+  /* 赛果详情弹层：点已赛/取消场次弹详情与撤销；点其他日期仍是跳转确认 */
+  .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.42);display:none;align-items:center;justify-content:center;z-index:60;padding:20px}
+  .modal-mask.show{display:flex}
+  .modal{width:100%;max-width:380px;background:var(--card);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow);overflow:hidden;animation:mpop .18s ease}
+  @keyframes mpop{from{transform:translateY(10px) scale(.97);opacity:0}to{transform:none;opacity:1}}
+  .modal-h{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+  .modal-h b{font-size:14px}
+  .modal-h .x{width:28px;height:28px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;color:var(--muted);font-size:16px}
+  .modal-h .x:hover{background:var(--card2)}
+  .modal-b{padding:14px 16px;display:flex;flex-direction:column;gap:8px;font-size:13px;line-height:1.7}
+  .modal-b .row2{display:flex;justify-content:space-between;gap:12px}
+  .modal-b .row2 span:first-child{color:var(--muted);flex:none}
+  .modal-b .row2 span:last-child{font-weight:600;text-align:right}
+  .modal-f{padding:12px 16px 16px;display:flex;gap:10px}
+  .modal-f button{flex:1;padding:10px 12px;border-radius:10px;font-size:13px;font-weight:700;border:1px solid var(--border);transition:background .2s}
+  .modal-f .jump{background:var(--card2)}
+  .modal-f .jump:hover{background:var(--border)}
+  .modal-f .undo{background:var(--accent-soft);color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+  .modal-f .undo:hover{background:color-mix(in srgb,var(--accent) 18%,var(--card))}
+  .modal-f .undo:disabled{opacity:.5;cursor:not-allowed}
 </style>
 </head>
 <body>
@@ -146,6 +182,26 @@
   </div>
 
   <div class="stats" id="statsRow"></div>
+
+  <div class="panel">
+    <div class="panel-h">
+      <b>剧情时间线</b>
+      <span class="hint">赛果 / 首败大吵 / 阶段推进 / 撤销，倒序最近 30 条</span>
+    </div>
+    <div class="loglist" id="logList"></div>
+  </div>
+</div>
+
+<!-- 赛果详情弹层 -->
+<div class="modal-mask" id="modalMask">
+  <div class="modal">
+    <div class="modal-h"><b id="mTitle">比赛详情</b><button class="x" id="mClose" aria-label="关闭">✕</button></div>
+    <div class="modal-b" id="mBody"></div>
+    <div class="modal-f">
+      <button class="jump" id="mJump">回到这天</button>
+      <button class="undo" id="mUndo">撤销这个结果</button>
+    </div>
+  </div>
 </div>
 
 <div class="foot">赛程结构参照 KPL 真实赛制（2025/2026 外推）· 比赛结果由岚风在对话中宣布 · 数据存于云端</div>
@@ -153,8 +209,17 @@
 
 <script>
 var API = {
-  get: function(path){ return fetch(path).then(function(r){ if(r.status===401){ location.href='/login'; throw new Error('未登录'); } return r.json(); }); },
-  post: function(path, body){ return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(function(r){ if(r.status===401){ location.href='/login'; throw new Error('未登录'); } return r.json(); }); }
+  /* 统一错误处理：401 跳登录；其余非 2xx 解析后端 {detail} 提示文案（撤销/跳转失败时用户能看到具体原因） */
+  _check: function(r){
+    if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
+    if (!r.ok) {
+      return r.json().then(function(d){ throw new Error((d && d.detail) || ('请求失败（' + r.status + '）')); },
+        function(){ throw new Error('请求失败（' + r.status + '）'); });
+    }
+    return r.json();
+  },
+  get: function(path){ return fetch(path).then(API._check); },
+  post: function(path, body){ return fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})}).then(API._check); }
 };
 var D = {};           /* calendar 数据 */
 var S = null;         /* status 数据 */
@@ -197,6 +262,22 @@ function renderToday(){
   mb.textContent = S.mode === 'override' ? '自由跳转' : '跟随现实';
   mb.className = 'mode-badge' + (S.mode === 'override' ? ' override' : '');
   document.getElementById('todayBtn').disabled = S.mode !== 'override';
+
+  /* 今日剧情指引（折叠）：今天能演什么、大帅处于什么状态，点开看全文 */
+  var card = document.getElementById('todayCard');
+  var oldGuide = card.querySelector('details');
+  if (oldGuide) oldGuide.remove();
+  if (S.guide) {
+    var det = document.createElement('details');
+    var sum = document.createElement('summary');
+    sum.textContent = '今日剧情指引';
+    var gb = document.createElement('div');
+    gb.className = 'guide-body';
+    gb.textContent = S.guide;
+    det.appendChild(sum);
+    det.appendChild(gb);
+    card.appendChild(det);
+  }
 }
 
 function renderStages(){
@@ -305,6 +386,8 @@ function renderCal(){
 
     (function(ds2, mm2, ev2){
       cell.addEventListener('click', function(){
+        /* 已记录的场次 → 弹详情（回看赛果/撤销口误），不直接跳转 */
+        if (mm2 && mm2.status === 'played' && mm2.result) { openMatchModal(mm2); return; }
         if (ds2 === todayDS && S && S.mode === 'follow') { toast('这就是当前剧情日'); return; }
         var label2 = mm2 ? ('比赛日 vs ' + mm2.opponent) : (ev2 ? ev2.title : '跳转到 ' + ds2);
         if (ds2 < todayDS || (S && S.mode === 'override' && ds2 === todayDS)) {
@@ -350,7 +433,112 @@ function renderAll(){
   renderStages();
   renderCal();
   renderStats();
+  renderLog();
 }
+
+/* ---------- 剧情时间线 ---------- */
+function renderLog(){
+  var box = document.getElementById('logList');
+  if (!box) return;
+  box.innerHTML = '';
+  var logs = (S && S.log) || [];
+  if (!logs.length) {
+    box.innerHTML = '<div class="log-empty">还没有剧情记录——在对话里宣布第一场比赛结果（如「赢了 3:1」），故事就开始了。</div>';
+    return;
+  }
+  var stageEv = { stage_1:1, stage_2:1, stage_3:1, first_fight:1, command_win:1, confession:1 };
+  logs.forEach(function(it){
+    var d = document.createElement('div');
+    d.className = 'log-item' + (stageEv[it.event] ? ' stage' : '');
+    var ld = document.createElement('span');
+    ld.className = 'ld';
+    ld.textContent = (it.date || '').slice(5);
+    var lt = document.createElement('span');
+    lt.className = 'lt';
+    lt.textContent = it.detail || it.event;
+    d.appendChild(ld);
+    d.appendChild(lt);
+    box.appendChild(d);
+  });
+}
+
+/* ---------- 赛果详情弹层（含撤销） ---------- */
+var _modalMatch = null;
+function stageNameOf(key){
+  for (var i = 0; i < (D.stages || []).length; i++) {
+    if (D.stages[i].key === key) return D.stages[i].name;
+  }
+  return key || '';
+}
+function openMatchModal(mm){
+  _modalMatch = mm;
+  var r = mm.result || {};
+  document.getElementById('mTitle').textContent = mm.date + ' vs ' + mm.opponent;
+  var body = document.getElementById('mBody');
+  body.innerHTML = '';
+  function row(k, v){
+    var d = document.createElement('div');
+    d.className = 'row2';
+    var a = document.createElement('span'); a.textContent = k;
+    var b = document.createElement('span'); b.textContent = v;
+    d.appendChild(a); d.appendChild(b);
+    body.appendChild(d);
+  }
+  row('赛段', stageNameOf(mm.stage) + (mm.label && mm.label !== stageNameOf(mm.stage) ? ' · ' + mm.label : ''));
+  row('赛制', mm.bo || '-');
+  var cancelled = (r.score === '-');
+  row('结果', cancelled ? '取消（未晋级）' : ((r.win ? '胜 ' : '负 ') + (r.score || '')));
+  if (!cancelled) {
+    if (r.mvp) row('MVP', r.mvp);
+    if (r.note) row('备注', r.note);
+    row('宣布方式', '对话中由岚风宣布');
+  }
+  var undoBtn = document.getElementById('mUndo');
+  undoBtn.style.display = cancelled ? 'none' : '';
+  undoBtn.disabled = false;
+  undoBtn.textContent = '撤销这个结果';
+  document.getElementById('modalMask').classList.add('show');
+}
+function closeModal(){
+  document.getElementById('modalMask').classList.remove('show');
+  _modalMatch = null;
+}
+function reloadAll(){
+  return Promise.all([API.get('/api/story/calendar'), API.get('/api/story/status')]).then(function(rs){
+    D = rs[0]; S = rs[1];
+    renderAll();
+  });
+}
+document.getElementById('mClose').addEventListener('click', closeModal);
+document.getElementById('modalMask').addEventListener('click', function(e){
+  if (e.target === this) closeModal();
+});
+document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeModal(); });
+document.getElementById('mJump').addEventListener('click', function(){
+  if (!_modalMatch) return;
+  var ds = _modalMatch.date;
+  closeModal();
+  if (S && S.virtual_date === ds) { toast('剧情就在这天'); return; }
+  doJump(ds);
+});
+document.getElementById('mUndo').addEventListener('click', function(){
+  if (!_modalMatch) return;
+  var mm = _modalMatch;
+  var btn = this;
+  if (!confirm('撤销 ' + mm.date + ' vs ' + mm.opponent + ' 的结果？\n场次会回到「待宣布」，战绩与后续受影响场次将重算。')) return;
+  btn.disabled = true;
+  btn.textContent = '撤销中…';
+  API.post('/api/story/result/undo', { date: mm.date }).then(function(s){
+    S = s;
+    closeModal();
+    toast('已撤销，战绩已重算');
+    return reloadAll();
+  }).catch(function(e){
+    btn.disabled = false;
+    btn.textContent = '撤销这个结果';
+    toast('撤销失败：' + e.message);
+  });
+});
 
 /* 月份导航 */
 function mountMonth(delta){

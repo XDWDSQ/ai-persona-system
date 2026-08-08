@@ -54,6 +54,32 @@ def test_too_similar_to_last():
                                    [{"role": "assistant", "content": prev}]))
 
 
+def test_story_regex_detect():
+    """剧情赛果正则：赢/输+比分要认得出，假设句/无胜负词绝不许误记。"""
+    d = server._story_regex_detect
+    r = d("今天赢了 3:1，爽")
+    check("赛果识别：赢+半角比分", r is not None and r["win"] is True and r["score"] == "3:1", str(r))
+    r2 = d("输了1：3，我的问题")
+    check("赛果识别：输+全角比分", r2 is not None and r2["win"] is False and r2["score"] == "1:3", str(r2))
+    check("赛果识别：无比分不记（交给 LLM）", d("这场赢了，打得不错") is None)
+    check("赛果识别：无胜负词不记", d("今天天气不错 3:1") is None)
+    check("赛果识别：假设句「要是」不误记", d("要是赢了3:1就请你们吃饭") is None)
+    check("赛果识别：假设句「如果」不误记", d("如果输了1:3怎么办") is None)
+    check("赛果识别：假设句「差点」不误记", d("差点就赢了 3:1") is None)
+    check("赛果识别：「本来能赢」不误记", d("本来能赢 3:1 的，可惜了") is None)
+    check("赛果识别：训练赛不误记", d("今天训练赛 3:1 赢了一场") is None)
+    check("赛果识别：巅峰赛不误记", d("巅峰赛 2:0 拿下，手感来了") is None)
+    check("赛果识别：排位不误记", d("排位三连胜，最后一局 3:1 赢的") is None)
+    check("赛果识别：时钟比分不误记", d("今晚 19:00 的比赛我们赢了") is None)
+    check("赛果识别：比分越界不记（5:3）", d("我们 5:3 赢了") is None)
+    check("赛果识别：平局比分不记（2:2）", d("我们 2:2 打平了") is None)
+    check("赛果识别：BO7 大比分 4:3 仍可记",
+          (lambda r: r is not None and r["win"] is True and r["score"] == "4:3")(d("总决赛 4:3 赢了，冠军！")))
+    check("剧情日期校验：非法格式拒绝", not server._story_date_valid("abc"))
+    check("剧情日期校验：越界日期拒绝", not server._story_date_valid("2027-13-99"))
+    check("剧情日期校验：合法日期通过", server._story_date_valid("2027-01-14"))
+
+
 def test_time_hint():
     from datetime import datetime
     hint = server._time_hint()
@@ -113,9 +139,9 @@ def test_retry_guard():
 
 def main():
     for t in (test_clean_history, test_degenerate_reply, test_too_similar_to_last,
-              test_time_hint, test_retry_guard):
+              test_story_regex_detect, test_time_hint, test_retry_guard):
         t()
-    print(f"\n{'=' * 50}\n共 5 组，失败 {_FAIL} 组")
+    print(f"\n{'=' * 50}\n共 6 组，失败 {_FAIL} 组")
     sys.exit(1 if _FAIL else 0)
 
 

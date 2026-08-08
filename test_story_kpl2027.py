@@ -55,6 +55,15 @@ class TestStoryManager(unittest.TestCase):
     def _mk(self, tmp):
         return StoryManager(tmp)
 
+    def test_invalid_date_returns_ok_false(self):
+        """非法日期格式：record/undo 返回 ok:False 而不是抛异常（API 层 400，引擎层不炸）。"""
+        with TmpDir() as d:
+            sm = self._mk(d)
+            r = sm.record_result("abc", True)
+            self.assertIs(r.get("ok"), False)
+            u = sm.undo_result("2027-13-99")
+            self.assertIs(u.get("ok"), False)
+
     def test_clock_follow(self):
         with TmpDir() as d:
             sm = self._mk(d)
@@ -134,6 +143,78 @@ class TestStoryManager(unittest.TestCase):
             m3 = sm.cal.match_on(_d("2027-04-11"))
             self.assertEqual(m2["status"], "skipped")
             self.assertEqual(m3["status"], "skipped")
+
+    def test_undo_result_recompute(self):
+        """撤销赛果：场次回 pending、战绩/连胜重算、情感阶段不回退。"""
+        with TmpDir() as d:
+            sm = self._mk(d)
+            sm.jump("2027-01-16")
+            self.assertTrue(sm.record_result("2027-01-16", True, "3:1")["ok"])
+            nxt = next(mm for mm in sm.cal.data["matches"]
+                       if mm["date"] > "2027-01-16" and mm["status"] == "pending")
+            self.assertTrue(sm.record_result(nxt["date"], False, "1:3")["ok"])
+            self.assertEqual(sm.state["record"], {"win": 1, "loss": 1, "streak": 0})
+            self.assertEqual(sm.state["stage"], 1)  # 首败触发大吵
+            # 撤销第二场（首败）：战绩回到 1 胜 0 负，连胜重算为 1
+            r = sm.undo_result(nxt["date"])
+            self.assertTrue(r["ok"])
+            self.assertEqual(sm.cal.match_on(_d(nxt["date"]))["status"], "pending")
+            self.assertEqual(sm.state["record"], {"win": 1, "loss": 0, "streak": 1})
+            # 发生过的大吵是既成事实：flags/阶段不回退
+            self.assertTrue(sm.state["flags"]["first_loss"])
+            self.assertEqual(sm.state["stage"], 1)
+            # 未记录的场次不能撤销；因淘汰取消的场次不能撤销
+            self.assertFalse(sm.undo_result(nxt["date"])["ok"])
+
+    def test_undo_playoff_restores_skipped(self):
+        """撤销季后赛败局：被取消的后续场次恢复 pending，战绩归零。"""
+        with TmpDir() as d:
+            sm = self._mk(d)
+            sm.jump("2027-03-27")
+            sm.record_result("2027-03-27", False, "1:4")
+            m2 = sm.cal.match_on(_d("2027-03-31"))
+            m3 = sm.cal.match_on(_d("2027-04-11"))
+            self.assertEqual(m2["status"], "skipped")
+            self.assertEqual(m3["status"], "skipped")
+            self.assertTrue(sm.undo_result("2027-03-27")["ok"])
+            self.assertEqual(m2["status"], "pending")
+            self.assertIsNone(m2["result"])
+            self.assertEqual(m3["status"], "pending")
+            self.assertEqual(sm.state["record"], {"win": 0, "loss": 0, "streak": 0})
+            # 重新记负 → 跳过逻辑再次生效
+            sm.record_result("2027-03-27", False, "1:4")
+            self.assertEqual(m2["status"], "skipped")
+            self.assertEqual(m3["status"], "skipped")
+
+    def test_calendar_result_persistence(self):
+        """赛果写在日历对象上，必须随 _save_calendar 落盘，重启不丢。"""
+        with TmpDir() as d:
+            sm = self._mk(d)
+            sm.jump("2027-01-16")
+            self.assertTrue(sm.record_result("2027-01-16", True, "3:1", "岚风")["ok"])
+            sm2 = StoryManager(d)  # 模拟重启后重新加载
+            m = sm2.cal.match_on(_d("2027-01-16"))
+            self.assertEqual(m["status"], "played")
+            self.assertTrue(m["result"]["win"])
+            self.assertEqual(sm2.state["record"]["win"], 1)
+
+    def test_set_flag_idempotent_log(self):
+        """同一 flag 重复置位只落一条日志（同步识别与后台标注可能重复触发）。"""
+        with TmpDir() as d:
+            sm = self._mk(d)
+            sm.set_flag("first_loss", True, "首败")
+            sm.set_flag("command_win", True, "岚风赢下指挥权")
+            sm.set_flag("command_win", True, "岚风赢下指挥权")
+            n = sum(1 for e in sm.state["log"] if e["event"] == "command_win")
+            self.assertEqual(n, 1)
+
+    def test_status_payload_has_log(self):
+        with TmpDir() as d:
+            sm = self._mk(d)
+            sm.set_flag("first_loss", True, "首败")
+            payload = sm.status_payload()
+            self.assertIn("log", payload)
+            self.assertTrue(any(e.get("event") == "stage_1" for e in payload["log"]))
 
     def test_story_context(self):
         with TmpDir() as d:

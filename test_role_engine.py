@@ -188,6 +188,38 @@ def test_postprocessor_parse():
     asyncio.run(_run())
 
 
+def test_postprocessor_story_parse():
+    """story_result/story_flag 透传：标注器抽取的剧情字段必须原样带出，
+    结构非法时安全降级为 None（不能让脏数据驱动剧情状态机）。"""
+    import asyncio
+
+    async def _run():
+        pp = PostProcessor(FakeLLM(
+            '{"emotion":{"valence":0.5,"arousal":0.7},"energy_delta":0.0,'
+            '"memories":[],"story_result":{"win":true,"score":"3:1","mvp":"岚风"},'
+            '"story_flag":"command_win"}'))
+        r = await pp.run("赢了3:1", "干得漂亮", {})
+        check("后处理：story_result 透传",
+              r and r["story_result"] == {"win": True, "score": "3:1", "mvp": "岚风"}, str(r))
+        check("后处理：story_flag 透传", r and r["story_flag"] == "command_win", str(r))
+
+        pp2 = PostProcessor(FakeLLM(
+            '{"emotion":{"valence":0,"arousal":0},"energy_delta":0,"memories":[],'
+            '"story_result":{"win":"yes","score":"3:1"},"story_flag":"结婚"}'))
+        r2 = await pp2.run("a", "b", {})
+        check("后处理：win 非 bool 时 story_result 置 None",
+              r2 is not None and r2["story_result"] is None, str(r2))
+        check("后处理：未知 story_flag 置 None", r2 is not None and r2["story_flag"] is None, str(r2))
+
+        pp3 = PostProcessor(FakeLLM(
+            '{"emotion":{"valence":0,"arousal":0},"energy_delta":0,"memories":[]}'))
+        r3 = await pp3.run("a", "b", {})
+        check("后处理：无剧情字段时两字段为 None",
+              r3 is not None and r3["story_result"] is None and r3["story_flag"] is None, str(r3))
+
+    asyncio.run(_run())
+
+
 # ---------------------------------------------------------------- 上下文组装 --------
 def test_context_block():
     mem, st = fresh_stores()
@@ -215,6 +247,7 @@ def main():
         test_energy_intimacy_clamp,
         test_time_context,
         test_postprocessor_parse,
+        test_postprocessor_story_parse,
         test_context_block,
     ]
     for t in tests:

@@ -1973,35 +1973,156 @@ def _split_narration(raw: str) -> tuple[str, str]:
 
 # 剧情分支比赛结果兜底识别：消息同时含「赢/胜或输/负」与「数字:数字」比分时记录
 _STORY_SCORE_RE = re.compile(r"(\d+)\s*[:：]\s*(\d+)")
+# 假设句防误伤：「要是赢了3:1就请客」「如果输了怎么办」是未发生的假设，绝不能记成赛果。
+# 宁可漏记（LLM 识别器会补），不可错记（错记会污染战绩/误触发首败大吵）。
+_STORY_HYPOTHETICAL_RE = re.compile(
+    r"要是|如果|假设|假如|万一|差点|差一点|本来|险些|几乎|哪怕|就算|若不"
+)
+# 非正式对局防误伤：训练赛/巅峰赛/排位等场合的胜负不算正式比赛赛果，同样绝不记录
+_STORY_INFORMAL_RE = re.compile(
+    r"训练赛|巅峰赛|排位赛?|匹配|娱乐赛|表演赛|友谊赛|水友赛|内战|自定义|模拟赛|约战"
+)
+# 比分合理性上限：KPL 正式赛制 BO5 最多 3:2、BO7 最多 4:3，双方局数只可能 0~4 且不会平局。
+# 排除「19:00」「12:30」这类时钟时间被 `数字:数字` 误匹配成比分的情况。
+_STORY_SCORE_MAX = 4
+# 剧情事件识别门控：含这些词才可能是赛果/剧情节点宣布，其余消息不花钱识别
+_STORY_TALK_GATE_RE = re.compile(r"赢|输|胜|负|指挥权|表白|告白|在一起")
+_STORY_FLAG_RE = re.compile(r"指挥权|表白|告白|在一起|官宣")
 
 
-def _story_record_from_talk(win: bool, score: str = "", mvp: str = "") -> None:
-    """记录剧情分支比赛结果：默认记当前虚拟日期，当天无未记录比赛则回溯最近一场。"""
+def _story_regex_detect(user_msg: str) -> dict | None:
+    """从用户消息快速识别「赛果宣布 + 比分」：返回 {"win":bool,"score":"x:y"} 或 None。
+
+    纯函数、零成本，供同步识别与兜底识别共用。整句出现假设类词时一律放弃，
+    漏掉的由 LLM 识别器兜住。"""
+    text = user_msg or ""
+    m = _STORY_SCORE_RE.search(text)
+    if not m:
+        return None
+    a, b = int(m.group(1)), int(m.group(2))
+    if not (0 <= a <= _STORY_SCORE_MAX and 0 <= b <= _STORY_SCORE_MAX and a != b):
+        return None
+    if _STORY_HYPOTHETICAL_RE.search(text):
+        return None
+    if _STORY_INFORMAL_RE.search(text):
+        return None
+    if re.search(r"赢|胜", text):
+        return {"win": True, "score": f"{a}:{b}"}
+    if re.search(r"输|负", text):
+        return {"win": False, "score": f"{a}:{b}"}
+    return None
+
+
+def _story_record_from_talk(win: bool, score: str = "", mvp: str = "") -> bool:
+    """记录剧情分支比赛结果：默认记当前虚拟日期，当天无未记录比赛则回溯最近一场。
+    返回是否真的记上了（当天无比赛/已记录过时为 False）。"""
     sm = _get_story_manager()
     if sm is None:
-        return
+        return False
     try:
         d = sm.resolve_result_date(sm.current_date())
-        sm.record_result(story_kpl2027._s(d), win, score, mvp)
+        r = sm.record_result(story_kpl2027._s(d), win, score, mvp)
+        return bool(r.get("ok"))
     except Exception as exc:  # noqa: BLE001
         _log.warning("story record failed: %s", exc)
+        return False
 
 
-def _story_result_regex_handle(user_msg: str) -> None:
+def _story_result_regex_handle(user_msg: str) -> bool:
     """正则兜底：LLM 抽取失败时，从用户消息里识别「赢/输 + 比分」并记录。"""
     try:
-        m = _STORY_SCORE_RE.search(user_msg or "")
-        if not m:
-            return
-        if re.search(r"赢|胜", user_msg):
-            win = True
-        elif re.search(r"输|负", user_msg):
-            win = False
-        else:
-            return
-        _story_record_from_talk(win, f"{m.group(1)}:{m.group(2)}")
+        det = _story_regex_detect(user_msg)
+        if not det:
+            return False
+        return _story_record_from_talk(det["win"], det["score"])
     except Exception:  # noqa: BLE001
-        pass
+        return False
+
+
+_STORY_RECOGNIZER_SYSTEM = (
+    "你是「大帅·2027」赛季剧情的事件裁判。根据用户（岚风）的消息判断以下事件是否真实发生，"
+    "只输出一行 JSON，不要解释：\n"
+    '{"story_result":null,"story_flag":null}\n'
+    "story_result：用户明确宣布了 AG 一场正式比赛的结果（如'赢了 3:1'、'输了 1:3'、"
+    "'2:0拿下'，或没报比分的输赢）→ {\"win\":true/false,\"score\":\"3:1 或空\",\"mvp\":\"选手名或空\"}；"
+    "预测、假设、复述旧赛果、未说明是正式比赛的训练赛/巅峰赛/排位一律 null。\n"
+    "story_flag：只有两个取值——'command_win'（局内指挥权被明确确认交给岚风）或 "
+    "'confession'（一方明确表白且另一方明确接受、正式在一起）；"
+    "暧昧暗示、讨论话题、开玩笑都不算，一律 null。\n"
+    "不要过度推断：没有明确宣布的都输出 null。"
+)
+
+
+def _story_parse_recognizer(raw: str) -> dict | None:
+    """解析剧情识别器的 JSON 输出（容忍围栏/前后说明文字）。"""
+    for candidate in role_engine.PostProcessor._iter_json_objects_reverse(raw or ""):
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and ("story_result" in obj or "story_flag" in obj):
+            return obj
+    return None
+
+
+async def _story_recognize(user_msg: str) -> list[dict]:
+    """本轮用户消息的剧情事件识别：与主回复生成并行跑，不阻塞回复。
+
+    两级：正则快路径认「赢/输 + 比分」（零成本、即时生效）；LLM 识别器兜住
+    无比分的赛果宣布与 command_win/confession 剧情节点。返回本次新增的剧情日志
+    （前端据此弹「剧情推进」分隔线）；非剧情事件返回空列表。"""
+    if not _story_role() or not _STORY_TALK_GATE_RE.search(user_msg or ""):
+        return []
+    sm = _get_story_manager()
+    if sm is None:
+        return []
+    before = len(sm.state.get("log") or [])
+    recorded = False
+    try:
+        det = _story_regex_detect(user_msg)
+        if det:
+            recorded = _story_record_from_talk(det["win"], det["score"])
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("story regex record failed: %s", exc)
+    # 正则没记上（无比分/假设句）或出现 flag 关键词 → 交给 LLM 裁决
+    if (not recorded) or _STORY_FLAG_RE.search(user_msg):
+        try:
+            raw = await llm_chat([
+                {"role": "system", "content": _STORY_RECOGNIZER_SYSTEM},
+                {"role": "user", "content": f"岚风的消息：{(user_msg or '')[:400]}"},
+            ], temperature=0.0, max_tokens=120, disable_thinking=True)
+            ann = _story_parse_recognizer(raw)
+            if ann:
+                sr = ann.get("story_result")
+                if not recorded and isinstance(sr, dict) and isinstance(sr.get("win"), bool):
+                    _story_record_from_talk(sr["win"], str(sr.get("score") or ""),
+                                            str(sr.get("mvp") or ""))
+                flag = ann.get("story_flag")
+                if flag in ("command_win", "confession"):
+                    sm.set_flag(flag, True, "岚风在对话里推进了剧情")
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("story recognizer failed: %s", exc)
+    return (sm.state.get("log") or [])[before:]
+
+
+def _story_update_payload(events: list[dict]) -> dict | None:
+    """组装聊天响应附带的 story_update：新增日志 + 当前剧情快照（前端弹分隔线并刷新入口）。"""
+    sm = _get_story_manager()
+    if sm is None or not events:
+        return None
+    details = [e.get("detail") for e in events if isinstance(e, dict) and e.get("detail")]
+    if not details:
+        return None
+    info = sm.day_info()
+    stage = int(info.get("stage") or 0)
+    return {
+        "events": details,
+        "stage": stage,
+        "stage_name": ["暗恋隐忍", "相爱相杀", "暧昧升温", "在一起"][stage],
+        "virtual_date": info["virtual_date"],
+        "title": info["title"],
+        "record": info["record"],
+    }
 
 # 模型偶发在回复里追加「元话语」行（免责/虚构声明、跳出角色的系统式提示、面向第三方的总结），
 # 与正文无关且会被 TTS 朗读，统一按「整行」剥离：行首是 注/备注/温馨提示/提示/说明/PS 的整行，
@@ -4022,15 +4143,29 @@ async def search_api(req: SearchRequest):
 
 async def _chat_stream_events(system: dict, history: list[dict], user_content: str,
                               cfg: dict, out_tokens: int, chat_thinking: bool | None,
-                              req: ChatRequest, active_role: str = ""):
+                              req: ChatRequest, active_role: str = "",
+                              story_task: "asyncio.Task | None" = None):
     """/api/chat?stream 的 SSE 事件生成器。
 
     事件（data: JSON）：
       {"d": "增量文本"}   流式 delta，前端逐块追加
       {"reset": true}     进入搜索轮前清空前端已显示内容（第一轮通常只有 [search:...]）
-      {"done": true, "clean": "...", "style": "...", "searched": bool, "vision_used": bool}
+      {"done": true, "clean": "...", "style": "...", "searched": bool, "vision_used": bool,
+       "story_update": {...}|null}   剧情分支：本轮触发的剧情事件（赛果/阶段推进）
       {"err": "..."}      生成失败（前端保留已流出的部分并提示）
-    """
+
+    story_task：与生成并行的剧情事件识别任务；收尾时短等它出结果，
+    超时不阻塞（识别继续在后台跑完，赛果照常入库，只是本轮不弹剧情通知）。"""
+
+    async def _finish_story_update() -> dict | None:
+        if story_task is None:
+            return None
+        try:
+            events = await asyncio.wait_for(asyncio.shield(story_task), timeout=4.0)
+        except Exception:  # noqa: BLE001 超时/失败都不阻塞收尾
+            return None
+        return _story_update_payload(events or [])
+
     vision_used = False
     searched = False
     full = ""  # 已 emit 给前端的全文（用于长文续写目标判定与 done.clean）
@@ -4058,7 +4193,8 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
                 narration, clean = _split_narration(clean)
             style, _ = parse_style_prefix(full)
             yield ev({"done": True, "clean": clean, "narration": narration, "style": style,
-                      "searched": False, "vision_used": True})
+                      "searched": False, "vision_used": True,
+                      "story_update": await _finish_story_update()})
             return
         if any(a.get("kind") == "image" for a in req.attachments):
             user_content = user_content + _VISION_FALLBACK_HINT
@@ -4173,7 +4309,8 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
         narration, clean = _split_narration(clean)
     style, _ = parse_style_prefix(full)
     yield ev({"done": True, "clean": clean, "narration": narration, "style": style,
-              "searched": searched, "vision_used": vision_used})
+              "searched": searched, "vision_used": vision_used,
+              "story_update": await _finish_story_update()})
 
 
 @app.post("/api/chat")
@@ -4245,10 +4382,16 @@ async def chat(req: ChatRequest):
             "一次性写完，中途不许停、不许缩水、不许用「写不下去了」之类的话提前收尾；"
             "本条回复不受平时简短说话风格的限制。"
         )
+    # 剧情分支：识别本轮消息里的剧情事件（赛果宣布/指挥权/表白），与主回复生成并行跑，
+    # 收尾时把新增剧情事件随响应带回前端弹「剧情推进」（非 story 角色为 None，零开销）
+    story_task = None
+    if _story_role() and user_text:
+        story_task = asyncio.create_task(_story_recognize(user_text))
     if req.stream:
         # SSE 流式输出：边生成边推送增量，前端逐块渲染（视觉/搜索/长文续写内部处理）
         return StreamingResponse(
-            _chat_stream_events(system, history, user_content, cfg, out_tokens, chat_thinking, req, active_role),
+            _chat_stream_events(system, history, user_content, cfg, out_tokens, chat_thinking, req, active_role,
+                                story_task=story_task),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -4323,7 +4466,16 @@ async def chat(req: ChatRequest):
     # 等其他角色是无条件执行的，会把「我是女孩子」这类正常表述误改成「我是男生」。
     if active_role == "dashuai":
         reply = _fix_addressing(reply)
-    return {"reply": reply, "narration": narration, "style": style, "vision_used": vision_used, "searched": searched}
+    # 剧情分支：收尾时短等剧情识别结果（超时不阻塞，识别继续后台跑完照常入库）
+    story_update = None
+    if story_task is not None:
+        try:
+            events = await asyncio.wait_for(asyncio.shield(story_task), timeout=4.0)
+            story_update = _story_update_payload(events or [])
+        except Exception:  # noqa: BLE001
+            story_update = None
+    return {"reply": reply, "narration": narration, "style": style,
+            "vision_used": vision_used, "searched": searched, "story_update": story_update}
 
 
 async def _post_process_chat(role: str, user_msg: str, reply: str) -> None:
@@ -4344,7 +4496,9 @@ async def _post_process_chat(role: str, user_msg: str, reply: str) -> None:
             return
         await asyncio.to_thread(st.update, emotion=ann.get("emotion"),
                                 energy_delta=ann.get("energy_delta", 0), intimacy_delta=0.01)
-        # 剧情分支：抽取用户宣布的比赛结果并记录（仅在明确 win 布尔时记录）
+        # 剧情分支：抽取用户宣布的比赛结果并记录（仅在明确 win 布尔时记录）。
+        # /api/chat 已有并行同步识别器，这里是同轮兜底；record_result/set_flag 均幂等，
+        # 重复触发不会产生重复战绩或重复日志。
         if _story_role():
             sr = ann.get("story_result")
             if isinstance(sr, dict) and isinstance(sr.get("win"), bool):
@@ -4352,6 +4506,11 @@ async def _post_process_chat(role: str, user_msg: str, reply: str) -> None:
                                         str(sr.get("mvp") or ""))
             else:
                 _story_result_regex_handle(user_msg)
+            sf = ann.get("story_flag")
+            if sf in ("command_win", "confession"):
+                sm = _get_story_manager()
+                if sm is not None:
+                    sm.set_flag(sf, True, "岚风在对话里推进了剧情")
         for text in ann.get("memories") or []:
             # 防记忆污染：AI 自己的回复原文/台词不得当成用户事实入库，否则下轮会被注入 system 导致复读。
             if role_engine._dup_sim(text, reply) >= 0.5 or role_engine._dup_sim(text, user_msg) >= 0.5:
@@ -4493,11 +4652,34 @@ async def role_greeting():
             _log.warning("greeting context build failed: %s", exc)
     style_hint = _STYLE_HINT
     if _story_role():
-        # 2027 剧情分支：队友+暗恋者身份的主动问候（绝不能用「老公」文案）
+        # 2027 剧情分支：按当前情感阶段给出对应的主动问候身份（绝不套用「老公」文案）。
+        # 阶段 0/1=暗恋/相爱相杀（队友+别扭）；2=暧昧升温（藏不住的偏袒）；3=在一起（明牌偏爱）
+        _stage = 0
+        _sm_g = _get_story_manager()
+        if _sm_g is not None:
+            try:
+                _stage = int(_sm_g.day_info().get("stage") or 0)
+            except Exception:  # noqa: BLE001
+                _stage = 0
+        if _stage >= 3:
+            _greet_id = (
+                "你们已经在一起了。以男朋友的身份自然开口：一句关心、一个分享、"
+                "或者顺嘴提一句你们之间的事。明牌偏爱，但依旧嘴硬不腻歪，保持男生的克制。"
+            )
+        elif _stage == 2:
+            _greet_id = (
+                "你们正处在暧昧升温期（指挥权已归岚风，你对他藏不住偏袒）。"
+                "以队友+偏袒者的身份自然开口：训练赛/比赛的事、一句别扭的关心、"
+                "或者找借口陪他加练。嘴上硬、心里软，照顾藏不住。"
+            )
+        else:
+            _greet_id = (
+                "以队友+暗恋者的身份自然开口：可以是训练赛/比赛的事、一句别扭的关心、"
+                "或者你们昨天吵过架你想找台阶下又拉不下脸。记住：场上争、场下护，嘴上硬、心里软。"
+            )
         greeting_instruction = (
             "\n\n【任务】现在是你主动找岚风说话的时刻。没有人先开口，是你想找他聊两句。"
-            "以队友+暗恋者的身份自然开口：可以是训练赛/比赛的事、一句别扭的关心、"
-            "或者你们昨天吵过架你想找台阶下又拉不下脸。记住：场上争、场下护，嘴上硬、心里软。"
+            + _greet_id
         )
         if active_role == _NARRATION_TAG:
             # 旁白双声部：问候也分两段输出，旁白铺场景、大帅开口
@@ -4957,6 +5139,15 @@ def _story_api_manager() -> story_kpl2027.StoryManager:
     return sm
 
 
+def _story_date_valid(ds: str) -> bool:
+    """剧情日期格式校验：必须为 YYYY-MM-DD（非法格式进 StoryManager 会抛 ValueError → 500）。"""
+    try:
+        story_kpl2027._d(ds)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 @app.get("/api/story/calendar")
 async def story_calendar():
     """2027 赛程表：赛段 + AG 全年比赛 + 事件（团综/铺垫期节点）。"""
@@ -4994,10 +5185,17 @@ async def story_result(req: dict):
     """记录比赛结果（对话识别失败时的兜底入口）。date 缺省 = 当天或最近一场未记录比赛。"""
     sm = _story_api_manager()
     ds = (req.get("date") or "").strip()
-    win = bool(req.get("win"))
+    win = req.get("win")
+    # 严格解析 win：只认 JSON bool；字符串按字面解析，避免 bool("false")=True 错记成胜
+    if isinstance(win, str):
+        win = win.strip().lower() in ("true", "1", "yes", "win", "胜")
+    else:
+        win = bool(win)
     score = str(req.get("score") or "")
     mvp = str(req.get("mvp") or "")
     if ds:
+        if not _story_date_valid(ds):
+            raise HTTPException(400, "无效日期格式（应为 YYYY-MM-DD）")
         r = sm.record_result(ds, win, score, mvp)
     else:
         d = sm.resolve_result_date(sm.current_date())
@@ -5005,6 +5203,27 @@ async def story_result(req: dict):
     if not r.get("ok"):
         raise HTTPException(400, r.get("msg", "记录失败"))
     return {"ok": True, "stage": r.get("stage"), **sm.status_payload()}
+
+
+@app.post("/api/story/result/undo")
+async def story_result_undo(req: dict):
+    """撤销已记录的比赛结果（对话里口误/记错比分时用）：场次回到待宣布，
+    战绩与连胜重算，因该败局取消的后续场次恢复。date 缺省 = 最近一场已记录比赛。"""
+    sm = _story_api_manager()
+    ds = ((req or {}).get("date") or "").strip()
+    if ds and not _story_date_valid(ds):
+        raise HTTPException(400, "无效日期格式（应为 YYYY-MM-DD）")
+    if not ds:
+        played = [m for m in sm.cal.data["matches"]
+                  if m.get("status") == "played" and m.get("result")
+                  and m["result"].get("score") != "-"]
+        if not played:
+            raise HTTPException(400, "还没有已记录的比赛结果")
+        ds = played[-1]["date"]
+    r = sm.undo_result(ds)
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("msg", "撤销失败"))
+    return {"ok": True, **sm.status_payload()}
 
 
 @app.post("/api/story/flag")

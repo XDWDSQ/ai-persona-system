@@ -419,6 +419,7 @@
         .role-list{padding:0 8px 8px;display:flex;flex-direction:column;gap:2px;max-height:230px;overflow-y:auto}
         .story-entry{margin:2px 8px 8px;display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:10px;border:1px dashed color-mix(in srgb,var(--accent) 55%,transparent);background:color-mix(in srgb,var(--accent) 7%,transparent);color:var(--accent);font-size:12.5px;font-weight:600;text-decoration:none;transition:background .2s ease}
         .story-entry svg{width:15px;height:15px;flex:none}
+        .story-entry .se-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         .story-entry:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
         .role-label{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none}
         .role-label .role-caret{font-size:9px;opacity:.7;transition:transform .15s ease}
@@ -513,6 +514,12 @@
         .msg-guide .g-date{font-weight:650;color:var(--foreground);font-size:13px;letter-spacing:.01em}
         .msg-guide .g-tag{display:inline-block;padding:1px 9px;border-radius:99px;background:color-mix(in srgb,var(--chart-2) 14%,transparent);color:var(--chart-2);font-size:11px;font-weight:600;margin-left:8px;vertical-align:1px}
         .msg-guide .g-tip{margin-top:7px;opacity:.88}
+        /* 剧情推进分隔线：系统记录赛果/阶段推进时插在对话流里，居中细字、左右拉线，
+           不占角色气泡也不入库上下文（history 里 role=event，发给模型前被过滤） */
+        .msg.event{gap:0;margin:6px 0;justify-content:center}
+        .msg.event .event-line{display:flex;align-items:center;gap:10px;width:100%;color:var(--muted-foreground);font-size:11.5px;line-height:1.6}
+        .msg.event .event-line::before,.msg.event .event-line::after{content:'';flex:1;height:1px;background:color-mix(in srgb,var(--chart-2) 26%,transparent)}
+        .msg.event .event-txt{max-width:82%;text-align:center;padding:3px 10px;border-radius:99px;background:color-mix(in srgb,var(--chart-2) 8%,transparent);border:1px solid color-mix(in srgb,var(--chart-2) 22%,transparent);color:color-mix(in srgb,var(--chart-2) 82%,var(--foreground))}
         /* 生成失败的提示气泡：红色系弱化样式 + 下方带「重试」按钮 */
         .msg.failed .bubble{background:var(--error-subtle);border-color:color-mix(in srgb,var(--error) 38%,transparent);color:var(--error-strong)}
         .msg.failed .meta-btn:hover{color:var(--error-strong);border-color:color-mix(in srgb,var(--error) 40%,transparent);background:color-mix(in srgb,var(--error) 9%,transparent)}
@@ -844,7 +851,7 @@
           <div class="role-list" id="role-list"></div>
           <a class="story-entry" id="story-entry" href="/pages/story.html" style="display:none" title="2027 KPL 赛季赛程表：跳转任意日期、查看战绩与剧情进度">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M9 16l2 2 4-4"/></svg>
-            <span>2027 赛季赛程表</span>
+            <span class="se-label">2027 赛季赛程表</span>
           </a>
           <div class="side-foot">
             <button class="provider-row" data-kind="chat" type="button" title="点击切换本地/云端">
@@ -1168,13 +1175,13 @@
                   fullRaw = '';
                   if (onDelta) onDelta(fullRaw);
                 } else if (ev.done) {
-                  out = { clean: ev.clean, style: ev.style || '', narration: ev.narration || '', searched: !!ev.searched, vision_used: !!ev.vision_used };
+                  out = { clean: ev.clean, style: ev.style || '', narration: ev.narration || '', searched: !!ev.searched, vision_used: !!ev.vision_used, story_update: ev.story_update || null };
                 } else if (ev.err) {
                   throw new Error(ev.err);
                 }
               }
             }
-            if (!out) out = { clean: stripStyleTag(fullRaw), style: '', narration: '', searched: false, vision_used: false };
+            if (!out) out = { clean: stripStyleTag(fullRaw), style: '', narration: '', searched: false, vision_used: false, story_update: null };
             return out;
           }
 
@@ -1229,6 +1236,13 @@
               s = fresh;
               var aiMsg = { role: 'assistant', content: clean, style: style, narration: res.narration || '' };
               s.history.push(aiMsg);
+              /* 剧情推进：本轮触发了剧情事件（赛果记录/阶段推进）时，把系统分隔线也入库，
+                 刷新/换设备后仍能看到剧情节点；role=event 不会进模型上下文 */
+              var storyEvText = '';
+              if (res.story_update && res.story_update.events && res.story_update.events.length) {
+                storyEvText = '剧情推进 · ' + res.story_update.events.join('；');
+                s.history.push({ role: 'event', content: storyEvText });
+              }
               markSessionActivity(sessionId);
               if (currentSessionId === sessionId) {
                 /* 旁白双声部：旁白气泡插在 AI 气泡之前（灰色小字推剧情，大帅气泡说台词） */
@@ -1248,6 +1262,8 @@
                 meta.appendChild(spk);
                 meta.appendChild(makeResynthBtn(clean, style, aiMsg, sessionId));
                 meta.appendChild(makeRegenBtn(div));
+                if (storyEvText) addMsg('event', storyEvText); /* 分隔线跟在回复后面，像系统结算 */
+                if (res.story_update) refreshStoryEntry(res.story_update);
                 if (state.soundOn) ttsAndPlay(clean, spk, style, false, aiMsg, sessionId);
               }
             } catch (e) {
@@ -1736,6 +1752,22 @@
             /* 只要出现任何新消息就收起欢迎区（覆盖问候/首条消息等所有入口） */
             var _welcome = document.querySelector('.welcome');
             if (_welcome) _welcome.style.display = 'none';
+            /* 剧情推进分隔线：无头像无气泡无操作菜单，居中一条细字 */
+            if (role === 'event') {
+              var evDiv = document.createElement('div');
+              evDiv.className = 'msg event' + (opts.animate === false ? '' : ' anim');
+              evDiv.dataset.role = 'event';
+              var evLine = document.createElement('div');
+              evLine.className = 'event-line';
+              var evTxt = document.createElement('span');
+              evTxt.className = 'event-txt';
+              evTxt.textContent = text || '';
+              evLine.appendChild(evTxt);
+              evDiv.appendChild(evLine);
+              (opts.container || msgsInner).appendChild(evDiv);
+              if (!opts.noScroll && stickBottom) scrollBottom();
+              return evDiv;
+            }
             var div = document.createElement('div');
             /* .anim 门控入场动画：新消息默认有；长历史整页渲染传 animate:false 跳过，
                避免几百个元素同时播动画导致切会话掉帧 */
@@ -3455,10 +3487,35 @@
             if (changed) renderCurrentSession();
             renderSessions();
           }
-          /* 2027 赛季入口：仅 dashuai2027 角色激活时显示（跳赛程表页面） */
+          /* 2027 赛季入口：仅 dashuai2027 角色激活时显示（跳赛程表页面），标签实时带今日剧情 */
+          var _storyEntryFetchTs = 0;
           function updateStoryEntry(activeRole) {
             var el = document.getElementById('story-entry');
-            if (el) el.style.display = (activeRole === 'dashuai2027') ? 'flex' : 'none';
+            if (!el) return;
+            var on = (activeRole === 'dashuai2027');
+            el.style.display = on ? 'flex' : 'none';
+            if (on) refreshStoryEntry(null);
+          }
+          /* 刷新赛程入口标签：storyUpdate 直接来自聊天响应的剧情快照；否则节流拉 /api/story/status */
+          function refreshStoryEntry(storyUpdate) {
+            var el = document.getElementById('story-entry');
+            if (!el || currentRoleKey !== 'dashuai2027') return;
+            var label = el.querySelector('.se-label');
+            if (!label) return;
+            function apply(x) {
+              var vd = x.virtual_date || '';
+              var title = x.title || ((x.today && x.today.title) || '');
+              label.textContent = vd ? ('2027 赛程 · ' + vd.slice(5) + ' ' + title) : '2027 赛季赛程表';
+              el.title = '2027 KPL 赛季赛程表：跳转任意日期、查看战绩与剧情进度' + (title ? '（今日：' + title + '）' : '');
+            }
+            if (storyUpdate && storyUpdate.virtual_date) {
+              _storyEntryFetchTs = Date.now();
+              apply(storyUpdate);
+              return;
+            }
+            if (Date.now() - _storyEntryFetchTs < 30000) return;
+            _storyEntryFetchTs = Date.now();
+            api('/api/story/status').then(function(d){ if (d) apply(d); }).catch(function(){});
           }
           function renderSessions() {
             if (!sessionsBox) return;
@@ -3516,7 +3573,13 @@
                 var t = (d.today && d.today.title) || '';
                 var body = d.guide || ((d.today && d.today.event && d.today.event.desc) || t);
                 var tip = '在下面用（括号）描写动作/环境开始演出，例如：（我拖着行李箱站在 AG 楼下）。旁白会铺场景，大帅会接住你的戏。';
-                if (d.stage === 0) tip = '你们还没线下见过面。用（括号）开场：进基地报到、刷官宣微博、或者先跟队友打个照面。';
+                /* 见面与否按虚拟日期判断（2027-01-05 冬训集结才首次见面），不能用情感阶段——
+                   首败前 stage 恒为 0，若用 stage 判断，见面后仍会误提示「还没见过面」 */
+                if (d.virtual_date && d.virtual_date < '2026-12-20') {
+                  tip = '你们还没见过面，他只是巅峰赛里风头正盛的路人王 ID。用（括号）开场：巅峰赛撞车、刷到他的操作集锦、或者听圈内人议论「岚风是谁」。';
+                } else if (d.virtual_date && d.virtual_date < '2027-01-05') {
+                  tip = '他已官宣入队，还没来基地报到。用（括号）开场：刷官宣微博、听队友聊这个新人、或者他报到那天在训练室的第一面。';
+                }
                 var h1 = document.createElement('div'); h1.className = 'g-date';
                 h1.textContent = vd + ' · ' + sn;
                 var tag = document.createElement('span'); tag.className = 'g-tag'; tag.textContent = t;

@@ -632,13 +632,15 @@ class PostProcessor:
     SYSTEM = (
         "你是对话状态标注器。根据用户消息和角色回复，输出情绪和新事实标注。\n"
         "只输出一行 JSON，不要任何思考过程和解释：\n"
-        '{"emotion":{"valence":0.0,"arousal":0.0},"energy_delta":0.0,"memories":[],"story_result":null}\n'
+        '{"emotion":{"valence":0.0,"arousal":0.0},"energy_delta":0.0,"memories":[],"story_result":null,"story_flag":null}\n'
         "字段说明：valence(-1难过~1开心)、arousal(0平静~1激动)、energy_delta(-0.1~0.1)、"
         "memories 只记用户身上稳定重要的事实（用户喜好/约定/经历），以\"用户\"为主语；"
         "禁止把角色自己说过的回复原文、角色扮演台词或对话寒暄存成记忆，没有就空数组。\n"
         "story_result：仅当用户消息明确宣布了比赛/对局结果（如\"我们赢了3:1\"\"输了 1:3\""
         "\"那场2:0拿下\"）时输出 {\"win\":true,\"score\":\"3:1\",\"mvp\":\"岚风\"}，否则 null；"
-        "不要从角色回复里推断结果，只认用户自己宣布的结果。\n"
+        "预测、假设、提旧赛果不算，不要从角色回复里推断结果，只认用户自己宣布的结果。\n"
+        "story_flag：剧情节点，只有两个取值——\"command_win\"（指挥权被明确交给岚风）或 "
+        "\"confession\"（明确表白且被接受、正式在一起），其余一律 null。\n"
         "已有记忆里存在的信息不要重复输出。"
     )
 
@@ -738,8 +740,21 @@ class PostProcessor:
         mems = data.get("memories")
         if not isinstance(mems, list):
             mems = []
+        # story_result：仅接受结构合法的赛果宣布（win 必须是 bool），其余视为 null；
+        # story_flag：仅接受 command_win / confession 两个剧情节点取值
+        sr = data.get("story_result")
+        if not (isinstance(sr, dict) and isinstance(sr.get("win"), bool)):
+            sr = None
+        else:
+            sr = {"win": sr["win"], "score": str(sr.get("score") or ""),
+                  "mvp": str(sr.get("mvp") or "")}
+        sf = data.get("story_flag")
+        if sf not in ("command_win", "confession"):
+            sf = None
         return {
             "emotion": {"valence": valence, "arousal": arousal},
             "energy_delta": energy_delta,
             "memories": [t for t in mems if isinstance(t, str) and t.strip()][:5],
+            "story_result": sr,
+            "story_flag": sf,
         }
