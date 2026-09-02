@@ -32,7 +32,7 @@ _log = logging.getLogger("minimax_llm")
 MINIMAX_DEFAULT_BASE_URL = "https://api.minimaxi.com/v1"
 # Token Plan 配额查询官方端点（订阅 Key 调用）；base_url 配了 api.* 域名时优先用同域名拼
 MINIMAX_DEFAULT_QUOTA_URL = "https://www.minimaxi.com/v1/token_plan/remains"
-MINIMAX_DEFAULT_MODEL = "MiniMax-M2.5"
+MINIMAX_DEFAULT_MODEL = "MiniMax-M3"  # 与 config 默认模型保持一致（无配置时的兜底值）
 # 计费模式环境变量兜底：config.json 未配置 billing_mode 时读取（payg | token_plan）
 MINIMAX_BILLING_MODE_ENV = "MINIMAX_BILLING_MODE"
 # 输出 token 上限（云端给到官方最大值，长文请求不会被自家上限卡住）

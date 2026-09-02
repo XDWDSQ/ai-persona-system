@@ -1,28 +1,29 @@
 @echo off
-REM AI æ‹Ÿäººç³»ç»Ÿ ä¸€é”®å¯åŠ¨
+REM AI ÄâÈËÏµÍ³ Ò»¼üÆô¶¯
 cd /d "%~dp0"
 
 set "PY=%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe"
 
 if not exist "%PY%" (
-    echo [X] æœªæ‰¾åˆ° TTS è¿è¡Œç¯å¢ƒï¼Œè¯·å…ˆè¿è¡Œ setup.bat å®Œæˆåˆå§‹åŒ–
+    echo [X] Î´ÕÒµ½ TTS ÔËĞĞ»·¾³£¬ÇëÏÈÔËĞĞ setup.bat Íê³É³õÊ¼»¯
     pause
     exit /b 1
 )
 
-REM ä¿æŒ TTS/ASR å¸¸é©»ï¼Œé¿å…é—²ç½®åé‡æ–°åŠ è½½æ¨¡å‹
+REM ±£³Ö TTS/ASR ³£×¤£¬±ÜÃâÏĞÖÃºóÖØĞÂ¼ÓÔØÄ£ĞÍ
 set "INTEL_SKILL_DOG_NO_EVICTION=1"
 
-REM å¯åŠ¨æœ¬åœ° LLMï¼ˆæœ¬åœ°æ¨¡å¼ç”¨ï¼›è‹¥å·²é…ç½®äº‘ç«¯ API å¯è·³è¿‡ï¼Œä¸å½±å“ï¼‰
-call "llm\start_llm.bat"
+REM ±¾µØ LLM ÒÑ´Ó½çÃæÏÂÏß£¨ÔÆ¶Ë MiniMax ÎªÖ÷ÒıÇæ£©£»ÈçĞè»Ö¸´±¾µØÍÆÀí£¬
+REM ÊÖ¶¯ÔËĞĞ llm\start_llm.bat ²¢ÔÚÉèÖÃÀï°ÑÒıÇæÇĞ»Ø±¾µØ¡£
 
-REM è½»é‡æ ¡éªŒåç«¯ä¾èµ–ï¼ˆå®‰è£…å·²è¿ç§»åˆ° setup.batï¼‰
-"%PY%" -c "import fastapi, uvicorn, httpx, pydantic" || (echo ä¾èµ–ç¼ºå¤±ï¼Œè¯·å…ˆè¿è¡Œ setup.bat & exit /b 1)
+REM ÇáÁ¿Ğ£Ñéºó¶ËÒÀÀµ£¨°²×°ÒÑÇ¨ÒÆµ½ setup.bat£©
+"%PY%" -c "import fastapi, uvicorn, httpx, pydantic" || (echo ÒÀÀµÈ±Ê§£¬ÇëÏÈÔËĞĞ setup.bat & exit /b 1)
 
 echo.
-echo  AI æ‹Ÿäººç³»ç»Ÿå·²å¯åŠ¨ï¼šhttp://127.0.0.1:8000
-echo  è¿œç¨‹è®¿é—®ï¼ˆCloudflare Tunnel / å±€åŸŸç½‘ï¼‰éœ€å…ˆé…ç½®è®¿é—®å£ä»¤ã€‚
-echo  å…³é—­æœ¬çª—å£å³åœæ­¢æœåŠ¡ã€‚
+echo  AI ÄâÈËÏµÍ³ÒÑÆô¶¯£ºhttp://127.0.0.1:8000
+echo  Ô¶³Ì·ÃÎÊ£ºÏÈÆô¶¯ ngrok£¨ngrok http 8000£©£¬µØÖ·¼û data\tunnel_url.txt
+echo  ¹«Íø·ÃÎÊÇ°±ØĞëÅäÖÃ·ÃÎÊ¿ÚÁî£¨config.json ¶¥²ã access_token£©¡£
+echo  ¹Ø±Õ±¾´°¿Ú¼´Í£Ö¹·şÎñ¡£
 echo.
 start "" http://127.0.0.1:8000
 "%PY%" -m uvicorn server:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 10

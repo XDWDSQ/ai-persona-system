@@ -134,9 +134,10 @@
       '#pet-ctx .pet-ctx-item.missing{opacity:.4;cursor:default}',
       '#pet-ctx .pet-ctx-sep{height:1px;background:var(--border,#e5e5e5);margin:4px 0}',
       '#pet-ctx .pet-ctx-danger{color:#d33}',
-      /* 移动端适配：小屏缩小 + 菜单满宽 */
+      /* 移动端适配：小屏缩小 + 菜单满宽；默认位置抬到输入栏上方，不遮发送键 */
       '@media (max-width: 640px){',
-      '  #pet:not(.mini){width:120px;height:120px}',
+      '  #pet:not(.mini){width:120px;height:120px;bottom:calc(env(safe-area-inset-bottom, 0px) + 84px)}',
+      '  #pet.mini{bottom:calc(env(safe-area-inset-bottom, 0px) + 78px)}',
       '  #pet .pet-bubble{font-size:12px;max-width:120px}',
       '  #pet-ctx{left:8px !important;right:8px;width:auto;min-width:0;',
       '  transform-origin:bottom center}',

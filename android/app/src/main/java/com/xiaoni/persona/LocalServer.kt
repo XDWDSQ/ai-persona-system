@@ -107,7 +107,7 @@ class LocalServer private constructor() {
             val query = if (qIdx >= 0) target.substring(qIdx + 1) else ""
 
             when {
-                path == "/" -> serveAsset(out, "pages/index.html")
+                path == "/" -> serveAsset(out, "pages/chat.html")
                 path == "/login" -> serveLoginPage(out)
                 path == "/favicon.ico" || path == "/favicon.svg" -> {
                     if (!serveAsset(out, "pages/favicon.svg")) writeError(out, 404)
@@ -180,7 +180,7 @@ class LocalServer private constructor() {
             </style></head><body>
             <div class="box"><h1>登录已失效</h1>
             <p>连接服务器的口令已过期或服务器已重启更换口令。<br>请在应用内点击右下角「⚙」设置，重新填写服务器地址与访问口令。</p>
-            <a href="/pages/index.html">返回首页</a></div>
+            <a href="/pages/chat.html">返回对话</a></div>
             </body></html>
         """.trimIndent()
         val bytes = html.toByteArray(Charsets.UTF_8)
@@ -196,7 +196,11 @@ class LocalServer private constructor() {
      *  改用 HttpURLConnection 默认 UA（Java/...）可绕过该拦截。 */
     private val SKIP_REQ_HEADERS = setOf(
         "host", "connection", "content-length", "transfer-encoding", "accept-encoding",
-        "origin", "referer", "cookie", "proxy-connection", "upgrade", "keep-alive", "user-agent",
+        "origin", "referer", "cookie", "proxy-connection", "upgrade", "keep-alive",
+        // WebView 页面请求会带浏览器 UA（Mozilla/5.0...），ngrok 免费版对浏览器 UA 强制显示
+        // 访问确认页（ERR_NGROK_6024）导致 API 返回 HTML 而非 JSON，页面误报"后端未连接"。
+        // 转发时丢弃 UA，让 HttpURLConnection 使用默认 Dalvik UA（直通，不被拦截）。
+        "user-agent",
     )
     /** 转发响应时跳过的头。
      *  注意：Content-Length 必须透传——MediaPlayer 播放 WAV 音频时依赖它拿到总时长，

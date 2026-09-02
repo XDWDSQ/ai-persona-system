@@ -1,6 +1,8 @@
 # Android APK（AI 拟人系统手机端）
 
-把 AI 拟人系统打包成 Android 应用：**界面内置在 APK 里（秒开、离线可见），数据接口经 APK 内本地代理转发到远程服务器**（电脑上的服务经 Cloudflare 隧道 / 云电脑部署）。
+> ⚠️ **已停止开发（存档）**：手机端统一改用 **PWA 网页版**（浏览器"添加到主屏幕"，体验对齐原生）。本工程仅作历史存档，不再构建更新；`sync_pages.bat` 与 `data/tunnel_url_apk.txt` 已废弃。以下内容保留供参考。
+
+把 AI 拟人系统打包成 Android 应用：**界面内置在 APK 里（秒开、离线可见），数据接口经 APK 内本地代理转发到远程服务器**（电脑上的服务经 ngrok 隧道 / 云电脑部署）。
 
 ## 架构
 
@@ -36,12 +38,13 @@ android/
 
 ## 打包前端更新
 
-改了 `xiaoni-ai-persona/` 前端后，重新拷贝并构建：
+改了 `xiaoni-ai-persona/` 前端后，运行同步脚本（xcopy pages → assets，并检测同步盘冲突副本）：
 
 ```bat
-xcopy /E /Y xiaoni-ai-persona\pages android\app\src\main\assets\pages\
-copy /Y xiaoni-ai-persona\colors_and_type.css android\app\src\main\assets\
+sync_pages.bat
 ```
+
+> 前端已精简为 chat.html 单页 + pet.js + pet 素材（原 index/roles/status/architecture 页与 colors_and_type.css 已删除）。
 
 ## 构建 APK
 
@@ -71,7 +74,7 @@ keytool -genkeypair -v -keystore keystore\persona-release.keystore -alias person
 
 1. 手机允许「安装未知来源应用」
 2. 安装 `app-release.apk`（正式签名版）
-3. 打开应用 → 填服务器地址（电脑运行 `start.bat` + `start_tunnel.bat` 后，`data/tunnel_url.txt` 里的地址；或云电脑地址）和访问口令 → 保存并进入
+3. 打开应用 → 填服务器地址（电脑运行 `start.bat` 启动服务、`ngrok http 8000` 开隧道后，`data/tunnel_url.txt` 里的地址；或云电脑地址）和访问口令 → 保存并进入
 
 ## 使用说明
 

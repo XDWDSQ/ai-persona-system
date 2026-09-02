@@ -228,13 +228,9 @@
 }
 
     </style>
-    <!-- 字体：Geist / Geist Mono（font-display:swap，加载失败自动回落系统字体）。
-         原先引入的 Tailwind 浏览器运行时（~500KB JIT + 全局 MutationObserver）只服务三个
-         工具类，已由下方兜底样式覆盖，移除后首屏与流式渲染都明显更轻 -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="preload" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" as="style" onload="this.onload=null;this.rel='stylesheet'">
-    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"></noscript>
+    <!-- 字体：直接使用系统字体栈（--font-sans 已含 ui-sans-serif/system-ui 回退）。
+         此前的 Google Fonts 外链（Geist）在国内网络下经常超时/失败，最终总是回落系统字体，
+         移除后少一个无谓的外网请求，首屏更稳 -->
     <style id="semantic-token-fallback">
       .bg-background { background-color: var(--vercel-background); }
       .text-background { color: var(--vercel-background); }
@@ -430,8 +426,8 @@
         .role-item .r-name{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .role-item .r-badge{font-family:var(--font-mono);font-size:9.5px;opacity:.7;flex:none}
         .side-foot{padding:14px 14px 16px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:10px}
-        .provider-row{display:flex;align-items:center;gap:8px;width:100%;padding:9px 11px;border-radius:8px;border:1px solid var(--border);background:var(--background);font-family:inherit;font-size:inherit;text-align:left;cursor:pointer;transition:border-color .16s ease,background-color .16s ease}
-        .provider-row:hover{border-color:color-mix(in srgb,var(--muted-foreground) 38%,transparent);background:var(--accent)}
+        /* ===== Provider row（状态卡，不可点击） ===== */
+        .provider-row{display:flex;align-items:center;gap:8px;width:100%;padding:9px 11px;border-radius:8px;border:1px solid var(--border);background:var(--background);font-family:inherit;font-size:inherit;text-align:left;cursor:default}
         .provider-row .p-dot{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 8px var(--success);flex:none;animation:liveBlink 1.8s ease-in-out infinite}
         .provider-row .p-dot.checking{background:var(--muted-foreground);box-shadow:none;animation:none}
         .provider-row .p-dot.offline{background:var(--destructive);box-shadow:0 0 8px var(--destructive);animation:none}
@@ -442,9 +438,7 @@
         .provider-row.voice-row .p-dot{background:var(--chart-2);box-shadow:0 0 8px var(--chart-2)}
         .provider-row.voice-row .p-dot.checking{background:var(--muted-foreground);box-shadow:none;animation:none}
         .provider-row.voice-row .p-dot.offline{background:var(--destructive);box-shadow:0 0 8px var(--destructive);animation:none}
-        .side-link{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted-foreground);padding:8px 11px;border-radius:8px;transition:background-color .14s ease,color .14s ease}
-        .side-link svg{width:15px;height:15px}
-        .side-link:hover{background:var(--accent);color:var(--foreground)}
+        /* 导航链接已随边缘页面一起移除（个人产品唯一入口是本页） */
 
         /* ===== Chat main ===== */
         .main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
@@ -463,10 +457,6 @@
         .top-chip svg{width:13px;height:13px}
         .top-chip.voice{color:var(--success)}
         .top-chip.voice svg{color:var(--success)}
-        .speed-row{display:inline-flex;align-items:center;gap:2px;height:32px;padding:3px;border:1px solid var(--border);border-radius:8px;background:var(--card)}
-        .speed-btn{height:26px;min-width:40px;padding:0 9px;border:none;border-radius:6px;background:transparent;color:var(--muted-foreground);font-family:var(--font-mono);font-size:10.5px;cursor:pointer;transition:background-color .14s ease,color .14s ease}
-        .speed-btn:hover{color:var(--foreground);background:var(--accent)}
-        .speed-btn.active{background:color-mix(in srgb,var(--chart-2) 18%,transparent);color:var(--chart-2)}
         .chat-title .c-dot.checking{background:var(--muted-foreground);box-shadow:none;animation:none}
         .chat-title .c-dot.offline{background:var(--destructive);box-shadow:0 0 8px var(--destructive);animation:none}
         .top-btn{width:32px;height:32px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--muted-foreground);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background-color .16s ease,color .16s ease,border-color .16s ease}
@@ -626,7 +616,6 @@
         .att-chip-info small{font-size:10px;color:var(--muted-foreground)}
         .att-chip-rm{width:22px;height:22px;border-radius:6px;border:none;background:none;color:var(--muted-foreground);cursor:pointer;flex:none;font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center}
         .att-chip-rm:hover{color:var(--destructive);background:color-mix(in srgb,var(--destructive) 10%,transparent)}
-        .input-hint{max-width:760px;margin:8px auto 0;text-align:center;font-family:var(--font-mono);font-size:10.5px;color:var(--muted-foreground);letter-spacing:.04em}
 
         /* ===== Meta actions (copy/regen) ===== */
         .meta-actions{display:inline-flex;align-items:center;gap:4px}
@@ -635,6 +624,12 @@
         .meta-btn:hover{color:var(--chart-2);border-color:color-mix(in srgb,var(--chart-2) 32%,transparent);background:color-mix(in srgb,var(--chart-2) 7%,transparent);transform:translateY(-1px)}
         .meta-btn:active{transform:translateY(0) scale(.97)}
         .meta-btn:hover svg{transform:rotate(-6deg) scale(1.08)}
+
+        /* ===== 回到底部浮钮（上翻浏览历史时出现；位于桌宠左侧避免遮挡） ===== */
+        .jump-bottom{position:absolute;right:192px;bottom:108px;z-index:45;width:38px;height:38px;border-radius:50%;border:1px solid var(--border);background:var(--card);color:var(--muted-foreground);display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 12px 32px -14px rgba(0,0,0,.55);opacity:0;transform:translateY(8px);pointer-events:none;transition:opacity .18s ease,transform .18s ease,color .16s ease,background-color .16s ease}
+        .jump-bottom.show{opacity:1;transform:none;pointer-events:auto}
+        .jump-bottom:hover{color:var(--foreground);background:var(--accent)}
+        .jump-bottom svg{width:16px;height:16px}
 
         /* ===== Overlay + Modal ===== */
         .overlay{position:fixed;inset:0;z-index:50;background:rgba(8,10,14,.55);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);display:none;opacity:0;transition:opacity .22s ease}
@@ -670,16 +665,7 @@
         .ctx-menu button svg{width:14px;height:14px;color:var(--chart-2)}
         .ctx-menu hr{border:none;border-top:1px solid var(--border);margin:5px 2px}
 
-        /* ===== Provider row micro transitions ===== */
-        .provider-row{transition:background-color .22s ease,border-color .22s ease,box-shadow .22s ease,transform .2s ease}
-        .provider-row:hover{background:color-mix(in srgb,var(--accent) 60%,transparent);transform:translateY(-1px);box-shadow:0 6px 18px -10px rgba(0,0,0,.4)}
-        .provider-row:active{transform:translateY(0)}
-        .p-dot{transition:transform .24s ease,box-shadow .24s ease}
-        .provider-row:hover .p-dot{transform:scale(1.25)}
-        .p-dot.local{box-shadow:0 0 0 3px color-mix(in srgb,var(--success) 16%,transparent)}
-        .provider-row:hover .p-dot.local{box-shadow:0 0 0 5px color-mix(in srgb,var(--success) 16%,transparent)}
-        .p-dot.cloud{box-shadow:0 0 0 3px color-mix(in srgb,var(--chart-2) 16%,transparent)}
-        .provider-row:hover .p-dot.cloud{box-shadow:0 0 0 5px color-mix(in srgb,var(--chart-2) 16%,transparent)}
+        /* ===== Provider row 微动效已随「不可点击状态卡」化移除 ===== */
         .role-caret{display:inline-block;transition:transform .25s cubic-bezier(.2,.7,.2,1)}
         .role-label.collapsed .role-caret{transform:rotate(-90deg)}
         .role-list{overflow:hidden;transition:max-height .35s cubic-bezier(.2,.7,.2,1),opacity .3s ease,margin .3s ease}
@@ -713,8 +699,6 @@
         .attach-btn:hover svg{transform:rotate(-14deg)}
         .menu-btn svg{transition:transform .25s cubic-bezier(.2,.7,.2,1)}
         .menu-btn:hover svg{transform:translateX(1.5px)}
-        .side-link svg{transition:transform .22s cubic-bezier(.2,.7,.2,1)}
-        .side-link:hover svg{transform:translateY(-1px)}
         .top-chip svg{transition:transform .22s cubic-bezier(.2,.7,.2,1)}
         .top-chip:hover svg{transform:scale(1.1)}
         .top-btn svg{transition:transform .22s cubic-bezier(.2,.7,.2,1)}
@@ -734,7 +718,10 @@
         .side-backdrop{display:none}
 
         /* ===== Responsive ===== */
-        @media (max-width:900px){
+          @media (max-width:900px){
+            .jump-bottom{right:142px;bottom:84px}
+          }
+          @media (max-width:900px){
           /* 侧边栏抽屉化：不再 display:none，改为左滑出入，保证手机上可切换会话/角色 */
           .side{position:fixed;top:0;bottom:0;left:0;z-index:60;width:min(300px,84vw);transform:translateX(-103%);transition:transform .26s cubic-bezier(.2,.7,.2,1)}
           .side.open{transform:none;box-shadow:0 18px 60px -18px rgba(0,0,0,.6)}
@@ -766,7 +753,6 @@
           .attach-btn svg{width:15px;height:15px}
           .send-btn{width:36px;height:36px;border-radius:10px}
           .send-btn svg{width:15px;height:15px}
-          .input-hint{display:none}
           /* 顶部安全区（刘海/灵动岛） */
           .chat-top{height:calc(56px + env(safe-area-inset-top,0px));padding:env(safe-area-inset-top,0px) 12px 0;gap:8px}
           .chat-title .c-sub{display:none}
@@ -786,8 +772,7 @@
           #settings .set-foot{padding-bottom:calc(16px + env(safe-area-inset-bottom,0px))}
         }
         @media (max-width:640px){
-          /* 窄屏空间不够：语速控件隐藏（朗读语速保留 1.0x 默认），优先保标题与发送区 */
-          .speed-row{display:none}
+          /* 窄屏：优先保标题与发送区 */
         }
         /* ===== 动画增强：欢迎区入场 / 侧栏错峰 / 朗读状态 / Toast 进度条 ===== */
         @keyframes riseIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
@@ -824,7 +809,7 @@
         <!-- ===== SIDEBAR ===== -->
         <aside class="side" aria-label="会话栏">
           <div class="side-head">
-            <a class="brand" href="/pages/index.html" target="_blank" rel="noopener" data-dom-id="chat-home" title="新标签页打开官网">
+            <a class="brand" href="/" data-dom-id="chat-home" title="回到对话页">
               <span class="brand-mark" aria-hidden="true">
                 <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="10" width="2.6" height="4" rx="1.3" fill="currentColor"/><rect x="8" y="6" width="2.6" height="12" rx="1.3" fill="currentColor"/><rect x="13" y="3" width="2.6" height="18" rx="1.3" fill="currentColor"/><rect x="18" y="8" width="2.6" height="8" rx="1.3" fill="currentColor"/></svg>
               </span>
@@ -847,32 +832,17 @@
             <span>2027 赛季赛程表</span>
           </a>
           <div class="side-foot">
-            <button class="provider-row" data-kind="chat" type="button" title="点击切换本地/云端">
+            <button class="provider-row" data-kind="chat" type="button" title="当前文字生成引擎">
               <span class="p-dot checking"></span>
               <span class="p-name">云端语言生成</span>
               <span class="p-detail">正在探测</span>
             </button>
-            <button class="provider-row voice-row" data-kind="voice" type="button" title="点击切换本地/云端合成">
+            <button class="provider-row voice-row" data-kind="voice" type="button" title="当前语音合成引擎">
               <span class="p-dot checking"></span>
               <span class="p-name">音频合成</span>
               <span class="p-detail">检测中…</span>
             </button>
-            <a class="side-link" href="/pages/architecture.html" target="_blank" rel="noopener" data-dom-id="chat-arch">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
-              技术架构
-            </a>
-            <a class="side-link" href="/pages/roles.html" target="_blank" rel="noopener" data-dom-id="chat-roles" title="新标签页打开：角色记忆 / 情绪 / 人设">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-              角色管理
-            </a>
-            <a class="side-link" href="/pages/status.html" target="_blank" rel="noopener" data-dom-id="chat-status" title="新标签页打开：依赖与健康检查">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-              系统状态
-            </a>
-            <a class="side-link" href="/pages/index.html" target="_blank" rel="noopener" data-dom-id="chat-home-link" title="新标签页打开官网">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>
-              返回官网
-            </a>
+            <!-- 引擎切换与角色管理收进「设置」：侧栏只保留状态与操作 -->
           </div>
         </aside>
 
@@ -892,11 +862,7 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
               <span class="hide-m">语音合成</span>
             </span>
-            <div class="speed-row" id="speed-row" title="朗读语速">
-              <button class="speed-btn" data-speed="0.8" type="button">0.8x</button>
-              <button class="speed-btn active" data-speed="1.0" type="button">1.0x</button>
-              <button class="speed-btn" data-speed="1.2" type="button">1.2x</button>
-            </div>
+            <!-- 朗读语速移入设置面板：低频参数不再占据顶栏 -->
             <button class="top-btn" title="设置" data-dom-id="btn-settings">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             </button>
@@ -904,25 +870,12 @@
 
           <div class="msgs" id="msgs">
             <div class="msgs-inner">
-              <!-- Welcome -->
+              <!-- Welcome：内容由 refreshStatus 按当前角色动态填充 -->
               <div class="welcome">
-                <div class="eyebrow"><span class="pip"></span>小拟 · 在线</div>
-                <h1>嗨，我是小拟 <span class="grad">你的 AI 分身</span></h1>
-                <p>你的 AI 分身。我已经学会了你的声音，接下来，我们就像老朋友一样聊天吧。直接打字开聊，我的声音，就是你的声音。</p>
-                <div class="chips">
-                  <button class="prompt-chip" data-dom-id="prompt-1">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
-                    用我的声音读一段话
-                  </button>
-                  <button class="prompt-chip" data-dom-id="prompt-2">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-                    聊聊今天的心情
-                  </button>
-                  <button class="prompt-chip" data-dom-id="prompt-3">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
-                    我的声音安全吗
-                  </button>
-                </div>
+                <div class="eyebrow"><span class="pip"></span>正在连接…</div>
+                <h1 id="welcome-title">你好</h1>
+                <p id="welcome-sub">正在获取角色信息…</p>
+                <div class="chips" id="prompt-chips"></div>
               </div>
 
               <!-- 动态消息由 JS 渲染 -->
@@ -958,7 +911,6 @@
                 <i class="spinner" aria-hidden="true"></i>
               </button>
             </div>
-            <div class="input-hint">GPU 推理 · 声音合成 —— 全程在你电脑上运行</div>
           </div>
         </div>
       </div>
@@ -1252,8 +1204,28 @@
               }
             } catch (e) {
               hideTyping();
-              if (div && div.parentNode) div.remove(); /* 流中断：删掉半成品，落失败气泡 */
-              addFailureMsg(sessionId, (e && e.message) || '生成失败，请重试', snap);
+              /* 流中断但已流出内容（如收尾断连/部署重启/隧道抖动）：把已生成内容入库，
+                 否则重进后历史以用户消息结尾，误报"上次回复没有生成成功"。
+                 没有任何内容才落失败气泡（可重试）。 */
+              var kept = clean || stripStyleTag(fullRaw);
+              if (kept && kept.trim()) {
+                var f2 = findSession(sessionId);
+                if (f2) {
+                  f2.history.push({ role: 'assistant', content: kept, style: style || '' });
+                  markSessionActivity(sessionId);
+                  if (div && div.querySelector('.bubble')) {
+                    div.querySelector('.bubble').textContent = kept;
+                    div.classList.remove('no-text');
+                  }
+                  toast('网络中断，已保留已生成的内容');
+                } else if (div && div.parentNode) {
+                  div.remove();
+                  addFailureMsg(sessionId, '会话已被删除', snap);
+                }
+              } else {
+                if (div && div.parentNode) div.remove(); /* 流中断：删掉半成品，落失败气泡 */
+                addFailureMsg(sessionId, (e && e.message) || '生成失败，请重试', snap);
+              }
             }
           }
 
@@ -1292,6 +1264,14 @@
               } else {
                 clean = stripStyleTag(raw);
               }
+              /* 收尾竞态防护：done 处理会绕过渲染器直接写整段文本（b2.textContent = clean），
+                 此时若还有排队的 rAF flush，按 base 追加增量会把末段重复一遍
+                 （delta 与 done 同帧到达时必现）。气泡已等于目标文本 → 只同步 base。 */
+              if (clean && bubble.textContent === clean) {
+                base = clean;
+                if (onRendered) onRendered();
+                return;
+              }
               if (base) {
                 if (clean.indexOf(base) === 0) {
                   /* 前缀一致（常态）：只把新增部分 append 成独立 TextNode，不重建整个气泡 */
@@ -1315,29 +1295,22 @@
           }
 
           /* ---------- 状态 ---------- */
-          function pickProvider(p) {
-            document.querySelectorAll('#chat-tabs .set-tab').forEach(function(b){ b.classList.toggle('active', b.dataset.provider === p); });
-            var lf = document.getElementById('local-fields');
-            var cf = document.getElementById('cloud-fields');
-            if (lf) lf.style.display = p === 'local' ? '' : 'none';
-            if (cf) cf.style.display = p === 'cloud' ? '' : 'none';
-          }
           function pickVoiceProvider(p) {
+            /* 本地合成不再出现在设置里（后端能力保留）：存量 voice_provider=local 时兜底显示 MiniMax */
+            if (p !== 'aliyun' && p !== 'minimax') p = 'minimax';
             document.querySelectorAll('#voice-tabs .set-tab').forEach(function(b){ b.classList.toggle('active', b.dataset.voice === p); });
-            var map = { 'local': 'local-voice-fields', 'aliyun': 'aliyun-voice-fields', 'minimax': 'minimax-voice-fields' };
+            var map = { 'aliyun': 'aliyun-voice-fields', 'minimax': 'minimax-voice-fields' };
             Object.keys(map).forEach(function(k){
               var el = document.getElementById(map[k]);
               if (el) el.style.display = (k === p) ? '' : 'none';
             });
           }
           function fillConfig(s) {
-            if (!document.getElementById('local_base_url')) return;
+            if (!document.getElementById('cloud_provider_sel')) return;
             /* 防御：后端字段缺失/结构异常时不抛 TypeError 中断整段回填（旧实现 s.local 为
                undefined 时整页设置面板崩溃，refreshStatus 误报"后端未连接"） */
             s = s || {};
-            var lc = s.local || {}, cc = s.cloud || {};
-            document.getElementById('local_base_url').value = lc.base_url || '';
-            document.getElementById('local_model').value = lc.model || '';
+            var cc = s.cloud || {};
             var sel = document.getElementById('cloud_provider_sel');
             sel.innerHTML = '';
             Object.keys(state.cloudProviders).forEach(function(k){
@@ -1379,12 +1352,21 @@
             document.getElementById('minimax_pitch').value = (vm.pitch != null) ? vm.pitch : 0;
             var msrEl = document.getElementById('minimax_sample_rate');
             if (msrEl) msrEl.value = vm.sample_rate || 32000;
-            pickProvider(s.provider);
-            pickVoiceProvider(s.voice_provider || 'local');
+            pickVoiceProvider(s.voice_provider || 'minimax');
             var gt = document.getElementById('greeting_toggle');
             if (gt) {
               var gv = localStorage.getItem('xiaoni_greeting_enabled');
               gt.checked = (gv === null ? true : gv === '1');
+            }
+            /* 自动朗读开关与语速回填（持久化在 localStorage，与顶栏 chip 同源） */
+            var st2 = document.getElementById('sound_toggle');
+            if (st2) st2.checked = state.soundOn;
+            var sp2 = document.getElementById('tts-speed');
+            if (sp2) {
+              /* String(1.0)='1' 匹配不上 option value '1.0'（下拉框显示为空的根源），
+                 匹配失败时回落 1.0x */
+              sp2.value = String(state.speed);
+              if (sp2.selectedIndex < 0) sp2.value = '1.0';
             }
           }
           function renderRoles(roles, active) {
@@ -1433,9 +1415,13 @@
               var nm = document.createElement('span');
               nm.className = 'r-name';
               nm.textContent = r.name;
+              /* 徽标显示实际生效的引擎：全局开了 manual_provider 时角色自己的
+                 voice.provider 已被覆盖（角色配"本地"但实际走 MiniMax 的失真） */
               var badge = document.createElement('span');
               badge.className = 'r-badge';
-              badge.textContent = r.voice_provider === 'aliyun' ? '阿里云' : (r.voice_provider === 'minimax' ? 'MiniMax' : '本地');
+              badge.textContent = state.voiceManualProvider
+                ? voiceLabel(state.voiceProvider)
+                : (r.voice_provider === 'aliyun' ? '阿里云' : (r.voice_provider === 'minimax' ? 'MiniMax' : '本地'));
               b.appendChild(ava);
               b.appendChild(nm);
               b.appendChild(badge);
@@ -1501,26 +1487,28 @@
               state.minimaxConfigured = !!s.minimax_configured;
               state.voiceRegistered = !!s.voice_registered;
               state.cloudProviders = s.cloud_providers || {};
+              state.voiceManualProvider = !!s.voice_manual_provider;
               var cc2 = s.cloud || {};  /* 防御：后端字段缺失时不抛 TypeError */
               var cp = state.cloudProviders[cc2.provider];
               var pName = $('.p-name'), pDetail = $('.p-detail'), cSub = $('.c-sub');
               if (pName) pName.textContent = s.provider === 'local' ? '本地语言生成' : '云端语言生成 · ' + (cp ? cp.label : cc2.model);
               if (pDetail) pDetail.textContent = s.provider === 'local' ? (s.local ? s.local.model : '') : (cc2.model || '');
-              if (cSub) cSub.textContent = (s.provider === 'local' ? '本地对话' : '云端对话') + ' · 串行引擎';
-              var nextName = s.provider === 'local' ? '云端' : '本地';
+              if (cSub) cSub.textContent = s.provider === 'local' ? '本地对话' : '云端对话';
               var row = document.querySelector('.provider-row[data-kind="chat"]');
-              if (row) row.title = '当前：' + (s.provider === 'local' ? '本地语言生成' : '云端语言生成') + '，点击切换到' + nextName;
+              if (row) row.title = '当前：' + (s.provider === 'local' ? '本地语言生成' : '云端语言生成') + '（在设置中切换引擎）';
               var vRow = document.querySelector('.provider-row[data-kind="voice"]');
               var vName = vRow ? vRow.querySelector('.p-name') : null;
               var vDetail = vRow ? vRow.querySelector('.p-detail') : null;
               var vLabel = voiceLabel(state.voiceProvider);
-              if (vName) vName.textContent = state.voiceProvider === 'local' ? '本地合成' : vLabel + '合成';
-              if (vDetail) vDetail.textContent = state.voiceProvider === 'local'
-                ? '本地合成'
-                : (state.voiceProvider === 'aliyun'
-                  ? (state.aliyunConfigured ? '阿里云语音合成' : '未配置阿里云')
-                  : (state.minimaxConfigured ? 'MiniMax 语音合成' : '未配置 MiniMax'));
-              if (vRow) vRow.title = '当前：' + vLabel + '，点击切换引擎';
+              if (vName) vName.textContent = vLabel;
+              /* 实际可达性：本地引擎常可用；云端引擎看对应 key 是否已配置
+                 （此前的 `ok` 引用了 applyVoiceState 的局部变量 → ReferenceError，
+                 整个 refreshStatus 成功路径被 catch 吞成"后端未连接"） */
+              var vOk = state.voiceProvider === 'local'
+                || (state.voiceProvider === 'aliyun' && state.aliyunConfigured)
+                || (state.voiceProvider === 'minimax' && state.minimaxConfigured);
+              if (vDetail) vDetail.textContent = vOk ? '语音合成' : '未配置';
+              if (vRow) vRow.title = '当前：' + vLabel + '（在设置中切换引擎）';
               applyOnlineState(!!s.active_online);
               applyVoiceState();
               /* 语音合成 chip 由 syncVoiceChipUI 统一管理（开关文案），这里不覆盖 */
@@ -1539,6 +1527,21 @@
                 pip.className = 'pip';
                 wl.appendChild(pip);
                 wl.appendChild(document.createTextNode(role.name + ' · ' + (s.active_online ? '在线' : '离线')));
+                /* 欢迎区按当前角色动态填充：不再硬编码任何角色的名字与话术 */
+                var wt = document.getElementById('welcome-title');
+                if (wt) {
+                  wt.textContent = '';
+                  var grad = document.createElement('span');
+                  grad.className = 'grad';
+                  grad.textContent = role.name;
+                  wt.appendChild(document.createTextNode('嗨，我是'));
+                  wt.appendChild(grad);
+                }
+                var ws = document.getElementById('welcome-sub');
+                if (ws) {
+                  ws.textContent = (ROLE_WELCOME[role.key] || ROLE_WELCOME.default);
+                }
+                renderPromptChips(role);
               }
             } catch (e) {
               if (seq !== _statusSeq) return;  /* 过期错误同样丢弃 */
@@ -1556,70 +1559,35 @@
               applyOnlineState(false);
             }
           }
-          async function toggleProvider() {
-            var target = state.provider === 'local' ? 'cloud' : 'local';
-            /* 切换至本地前先确认：本地模型已移除，误切会无可用模型 */
-            if (target === 'local') {
-              var ok = await confirmDialog('确定要切换到本地模型吗？\n\n本地 LLM 模型文件已移除（见 8-04 记录），当前没有可用本地模型。切到本地后将无法对话，建议保持云端模型。', {
-                title: '切换到本地模型？',
-                okText: '仍要切换',
-              });
-              if (!ok) return;
-            }
-            setDotsChecking();
-            try {
-              await api('/api/config', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ provider: target }),
-              });
-              toast('已切换到' + (target === 'local' ? '本地语言生成' : '云端语言生成') + '，正在检测…');
-              await refreshStatus();
-            } catch (e) {
-              toast('切换失败：' + e.message);
-            }
-          }
-          async function toggleVoiceProvider() {
-            var order = ['local', 'aliyun', 'minimax'];
-            var target = order[(order.indexOf(state.voiceProvider) + 1) % order.length];
-            /* 切换至本地合成前先确认：当前用的是云端克隆音色，切本地音色会变 */
-            if (target === 'local') {
-              var ok = await confirmDialog('确定要切换到本地合成吗？\n\n当前使用的是云端克隆音色（大帅），切换到本地合成后将使用本地预设音色，音色会改变。建议保持云端合成。', {
-                title: '切换到本地合成？',
-                okText: '仍要切换',
-              });
-              if (!ok) return;
-            }
-            setDotsChecking();
-            try {
-              await api('/api/config', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                /* 显式带上当前 LLM provider：只传 voice_provider 会让后端把 provider 落默认值，误切本地 */
-                body: JSON.stringify({ voice_provider: target, provider: state.provider }),
-              });
-              toast('已切换到' + voiceLabel(target));
-              await refreshStatus();
-            } catch (e) {
-              toast('切换失败：' + e.message);
-            }
-          }
-          function bindModelSwitch() {
-            var chatRow = document.querySelector('.provider-row[data-kind="chat"]');
-            if (chatRow) chatRow.addEventListener('click', toggleProvider);
-            var voiceRow = document.querySelector('.provider-row[data-kind="voice"]');
-            if (voiceRow) voiceRow.addEventListener('click', toggleVoiceProvider);
-            document.querySelectorAll('.speed-btn').forEach(function(b){
+          /* ---------- 欢迎区文案与话题（按角色） ---------- */
+          /* 副标题不直接展示 role.desc：desc 含内部设定原文（称呼/口吻约束），上屏观感差 */
+          var ROLE_WELCOME = {
+            dashuai: '你的专属陪伴。我记着我们聊过的事，也会一直在这儿。',
+            default: '你的专属陪伴。我记着我们聊过的事，也会一直在这儿。'
+          };
+          var ROLE_PROMPTS = {
+            dashuai: ['今天训练累不累', '最近有比赛吗', '陪我聊会儿天'],
+            default: ['今天过得怎么样', '陪我说说话', '聊点开心的']
+          };
+          function renderPromptChips(role) {
+            var box = document.getElementById('prompt-chips');
+            if (!box) return;
+            var list = (role && ROLE_PROMPTS[role.key]) || ROLE_PROMPTS.default;
+            box.innerHTML = '';
+            list.forEach(function(t){
+              var b = document.createElement('button');
+              b.className = 'prompt-chip';
+              b.type = 'button';
+              b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span></span>';
+              b.querySelector('span').textContent = t;
               b.addEventListener('click', function(){
-                state.speed = parseFloat(b.dataset.speed) || 1.0;
-                /* 语速持久化：刷新/重开页面不再回到 1.0x */
-                try { localStorage.setItem('xiaoni_speed', String(state.speed)); } catch(e) {}
-                document.querySelectorAll('.speed-btn').forEach(function(x){ x.classList.toggle('active', x === b); });
+                var input = document.getElementById('text');
+                if (!input) return;
+                input.value = t;
+                input.focus();
+                input.dispatchEvent(new Event('input'));
               });
-              /* 初始化时把 active 状态同步到上次保存的语速 */
-              if (b.dataset.speed && parseFloat(b.dataset.speed) === state.speed) {
-                b.classList.add('active');
-              } else {
-                b.classList.remove('active');
-              }
+              box.appendChild(b);
             });
           }
 
@@ -1656,8 +1624,18 @@
           (function(){
             var m = document.getElementById('msgs');
             if (!m) return;
+            /* 回到底部浮钮：上翻浏览历史时出现，点击恢复贴底跟随 */
+            var jump = document.createElement('button');
+            jump.type = 'button';
+            jump.className = 'jump-bottom';
+            jump.title = '回到底部';
+            jump.setAttribute('aria-label', '回到底部');
+            jump.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>';
+            jump.addEventListener('click', function(){ scrollBottom(); });
+            (m.closest('.main') || document.body).appendChild(jump);
             m.addEventListener('scroll', function(){
               stickBottom = (m.scrollHeight - m.scrollTop - m.clientHeight) < 80;
+              jump.classList.toggle('show', !stickBottom);
             }, { passive: true });
             /* 内容高度变化（图片异步加载完成、meta 按钮后加、气泡折行等）且贴底时，即时补滚到底 */
             if (typeof ResizeObserver !== 'undefined' && msgsInner) {
@@ -1787,6 +1765,7 @@
               if (role === 'user' && !(opts.attachments && opts.attachments.length)) {
                 items.push({ label: '修改消息', icon: 'edit', onClick: function(){ editMessage(div); } });
               }
+              items.push({ label: '复制', icon: 'copy', onClick: function(){ copyToClipboard(text, '已复制'); } });
               items.push({ label: '删除消息', onClick: function(){
                 div.remove();
                 removeFromHistory(div);
@@ -2010,6 +1989,7 @@
             ok.addEventListener('click', function(){ finish(true); });
             cancel.addEventListener('click', function(){ finish(false); });
             ta.addEventListener('keydown', function(e){
+              if (e.isComposing || e.keyCode === 229) return; /* IME 合成期 Enter=确认候选词 */
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); finish(true); }
               else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
             });
@@ -2734,7 +2714,7 @@
           /* ---------- 设置 ---------- */
           /* 模态框 HTML 在 </main> 之后，需等 DOMContentLoaded 才能绑定 */
           function openSettings(){
-            var el = document.getElementById('settings'); if (el) { el.classList.add('show'); refreshStatus(); refreshWeather(); refreshRoleNews(); }
+            var el = document.getElementById('settings'); if (el) { el.classList.add('show'); refreshStatus(); refreshWeather(); refreshRoleNews(); refreshMemories(); }
             var hint = document.getElementById('server-url-hint');
             if (hint) {
               var cur = (window.AndroidBridge && window.AndroidBridge.getServerUrl) ? window.AndroidBridge.getServerUrl() : '';
@@ -2939,9 +2919,8 @@
                 await api('/api/config', {
                   method: 'POST', headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
-                    provider: document.querySelector('#chat-tabs .set-tab.active').dataset.provider,
-                    local_base_url: document.getElementById('local_base_url').value,
-                    local_model: document.getElementById('local_model').value,
+                    /* 本地 LLM 引擎已从界面下线（后端能力保留）：固定走云端 */
+                    provider: 'cloud',
                     cloud_provider: document.getElementById('cloud_provider_sel').value,
                     cloud_base_url: document.getElementById('cloud_base_url').value,
                     cloud_api_key: document.getElementById('cloud_api_key').value,
@@ -3022,12 +3001,67 @@
             if (modelsSel) modelsSel.addEventListener('change', function(){
               document.getElementById('cloud_model').value = this.value;
             });
-            document.querySelectorAll('.set-tab[data-provider]').forEach(function(b){
-              b.addEventListener('click', function(){ pickProvider(b.dataset.provider); });
-            });
             document.querySelectorAll('#voice-tabs .set-tab').forEach(function(b){
               b.addEventListener('click', function(){ pickVoiceProvider(b.dataset.voice); });
             });
+            /* ---------- 自动朗读开关（与顶栏语音 chip 同一持久化键） ---------- */
+            var soundToggle = document.getElementById('sound_toggle');
+            if (soundToggle) soundToggle.addEventListener('change', function(){
+              state.soundOn = this.checked;
+              try { localStorage.setItem('xiaoni_sound_on', state.soundOn ? '1' : '0'); } catch (e) {}
+              syncVoiceChipUI();
+              toast(state.soundOn ? '自动朗读已开启' : '自动朗读已关闭（仍可手动点喇叭朗读）');
+            });
+            /* ---------- 朗读语速（原顶栏控件移入设置） ---------- */
+            var speedSel = document.getElementById('tts-speed');
+            if (speedSel) speedSel.addEventListener('change', function(){
+              state.speed = parseFloat(this.value) || 1.0;
+              try { localStorage.setItem('xiaoni_speed', String(state.speed)); } catch (e) {}
+            });
+            /* ---------- 角色记忆（原 roles 页能力并入） ---------- */
+            var memClear = document.getElementById('btn-mem-clear');
+            if (memClear) memClear.addEventListener('click', async function(){
+              var ok = await confirmDialog('确定清空当前角色的全部记忆与状态吗？此操作不可恢复。', {
+                title: '清空记忆',
+                okText: '清空',
+              });
+              if (!ok) return;
+              try {
+                await api('/api/state', { method: 'DELETE' });
+                toast('已清空记忆与状态');
+                refreshMemories();
+              } catch (e) { toast(e.message || '清空失败'); }
+            });
+          }
+
+          /* ---------- 角色记忆列表（设置面板内，原 roles 页能力） ---------- */
+          async function refreshMemories() {
+            var box = document.getElementById('mem-list');
+            var cnt = document.getElementById('mem-count');
+            if (!box) return;
+            box.innerHTML = '';
+            try {
+              var st = await api('/api/state');
+              if (cnt) {
+                cnt.textContent = (st && st.enabled)
+                  ? ('长期记忆 ' + (st.memory_count != null ? st.memory_count : 0) + ' 条，最近 10 条')
+                  : '角色引擎未启用';
+              }
+              var data = await api('/api/roles/memories?top=10');
+              var items = (data && data.enabled && data.memories) || [];
+              if (!items.length) {
+                box.innerHTML = '<div style="color:#8a93a6;line-height:1.6">还没有记忆，多聊几句就有了</div>';
+                return;
+              }
+              items.forEach(function(m){
+                var it = document.createElement('div');
+                it.style.cssText = 'border:1px solid var(--border);border-radius:8px;padding:6px 9px;line-height:1.6;color:var(--foreground);word-break:break-word';
+                it.textContent = m.text || '';
+                box.appendChild(it);
+              });
+            } catch (e) {
+              if (cnt) cnt.textContent = '记忆加载失败';
+            }
           }
 
           /* ---------- 事件 ---------- */
@@ -3038,6 +3072,9 @@
             send(v);
           });
           if (ta) ta.addEventListener('keydown', function(e){
+            /* 中文输入法合成期按 Enter 是"确认候选词"不是发送：isComposing 与
+               keyCode 229 双守卫（部分 IME 只暴露其中一种信号） */
+            if (e.isComposing || e.keyCode === 229) return;
             if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (sendBtn) sendBtn.click(); }
           });
           if (attachBtn && attachMenu) {
@@ -3058,16 +3095,7 @@
           if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initSettings);
           else initSettings();
 
-          /* ---------- 欢迎提示词 chips：点击填入输入框 ---------- */
-          document.querySelectorAll('.prompt-chip').forEach(function(c){
-            c.addEventListener('click', function(){
-              var t = document.getElementById('text');
-              if (!t) return;
-              t.value = c.textContent.trim();
-              t.focus();
-              t.dispatchEvent(new Event('input'));
-            });
-          });
+          /* 欢迎提示词 chips 由 renderPromptChips 动态渲染并绑定（按当前角色） */
 
           /* ---------- 新对话 / 会话列表 ---------- */
           var sessionsBox = document.querySelector('.sessions');
@@ -3133,6 +3161,14 @@
           function isTestSession(x) {
             return /^t-/.test((x && x.id) || '');
           }
+          /* 空占位会话（与服务端 _is_placeholder_session 同语义）：
+             无消息、默认标题、未置顶未改名 —— 不渲染进列表，避免淹没会话栏 */
+          function isPlaceholderSession(s) {
+            if (!s) return false;
+            if (s.history && s.history.length) return false;
+            if (s.pinned || s.manualTitle) return false;
+            return !s.title || s.title === '新对话';
+          }
           function loadSessions() {
             var list = [];
             try {
@@ -3142,7 +3178,7 @@
                 if (Array.isArray(arr)) list = arr;
               }
             } catch (e) {}
-            list = list.map(normalizeSession).filter(function(s){ return !isSeedSession(s) && !isTestSession(s); });
+            list = list.map(normalizeSession).filter(function(s){ return !isSeedSession(s) && !isTestSession(s) && !isPlaceholderSession(s); });
             /* 存储为空或只剩垃圾记录时，自动建一个干净的新对话，保证页面始终有当前会话 */
             if (!list.length) list.push(makeSession('新对话'));
             return list;
@@ -3357,6 +3393,15 @@
               if (!sessions.some(function(x){ return x.id === currentSessionId; })) {
                 currentSessionId = sortSessions(sessions)[0].id;
               }
+              /* 首次同步落地（新设备/清存储后打开）：当前还是没动过的空草稿时，
+                 直接切到最近的真实会话，不再面对空白输入页 */
+              var curDraft = findSession(currentSessionId);
+              var _ta = document.getElementById('text');
+              if (curDraft && isPlaceholderSession(curDraft)
+                  && (!_ta || !_ta.value) && !state.pendingAttachments.length) {
+                var latest = sortSessions(sessions).find(function(x){ return !isPlaceholderSession(x); });
+                if (latest) currentSessionId = latest.id;
+              }
               persistLocal();
               renderSessions();
               /* 不要打断进行中的对话：正在等回复（typing）或正在朗读时跳过重渲染，
@@ -3472,6 +3517,8 @@
             /* 文档片段批量挂载：几十个会话一次性 append，只触发一次布局/重绘 */
             var frag = document.createDocumentFragment();
             sortSessions(vis).forEach(function(session, idx){
+              /* 空占位会话不进列表（当前正打开的草稿除外，否则没有落脚点） */
+              if (isPlaceholderSession(session) && session.id !== currentSessionId) return;
               var s = document.createElement('button');
               s.className = 'session' + (!sessionsAnimatedOnce ? ' side-in' : '') + (session.id === currentSessionId ? ' active' : '') + (session.pinned ? ' pinned' : '');
               if (!sessionsAnimatedOnce) s.style.animationDelay = Math.min(idx * 30, 300) + 'ms';
@@ -3733,6 +3780,7 @@
             }
             input.addEventListener('keydown', function(e){
               e.stopPropagation();
+              if (e.isComposing || e.keyCode === 229) return; /* IME 合成期 Enter=确认候选词 */
               if (e.key === 'Enter') commit();
               else if (e.key === 'Escape') cancel();
             });
@@ -3760,9 +3808,9 @@
           }
           /* 把会话整理成可读文本（复制/导出共用） */
           function sessionTranscript(sess){
-            /* 角色名动态取：切到大帅等角色后导出不再显示"小妮" */
+            /* 角色名动态取：切到大帅等角色后导出不再显示占位名 */
             var _r = (state.roles || []).find(function(x){ return x.key === currentRoleKey; });
-            var _roleName = (_r && _r.name) || '小妮';
+            var _roleName = (_r && _r.name) || 'AI';
             var lines = [
               _roleName + '对话记录：' + (sess.title || '未命名会话'),
               '时间：' + new Date(sess.updatedAt || Date.now()).toLocaleString('zh-CN'),
@@ -3795,9 +3843,11 @@
             var s = makeSession('新对话');
             sessions.unshift(s);
             currentSessionId = s.id;
-            saveSessions();
             renderSessions();
             renderCurrentSession();
+            /* 占位会话不落库：此时没有消息，saveSessions 会把空「新对话」同步到
+               服务端并经并集合并下发到每台设备（会话列表被淹没的根源）。
+               发出首条消息时 markSessionActivity → saveSessions 才真正持久化。 */
           }
           var newBtn = document.querySelector('[data-dom-id="btn-new"]');
           if (newBtn) {
@@ -3890,7 +3940,6 @@
             });
           })();
 
-          bindModelSwitch();
           refreshStatus();
 
           /* ---------- 主动问候：页面加载后按阈值触发 ---------- */
@@ -3991,6 +4040,13 @@
       #settings .set-mini-btn{flex:none;padding:8px 14px;border-radius:9px;border:1px solid var(--border);background:var(--background);color:var(--muted-foreground);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;transition:color .2s ease,border-color .2s ease,background-color .2s ease,transform .18s ease}
       #settings .set-mini-btn:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--chart-2) 40%,transparent);transform:translateY(-1px)}
       #settings .set-mini-btn:active{transform:scale(.96)}
+      /* ===== 折叠区（高级配置 / 动态详情） ===== */
+      #settings details{border:1px solid var(--border);border-radius:10px;padding:10px 12px;background:var(--background)}
+      #settings details>summary{cursor:pointer;font-size:12.5px;color:var(--muted-foreground);user-select:none;list-style:none;display:flex;align-items:center;gap:6px}
+      #settings details>summary::-webkit-details-marker{display:none}
+      #settings details>summary::before{content:"▸";font-size:10px;transition:transform .18s ease;color:var(--muted-foreground)}
+      #settings details[open]>summary::before{transform:rotate(90deg)}
+      #settings details>summary:hover{color:var(--foreground)}
       /* ===== 角色现实动态 v2：分级信息卡片 + 时间线 ===== */
       #rn-wrap{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px}
       #rn-summary{font-size:12.5px;line-height:1.65;color:var(--muted-foreground);background:color-mix(in srgb,var(--muted-foreground) 6%,transparent);border:1px solid var(--border);border-radius:10px;padding:8px 10px;white-space:pre-wrap;word-break:break-word}
@@ -4065,148 +4121,167 @@
           </button>
         </div>
         <div class="set-body">
-          <!-- 服务器连接（APK 内可改地址/口令；网页端只读提示） -->
+          <!-- ===== 常用：角色 / 人设 / 朗读 / 问候 ===== -->
           <div class="set-row">
-            <span class="set-label">服务器连接</span>
-            <span class="set-sub" id="server-url-hint" title="当前连接的服务器地址">—</span>
-          </div>
-          <div class="set-fields">
-            <div style="font-size:12px;color:#8a93a6;margin-bottom:8px">手机通过此地址连接电脑/云电脑上的服务。隧道地址变化后在这里修改。</div>
-            <button id="btn-server-settings" class="set-mini-btn" type="button">✏️ 修改服务器地址 / 访问口令</button>
-          </div>
-          <div class="set-row">
-            <span class="set-label">文字生成模型</span>
-            <div class="set-tabs" id="chat-tabs">
-              <button class="set-tab active" data-provider="local">本地模型</button>
-              <button class="set-tab" data-provider="cloud">云端 API</button>
-            </div>
-          </div>
-          <div class="set-fields" id="local-fields">
-            <label>本地地址<input id="local_base_url" class="set-input" placeholder="http://127.0.0.1:11434/v1"></label>
-            <label>本地模型<input id="local_model" class="set-input" placeholder="Qwen3.5-4B-Q4_K_M"></label>
-            <div style="font-size:12px;color:#8a93a6;margin-top:4px">本地对话与朗读均通过 NVIDIA GPU（CUDA）运行，不跑 CPU</div>
-          </div>
-          <div class="set-fields" id="cloud-fields" style="display:none">
-            <label>供应商<select id="cloud_provider_sel" class="set-input"></select></label>
-            <label id="cloud-billing-row" style="display:none">计费模式
-              <select id="cloud_billing_mode" class="set-input">
-                <option value="payg">按量付费（普通 API Key，按 token 实时计费）</option>
-                <option value="token_plan">Token Plan（订阅 Key，扣套餐额度/积分）</option>
-              </select>
-              <div style="font-size:12px;color:#8a93a6;margin-top:4px">两种 Key 互不混用：按量付费填「API 管理」的 API Key；Token Plan 填「订阅管理」的订阅 Key。余额不足/额度超限会明确报错。</div>
-            </label>
-            <label>API 地址<input id="cloud_base_url" class="set-input" placeholder="https://api.example.com/v1"></label>
-            <label>API Key
-              <span style="display:flex;gap:8px;align-items:center">
-                <input id="cloud_api_key" class="set-input" type="text" placeholder="sk-..." autocomplete="off" style="flex:1">
-                <button type="button" class="set-mini-btn key-eye" data-key-input="cloud_api_key" title="显示/隐藏 API Key">隐藏</button>
-              </span>
-            </label>
-            <label>模型<input id="cloud_model" class="set-input" placeholder="model-name"></label>
-            <div style="display:flex;gap:8px;align-items:center">
-              <button id="cloud-models-btn" class="set-mini-btn">🔄 获取模型列表</button>
-              <select id="cloud-models-sel" class="set-input" style="display:none;flex:1"></select>
-            </div>
-            <div class="set-row" style="margin-top:4px">
-              <span class="set-label">思考模式</span>
-              <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted-foreground)">
-                <input type="checkbox" id="cloud_thinking" style="width:auto" checked>
-                <span>模型先推理再回答，更聪明但更慢</span>
-              </label>
-            </div>
-          </div>
-          <div class="set-row">
-            <span class="set-label">语音合成引擎</span>
-            <div class="set-tabs" id="voice-tabs">
-              <button class="set-tab active" data-voice="local">本地合成</button>
-              <button class="set-tab" data-voice="aliyun">阿里云</button>
-              <button class="set-tab" data-voice="minimax">MiniMax</button>
-            </div>
-          </div>
-          <div class="set-fields" id="local-voice-fields">
-            <div style="font-size:12px;color:#8a93a6;margin-top:4px">本地克隆音色 · NVIDIA GPU（CUDA）合成，音色最像，速度较慢</div>
-          </div>
-          <div class="set-fields" id="aliyun-voice-fields" style="display:none">
-            <label>API Key
-              <span style="display:flex;gap:8px;align-items:center">
-                <input id="aliyun_api_key" class="set-input" type="text" placeholder="sk-..." autocomplete="off" style="flex:1">
-                <button type="button" class="set-mini-btn key-eye" data-key-input="aliyun_api_key" title="显示/隐藏 API Key">隐藏</button>
-              </span>
-            </label>
-            <label>API 地址<input id="aliyun_base_url" class="set-input" placeholder="https://dashscope.aliyuncs.com/api/v1"></label>
-            <label>模型<input id="aliyun_model" class="set-input" placeholder="qwen3-tts-flash"></label>
-            <label>音色<input id="aliyun_voice" class="set-input" placeholder="Cherry / Serena / Ethan ..."></label>
-            <div style="font-size:12px;color:#8a93a6;margin-top:4px">阿里云百炼（DashScope）语音合成，可在百炼控制台「声音复刻」上传音频创建自定义音色</div>
-          </div>
-          <div class="set-fields" id="minimax-voice-fields" style="display:none">
-            <label>API Key
-              <span style="display:flex;gap:8px;align-items:center">
-                <input id="minimax_api_key" class="set-input" type="text" placeholder="sk-..." autocomplete="off" style="flex:1">
-                <button type="button" class="set-mini-btn key-eye" data-key-input="minimax_api_key" title="显示/隐藏 API Key">隐藏</button>
-              </span>
-            </label>
-            <label>API 地址<input id="minimax_base_url" class="set-input" placeholder="https://api.minimaxi.com/v1"></label>
-            <label>模型<input id="minimax_model" class="set-input" placeholder="speech-02-hd"></label>
-            <label>音色<input id="minimax_voice" class="set-input" placeholder="male-qn-jingying / 复刻 voice_id"></label>
-            <div class="set-row" style="margin-top:4px">
-              <span class="set-label">采样参数</span>
-              <span style="font-size:12px;color:#8a93a6">调后旧缓存自动失效，重新合成</span>
-            </div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <label style="flex:1;min-width:110px">语速<input id="minimax_speed" class="set-input" type="number" min="0.5" max="2" step="0.05" placeholder="1.0"></label>
-              <label style="flex:1;min-width:110px">音量<input id="minimax_vol" class="set-input" type="number" min="0" max="10" step="0.1" placeholder="1.1"></label>
-              <label style="flex:1;min-width:110px">音调<input id="minimax_pitch" class="set-input" type="number" min="0" max="10" step="1" placeholder="0"></label>
-              <label style="flex:1;min-width:110px">采样率
-                <select id="minimax_sample_rate" class="set-input">
-                  <option value="8000">8000</option>
-                  <option value="16000">16000</option>
-                  <option value="24000">24000</option>
-                  <option value="32000">32000（最高）</option>
-                </select>
-              </label>
-            </div>
-            <div style="font-size:12px;color:#8a93a6;margin-top:4px">MiniMax（海螺）T2A v2 语音合成；「音色」填系统音色 id 或声音复刻返回的 voice_id（账号需完成实名认证才能复刻音色）；语速 0.5~2、音量 0~10（整数）、音调 0~10（整数）、采样率最高 32k</div>
-          </div>
-          <div class="set-row">
-            <span class="set-label">内置角色</span>
+            <span class="set-label">当前角色</span>
             <div class="set-tabs" id="role-tabs" style="flex-wrap:wrap"></div>
           </div>
-          <label>人设描述<textarea id="persona" class="set-input set-ta" placeholder="定义小拟的性格、语气、说话方式…"></textarea></label>
-          <div class="set-row" style="margin-top:4px">
-            <span class="set-label">角色现实动态</span>
+          <label>人设描述<textarea id="persona" class="set-input set-ta" placeholder="定义角色的性格、语气、说话方式…"></textarea></label>
+          <div class="set-row">
+            <span class="set-label">朗读</span>
+            <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted-foreground)">
+              <input type="checkbox" id="sound_toggle" style="width:auto" checked>
+              <span>回复后自动朗读</span>
+            </label>
+            <select id="tts-speed" class="set-input" style="width:auto;flex:none" title="朗读语速">
+              <option value="0.8">0.8x</option>
+              <option value="1.0">1.0x</option>
+              <option value="1.2">1.2x</option>
+            </select>
+          </div>
+          <div class="set-row">
+            <span class="set-label">主动问候</span>
+            <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted-foreground)">
+              <input type="checkbox" id="greeting_toggle" style="width:auto">
+              <span>角色偶尔主动找你说话（每天最多 1 次）</span>
+            </label>
+          </div>
+          <!-- ===== 角色：长期记忆（原角色管理页能力并入） ===== -->
+          <div class="set-row" style="align-items:flex-start">
+            <span class="set-label">角色记忆</span>
+            <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:8px">
+              <div style="display:flex;align-items:center;gap:8px">
+                <span id="mem-count" style="font-size:12px;color:#8a93a6">—</span>
+                <span style="flex:1"></span>
+                <button type="button" class="set-mini-btn" id="btn-mem-clear">清空记忆</button>
+              </div>
+              <div id="mem-list" style="display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto;font-size:12px"></div>
+            </div>
+          </div>
+          <!-- ===== 角色现实动态：日常只看摘要，详情默认折叠 ===== -->
+          <div class="set-row" style="align-items:flex-start">
+            <span class="set-label">现实动态</span>
             <div id="rn-wrap">
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0">
                 <button type="button" class="set-mini-btn" id="role-news-btn" style="padding:4px 10px" title="联网搜索该角色最近真实动态">🔄 搜索动态</button>
                 <span id="role-news-status" style="font-size:12px;color:#8a93a6;line-height:1.5;flex:1;min-width:0">获取中…</span>
               </div>
               <div id="rn-summary" class="empty">暂无动态：点 🔄 搜索动态获取（首次搜索+总结约需十几秒）</div>
-              <div id="rn-tabs" style="display:none">
-                <button type="button" class="rn-tab active" data-rn-view="cards">📇 信息卡片</button>
-                <button type="button" class="rn-tab" data-rn-view="timeline">🕐 时间线</button>
-              </div>
-              <div id="rn-body"></div>
-              <div id="rn-timeline" style="display:none"></div>
-              <div id="rn-sources"></div>
-              <div id="rn-missing-hint" style="display:none"></div>
-              <div style="font-size:12px;color:#8a93a6">多来源聚合：联网搜索 + 角色设定 + 记忆库 + 情绪状态 + 位置天气；已确认信息优先展示，资料不足时给出推测与缺失原因，12 小时内自动复用缓存</div>
+              <details id="rn-details">
+                <summary>详情：信息卡片 / 时间线 / 来源</summary>
+                <div id="rn-tabs" style="display:none;margin-top:8px">
+                  <button type="button" class="rn-tab active" data-rn-view="cards">📇 信息卡片</button>
+                  <button type="button" class="rn-tab" data-rn-view="timeline">🕐 时间线</button>
+                </div>
+                <div id="rn-body"></div>
+                <div id="rn-timeline" style="display:none"></div>
+                <div id="rn-sources"></div>
+                <div id="rn-missing-hint" style="display:none"></div>
+              </details>
             </div>
           </div>
-          <div class="set-row" style="margin-top:4px">
-            <span class="set-label">天气感知</span>
-            <div style="flex:1;display:flex;flex-direction:column;gap:8px;min-width:0">
-              <div id="loc-weather" style="font-size:12px;color:#8a93a6;line-height:1.5;display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0">
-                <button type="button" class="set-mini-btn" id="loc-weather-btn" style="padding:4px 10px" title="刷新天气">🔄 天气</button><span style="flex:1;min-width:0">获取天气中…</span>
+          <!-- ===== 高级：服务器 / 引擎 / 天气（低频配置，默认折叠） ===== -->
+          <details id="adv-settings">
+            <summary>高级：服务器连接 · 引擎与密钥 · 天气</summary>
+            <div style="display:flex;flex-direction:column;gap:16px;margin-top:14px">
+              <div class="set-row">
+                <span class="set-label">服务器连接</span>
+                <span class="set-sub" id="server-url-hint" title="当前连接的服务器地址">—</span>
               </div>
-              <div style="font-size:12px;color:#8a93a6">角色能感知你所在地的实时天气（数据源 Open-Meteo 免费接口，位置取自 config.json 的 location.manual，仅本机保存），聊到天气/穿什么/带不带伞时能自然接话。</div>
+              <div class="set-fields">
+                <div style="font-size:12px;color:#8a93a6;margin-bottom:8px">手机通过此地址连接电脑上的服务；隧道地址变化后在这里修改。</div>
+                <button id="btn-server-settings" class="set-mini-btn" type="button">✏️ 修改服务器地址 / 访问口令</button>
+              </div>
+              <div class="set-fields" id="cloud-fields">
+                <div style="font-size:12px;color:#8a93a6">文字生成模型（云端 API）</div>
+                <label>供应商<select id="cloud_provider_sel" class="set-input"></select></label>
+                <label id="cloud-billing-row" style="display:none">计费模式
+                  <select id="cloud_billing_mode" class="set-input">
+                    <option value="payg">按量付费（普通 API Key，按 token 实时计费）</option>
+                    <option value="token_plan">Token Plan（订阅 Key，扣套餐额度/积分）</option>
+                  </select>
+                  <div style="font-size:12px;color:#8a93a6;margin-top:4px">两种 Key 互不混用：按量付费填「API 管理」的 API Key；Token Plan 填「订阅管理」的订阅 Key。</div>
+                </label>
+                <label>API 地址<input id="cloud_base_url" class="set-input" placeholder="https://api.example.com/v1"></label>
+                <label>API Key
+                  <span style="display:flex;gap:8px;align-items:center">
+                    <input id="cloud_api_key" class="set-input" type="text" placeholder="已配置（存于 .env）" autocomplete="off" style="flex:1">
+                    <button type="button" class="set-mini-btn key-eye" data-key-input="cloud_api_key" title="显示/隐藏 API Key">隐藏</button>
+                  </span>
+                </label>
+                <label>模型<input id="cloud_model" class="set-input" placeholder="model-name"></label>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <button id="cloud-models-btn" class="set-mini-btn">🔄 获取模型列表</button>
+                  <select id="cloud-models-sel" class="set-input" style="display:none;flex:1"></select>
+                </div>
+                <div class="set-row" style="margin-top:4px">
+                  <span class="set-label">思考模式</span>
+                  <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted-foreground)">
+                    <input type="checkbox" id="cloud_thinking" style="width:auto" checked>
+                    <span>模型先推理再回答，更聪明但更慢</span>
+                  </label>
+                </div>
+                <div style="font-size:12px;color:#8a93a6;margin-top:4px">密钥建议只放在 .env（MINIMAX_API_KEY / ALIYUN_API_KEY 等）；此处显示 *** 掩码，不改动即不会覆盖已有配置。</div>
+              </div>
+              <div class="set-fields">
+                <div style="font-size:12px;color:#8a93a6;margin-bottom:8px">语音合成引擎</div>
+                <div class="set-tabs" id="voice-tabs">
+                  <button class="set-tab active" data-voice="aliyun">阿里云</button>
+                  <button class="set-tab" data-voice="minimax">MiniMax</button>
+                </div>
+              </div>
+              <div class="set-fields" id="aliyun-voice-fields" style="display:none">
+                <label>API Key
+                  <span style="display:flex;gap:8px;align-items:center">
+                    <input id="aliyun_api_key" class="set-input" type="text" placeholder="已配置（存于 .env）" autocomplete="off" style="flex:1">
+                    <button type="button" class="set-mini-btn key-eye" data-key-input="aliyun_api_key" title="显示/隐藏 API Key">隐藏</button>
+                  </span>
+                </label>
+                <label>API 地址<input id="aliyun_base_url" class="set-input" placeholder="https://dashscope.aliyuncs.com/api/v1"></label>
+                <label>模型<input id="aliyun_model" class="set-input" placeholder="qwen3-tts-flash"></label>
+                <label>音色<input id="aliyun_voice" class="set-input" placeholder="Cherry / Serena / Ethan ..."></label>
+                <div style="font-size:12px;color:#8a93a6;margin-top:4px">阿里云百炼（DashScope）语音合成，可在百炼控制台「声音复刻」上传音频创建自定义音色</div>
+              </div>
+              <div class="set-fields" id="minimax-voice-fields" style="display:none">
+                <label>API Key
+                  <span style="display:flex;gap:8px;align-items:center">
+                    <input id="minimax_api_key" class="set-input" type="text" placeholder="已配置（存于 .env）" autocomplete="off" style="flex:1">
+                    <button type="button" class="set-mini-btn key-eye" data-key-input="minimax_api_key" title="显示/隐藏 API Key">隐藏</button>
+                  </span>
+                </label>
+                <label>API 地址<input id="minimax_base_url" class="set-input" placeholder="https://api.minimaxi.com/v1"></label>
+                <label>模型<input id="minimax_model" class="set-input" placeholder="speech-02-hd"></label>
+                <label>音色<input id="minimax_voice" class="set-input" placeholder="male-qn-jingying / 复刻 voice_id"></label>
+                <div class="set-row" style="margin-top:4px">
+                  <span class="set-label">采样参数</span>
+                  <span style="font-size:12px;color:#8a93a6">调后旧缓存自动失效，重新合成</span>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                  <label style="flex:1;min-width:110px">语速<input id="minimax_speed" class="set-input" type="number" min="0.5" max="2" step="0.05" placeholder="1.0"></label>
+                  <label style="flex:1;min-width:110px">音量<input id="minimax_vol" class="set-input" type="number" min="0" max="10" step="0.1" placeholder="1.1"></label>
+                  <label style="flex:1;min-width:110px">音调<input id="minimax_pitch" class="set-input" type="number" min="0" max="10" step="1" placeholder="0"></label>
+                  <label style="flex:1;min-width:110px">采样率
+                    <select id="minimax_sample_rate" class="set-input">
+                      <option value="8000">8000</option>
+                      <option value="16000">16000</option>
+                      <option value="24000">24000</option>
+                      <option value="32000">32000（最高）</option>
+                    </select>
+                  </label>
+                </div>
+                <div style="font-size:12px;color:#8a93a6;margin-top:4px">MiniMax（海螺）T2A v2；「音色」填系统音色 id 或复刻返回的 voice_id（账号需实名认证才能复刻）</div>
+              </div>
+              <div class="set-row">
+                <span class="set-label">天气感知</span>
+                <div style="flex:1;display:flex;flex-direction:column;gap:8px;min-width:0">
+                  <div id="loc-weather" style="font-size:12px;color:#8a93a6;line-height:1.5;display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0">
+                    <button type="button" class="set-mini-btn" id="loc-weather-btn" style="padding:4px 10px" title="刷新天气">🔄 天气</button><span style="flex:1;min-width:0">获取天气中…</span>
+                  </div>
+                  <div style="font-size:12px;color:#8a93a6">位置取自 config.json 的 location.manual，仅本机保存；天气数据源 Open-Meteo 免费接口。</div>
+                </div>
+              </div>
             </div>
-          </div>
-          <div class="set-row" style="margin-top:4px">
-            <span class="set-label">主动问候</span>
-            <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted-foreground)">
-              <input type="checkbox" id="greeting_toggle" style="width:auto">
-              <span>大帅偶尔主动找你说话（每天最多 1 次）</span>
-            </label>
-          </div>
+          </details>
         </div>
         <div class="set-foot">
           <button class="btn-save" id="save-settings">保存设置</button>

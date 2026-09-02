@@ -31,7 +31,7 @@
 # 2. 单段重跑（覆盖 pages/pet/<state>.webp）：
 python ../pet_process.py 本目录/新视频.mp4 --name <state>
 
-# 批量重新处理全部（v2 默认 256px/10fps/q70，单段约 1 分钟）：
+# 批量重新处理全部（v3 默认 384px/10fps/q82，单段约 1 分钟）：
 python ../pet_process.py --all
 
 # 3. 重要：把 pages/pet.js 里的 ASSET_VERSION 加 1
@@ -41,9 +41,10 @@ python ../pet_process.py --all
 python ../deploy/pack_update.py && python ../deploy/pack_update.py --public
 ```
 
-v2 脚本说明：不依赖 rembg/cv2，用 onnxruntime 直跑 ~/.u2net/u2net.onnx
-（PyAV 解码 + PIL/numpy 合成）。常用调参：--size 320（更清晰但更大）、
---alpha-lo/--alpha-hi（边缘松紧）、--feather（羽化）、--quality。
+v3 脚本说明：不依赖 rembg/cv2，用 onnxruntime 直跑 ~/.u2net/u2net.onnx
+（PyAV 解码 + PIL/numpy 合成）。v3 相比 v2 新增边缘去色边（defringe）与
+alpha 蚀刻（shrink），默认输出 384px / WebP 质量 82。常用调参：--size 512（高清档）、
+--alpha-lo/--alpha-hi（边缘松紧）、--feather（羽化）、--defringe/--shrink（0=关闭）、--quality。
 
 ## 状态名中英文映射（处理脚本内置）
 

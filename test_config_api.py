@@ -171,17 +171,43 @@ def test_post_config_env_key_not_persisted(client):
 # ---------------------------------------------------------------- sessions --------
 def test_sessions_roundtrip(client):
     sessions = [
-        {"id": "s1", "title": "测试会话", "messages": [{"role": "user", "content": "你好"}]},
-        {"id": "s2", "messages": []},
+        {"id": "s1", "title": "测试会话", "history": [{"role": "user", "content": "你好"}]},
     ]
     r = client.put("/api/sessions", json={"sessions": sessions})
-    check("PUT /api/sessions 返回 ok", r.status_code == 200 and r.json() == {"ok": True},
-          f"status={r.status_code} data={r.json()}")
+    put_data = r.json()
+    check("PUT /api/sessions 返回 ok 且带文件指纹",
+          r.status_code == 200 and put_data.get("ok") is True and bool(put_data.get("fp")),
+          f"status={r.status_code} data={put_data}")
     r2 = client.get("/api/sessions")
     got = r2.json().get("sessions")
     check("GET 取回与 PUT 相同结构", r2.status_code == 200 and got == sessions, str(got))
+    check("GET 响应带文件指纹且与 PUT 一致", r2.json().get("fp") == put_data.get("fp"), str(r2.json().get("fp")))
+    r3 = client.get("/api/sessions/fingerprint")
+    check("轻量指纹探测可用", r3.status_code == 200 and r3.json().get("fp") == put_data.get("fp"),
+          f"status={r3.status_code} data={r3.json()}")
     disk = json.loads(server.SESSIONS_PATH.read_text(encoding="utf-8"))
     check("sessions 落盘内容与请求一致", disk.get("sessions") == sessions, str(disk))
+
+
+def test_placeholder_sessions_filtered(client):
+    """空占位会话（无 history、默认标题、未置顶未改名）合并时直接丢弃：
+    前端空 localStorage 打开即产生一个，入库后会随并集同步淹没所有设备的会话列表。"""
+    r = client.put("/api/sessions", json={"sessions": [
+        {"id": "ph1", "title": "新对话", "history": []},
+        {"id": "real1", "title": "真实会话", "history": [{"role": "user", "content": "在吗"}]},
+        {"id": "ph2", "title": "新对话", "history": [], "manualTitle": False},
+    ]})
+    check("占位会话 PUT 返回 ok", r.status_code == 200, f"status={r.status_code}")
+    got = {s["id"] for s in client.get("/api/sessions").json().get("sessions", [])}
+    check("空占位会话被过滤", "ph1" not in got and "ph2" not in got and "real1" in got, str(got))
+    # 非默认标题 / 置顶的空会话不算占位（可能有价值），应保留
+    r2 = client.put("/api/sessions", json={"sessions": [
+        {"id": "named", "title": "我起的名", "history": []},
+        {"id": "pinned", "title": "新对话", "history": [], "pinned": True},
+    ]})
+    check("第二次 PUT 返回 ok", r2.status_code == 200, f"status={r2.status_code}")
+    got2 = {s["id"] for s in client.get("/api/sessions").json().get("sessions", [])}
+    check("改名/置顶的空会话保留", "named" in got2 and "pinned" in got2 and "real1" in got2, str(got2))
 
 
 # ---------------------------------------------------------------- env overrides --------
@@ -220,6 +246,38 @@ def test_apply_env_overrides():
 
 
 # ---------------------------------------------------------------- health --------
+def test_persona_single_source(client):
+    """人设单一真值：角色存在时只写 roles[active].persona，顶层不再复制（避免两份大文本重复）；
+    无角色时（遗留配置）仍写顶层兜底。"""
+    cfg = json.loads(server.CONFIG_PATH.read_text(encoding="utf-8"))
+    cfg["active_role"] = "dashuai"
+    cfg["roles"] = {"dashuai": {"name": "大帅", "persona": "旧人设"}}
+    cfg["persona"] = "旧顶层人设"  # 存量重复：模拟旧版双写留下的顶层残留
+    server.CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    server._cfg_cache["_mtime_ns"] = 0
+    r = client.post("/api/config", json={"persona": "统一后的新人设"})
+    check("persona 保存返回 ok", r.status_code == 200 and r.json() == {"ok": True},
+          f"status={r.status_code} data={r.json()}")
+    disk = json.loads(server.CONFIG_PATH.read_text(encoding="utf-8"))
+    check("角色 persona 已更新",
+          disk.get("roles", {}).get("dashuai", {}).get("persona") == "统一后的新人设",
+          str(disk.get("roles")))
+    check("顶层 persona 不再被复制（保留旧值，等待手工清理）",
+          disk.get("persona") == "旧顶层人设", str(disk.get("persona")))
+    check("current_persona 返回角色人设（角色优先）",
+          server.current_persona(disk) == "统一后的新人设", server.current_persona(disk))
+    # 无角色（roles 空）时：顶层作为兜底被写入
+    cfg2 = json.loads(server.CONFIG_PATH.read_text(encoding="utf-8"))
+    cfg2["roles"] = {}
+    cfg2["active_role"] = ""
+    server.CONFIG_PATH.write_text(json.dumps(cfg2, ensure_ascii=False), encoding="utf-8")
+    server._cfg_cache["_mtime_ns"] = 0
+    r2 = client.post("/api/config", json={"persona": "兜底人设"})
+    check("无角色时顶层兜底写入", r2.status_code == 200
+          and json.loads(server.CONFIG_PATH.read_text(encoding="utf-8")).get("persona") == "兜底人设",
+          f"status={r2.status_code}")
+
+
 def test_health(client):
     r = client.get("/api/health")
     data = r.json()
@@ -236,6 +294,8 @@ def main():
             test_post_config_full_fields(client)
             test_post_config_env_key_not_persisted(client)
             test_sessions_roundtrip(client)
+            test_placeholder_sessions_filtered(client)
+            test_persona_single_source(client)
             test_health(client)
         test_apply_env_overrides()
     finally:

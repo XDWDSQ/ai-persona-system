@@ -137,11 +137,46 @@ def test_retry_guard():
         server._access_token = orig_token
 
 
+def test_login_rate_limit():
+    from fastapi.testclient import TestClient
+
+    orig_token = server._access_token
+    server._access_token = lambda: "correct-token"
+    server._login_track.clear()
+    try:
+        with TestClient(server.app) as client:
+            for _ in range(server._LOGIN_FAIL_MAX):
+                r = client.post("/api/login", json={"token": "wrong"})
+            check("达到上限的当次失败仍返回 401", r.status_code == 401, f"status={r.status_code}")
+            r = client.post("/api/login", json={"token": "wrong"})
+            check("连续失败达到上限后返回 429 锁定", r.status_code == 429, f"status={r.status_code}")
+            r = client.post("/api/login", json={"token": "correct-token"})
+            check("锁定期间正确口令也被拒（429）", r.status_code == 429, f"status={r.status_code}")
+            server._login_track.clear()
+            r = client.post("/api/login", json={"token": "correct-token"})
+            check("无失败记录时正确口令登录成功", r.status_code == 200, f"status={r.status_code}")
+    finally:
+        server._access_token = orig_token
+        server._login_track.clear()
+
+
+def test_fix_addressing():
+    fix = server._fix_addressing
+    check("自称老公被纠正", "我是你老婆" in fix("我是你老公"))
+    check("电竞术语 carry 保留", "carry型辅助" in fix("他们都叫我carry型辅助"))
+    check("小写电竞术语 bp/solo 保留",
+          "bp" in fix("这波bp做得不错，晚上solo吗") and "solo" in fix("这波bp做得不错，晚上solo吗"))
+    check("普通英文被清理", "hello" not in fix("hello老公，我来了"))
+    check("大写赛事术语保留", "KPL" in fix("下一场KPL常规赛") and "MVP" in fix("MVP给谁"))
+    check("本宝宝被替换", "本宝宝" not in fix("本宝宝想你了"))
+
+
 def main():
     for t in (test_clean_history, test_degenerate_reply, test_too_similar_to_last,
-              test_story_regex_detect, test_time_hint, test_retry_guard):
+              test_story_regex_detect, test_time_hint, test_retry_guard,
+              test_login_rate_limit, test_fix_addressing):
         t()
-    print(f"\n{'=' * 50}\n共 6 组，失败 {_FAIL} 组")
+    print(f"\n{'=' * 50}\n共 8 组，失败 {_FAIL} 组")
     sys.exit(1 if _FAIL else 0)
 
 

@@ -90,11 +90,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             self._send(200, {"provider": "cloud", "roles": {
-                "xiaoni": {"name": "小拟", "desc": "mock"},
                 "dashuai": {"name": "大帅", "desc": "mock"},
             }})
         elif path == "/api/roles":
-            self._send(200, ["xiaoni", "dashuai"])
+            self._send(200, ["dashuai"])
         elif path == "/api/state":
             self._send(200, {"role": "dashuai", "emotion": "平静", "energy": 80})
         elif path == "/api/sessions":

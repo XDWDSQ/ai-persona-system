@@ -13,9 +13,9 @@
   },
   "cloud": {
     "provider": "minimax",
-    "base_url": "https://api.xiaomimimo.com/v1",
+    "base_url": "https://api.minimaxi.com/v1",
     "api_key": "",
-    "model": "mimo-v2.5",
+    "model": "MiniMax-M3",
     "thinking": true
   },
   "cloud_providers": {
@@ -116,9 +116,8 @@
     "manual_provider": true
   },
   "tts_cache": {
-    "max_files": 500,
-    "max_bytes": 8589934592,
+    "max_files": 200,
+    "max_bytes": 1073741824,
     "clean_interval": 3600
-  },
-  "persona": ""
+  }
 }

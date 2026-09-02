@@ -1,29 +1,25 @@
 @echo off
-REM AI æ‹Ÿäººç³»ç»Ÿ é¦–æ¬¡åˆå§‹åŒ–ï¼ˆä¸€æ¬¡æ€§ï¼‰
-REM ä½œç”¨ï¼šåˆ›å»º TTS è¿è¡ŒçŽ¯å¢ƒã€ä¸‹è½½æœ¬åœ° LLM æ¨¡åž‹ã€å®‰è£…åŽç«¯ä¾èµ–
+REM AI ÄâÈËÏµÍ³ Ê×´Î³õÊ¼»¯£¨Ò»´ÎÐÔ£©
+REM ×÷ÓÃ£º´´½¨ TTS ÔËÐÐ»·¾³¡¢°²×°ºó¶ËÒÀÀµ
+REM ËµÃ÷£º±¾µØ LLM ÒÑ´Ó½çÃæÏÂÏß£¨ÔÆ¶Ë API ÎªÖ÷ÒýÇæ£©£¬²»ÔÙÔ¤ÏÂÔØÄ£ÐÍ£»
+REM       ÈçÐè±¾µØÍÆÀí£¬ÊÖ¶¯ÔËÐÐ llm\get_llm.py Óë llm\start_llm.bat¡£
 cd /d "%~dp0"
-set "CURL=C:\Windows\System32\curl.exe"
 set "PY=%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe"
 
-echo === [1/4] å‡†å¤‡ TTS å£°éŸ³å…‹éš†çŽ¯å¢ƒï¼ˆQwen3-TTSï¼‰===
+echo === [1/3] ×¼±¸ TTS ÉùÒô¿ËÂ¡»·¾³£¨Qwen3-TTS£©===
 if exist "%USERPROFILE%\.trae-cn\skills\local-tts\scripts\install-env.ps1" (
     powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%USERPROFILE%\.trae-cn\skills\local-tts\scripts\install-env.ps1' -SkillRoot '%USERPROFILE%\.trae-cn\skills\local-tts'"
 ) else (
-    echo [é”™è¯¯] TTS skill å°šæœªå®‰è£…ï¼Œè¯·å…ˆä»Ž OpenClaw å®‰è£… local-tts skill
+    echo [×¢Òâ] ±¾µØ TTS skill Î´°²×°£¨ÔÆ¶ËºÏ³É²»ÊÜÓ°Ïì£¬¿ÉÌø¹ý£©
 )
 
-echo === [2/4] ä»Žä¸Šæ¸¸èŽ·å–æœ¬åœ° LLMï¼ˆllama.cpp è¿è¡Œæ—¶ + Qwen3.5-4B æ¨¡åž‹ï¼‰===
-if exist "%PY%" (
-    "%PY%" "llm\get_llm.py"
-) else (
-    echo [æ³¨æ„] Python çŽ¯å¢ƒæœªå°±ç»ªï¼Œè·³è¿‡æ¨¡åž‹èŽ·å–ï¼Œç¨åŽå¯åœ¨ start.bat æ—¶è‡ªåŠ¨èŽ·å–
-)
+echo === [2/3] °²×°ºó¶ËÒÀÀµ ===
 if exist "%PY%" (
     "%PY%" -m pip install -r requirements.txt -q
 ) else (
-    echo [æ³¨æ„] TTS çŽ¯å¢ƒæœªç”Ÿæˆï¼Œè¯·æ£€æŸ¥ [1/4] æ­¥éª¤
+    echo [´íÎó] Python »·¾³Î´¾ÍÐ÷£¬ÇëÏÈ°´ README ×¼±¸ %PY%
 )
 
-echo.
-echo åˆå§‹åŒ–å®Œæˆï¼è¿è¡Œ start.bat å¯åŠ¨ç³»ç»Ÿã€‚
+echo === [3/3] Íê³É ===
+echo ³õÊ¼»¯Íê³É£¡ÔËÐÐ start.bat Æô¶¯ÏµÍ³¡£
 pause

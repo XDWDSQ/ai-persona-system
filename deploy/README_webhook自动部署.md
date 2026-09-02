@@ -1,5 +1,9 @@
 # Gitee Webhook 自动部署（部署机使用）
 
+> 说明：本方案基于 **cloudflared** 隧道，对应脚本 `deploy/webhook_autodeploy.py`，作为备选保留。
+> 当前部署机实际改用 **ngrok 固定域名 + Windows 任务计划**（详见 `.workbuddy/memory/MEMORY.md` 的"运行状态"节）。
+> 若你沿用 cloudflared，按以下步骤即可。
+
 开发机 `git push` 后，部署机自动拉取最新代码并重启服务，无需任何手动操作。
 
 ## 原理

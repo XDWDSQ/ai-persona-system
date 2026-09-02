@@ -23,7 +23,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="服务器运行在电脑/云电脑上，手机通过此地址访问（如 https://xxx.trycloudflare.com 或 http://192.168.x.x:8000）"
+            android:text="服务器运行在电脑/云电脑上，手机通过此地址访问（如 https://xxx.ngrok-free.dev 或 http://192.168.x.x:8000）"
             android:textColor="#a1a1aa"
             android:textSize="13sp"
             android:lineSpacingExtra="4dp" />
@@ -42,7 +42,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:background="@drawable/bg_input"
-            android:hint="https://xxx.trycloudflare.com"
+            android:hint="https://xxx.ngrok-free.dev"
             android:inputType="textUri"
             android:padding="12dp"
             android:textColor="#f4f4f5"

@@ -29,7 +29,7 @@ def check(name: str, cond: bool, detail: str = ""):
 def test_conf_from_cfg():
     c = MiniMaxConf.from_cfg({})
     check("空配置回落默认 base_url/model/payg",
-          c.base_url == "https://api.minimaxi.com/v1" and c.model == "MiniMax-M2.5"
+          c.base_url == "https://api.minimaxi.com/v1" and c.model == "MiniMax-M3"
           and c.billing_mode == "payg",
           f"base={c.base_url} model={c.model} mode={c.billing_mode}")
     c = MiniMaxConf.from_cfg({"billing_mode": "token_plan", "api_key": "sk-tp"})

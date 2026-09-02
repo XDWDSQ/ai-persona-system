@@ -44,20 +44,18 @@ install_cloud.bat
 
 云电脑默认无法从外网直接访问，需要开一条隧道，二选一：
 
-### 方案 A：cloudflared 隧道（无公网 IP 也适用，推荐先用这个）
+### 方案 A：ngrok 隧道（无公网 IP 也适用，推荐）
 
-1. 云电脑上安装 cloudflared：
-   ```
-   winget install --id Cloudflare.cloudflared -e
-   ```
-   （winget 不可用就去 https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ 下载 exe）
+1. 云电脑上安装 ngrok（https://ngrok.com/download），并 `ngrok config add-authtoken <你的token>`。
 
-2. 运行 `start_tunnel.bat`，窗口会显示手机访问地址并自动保存到 `data\tunnel_url.txt`：
+2. 启动隧道，窗口会显示手机访问地址：
    ```
-   https://xxxx.trycloudflare.com
+   ngrok http 8000
    ```
+   启动后地址会写入 `data\tunnel_url.txt`（免费版每次重启换域名）。
 
-3. 手机浏览器打开该地址，输入访问口令：**520TDJ**（见 `config.json` 的 access_token）
+3. 手机浏览器打开该地址，输入访问口令（见 `config.json` 的 `access_token`）。
+   > 注意：ngrok 免费版首次访问会先出现 `ERR_NGROK_6024` 警告页，点 "Visit Site" 进入。
 
 ### 方案 B：云电脑有公网 IP
 
@@ -69,14 +67,14 @@ install_cloud.bat
 
 | 功能 | 原因 | 表现 |
 | --- | --- | --- |
-| 图片理解 | 本地视觉模型不在云上 | 发图后走纯文本兜底回复 |
-| 本地 TTS | 云上无本地音色 | 当前配置已是云端 MiniMax，不受影响 |
+| 图片理解 | 本地视觉模型不在云上 | 云端多模态可用时走云端，否则纯文本兜底 |
+| 本地 TTS | 云上无本地音色 | 当前配置为云端语音合成（阿里云/MiniMax/MiMo），不受影响 |
 
 文字聊天、语音合成播放、角色记忆、联网搜索、天气位置 **全部正常**。
 
 ## 常见问题
 
 - **手机打不开**：隧道地址每次启动会变，先看 `data\tunnel_url.txt` 最新地址；确认云电脑没关机、服务在跑（`curl http://127.0.0.1:8000/api/health`）。
-- **重启云电脑后**：重新运行 `install_cloud.bat`（或开机自启），再运行 `start_tunnel.bat` 拿新地址。
+- **重启云电脑后**：重新运行 `install_cloud.bat`（或开机自启），再运行 `ngrok http 8000` 拿新地址。
 - **想保留本地聊天记录**：本地 `data/sessions.json` 已打包带走；如果之后本地又聊了，把本地的 `data/sessions.json`、`data/memory/`、`data/state/` 再拷到云电脑覆盖即可（单向）。
 - **云电脑关机**：服务停，手机连不上 —— 保持云电脑在线（包月套餐）。

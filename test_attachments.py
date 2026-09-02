@@ -59,6 +59,22 @@ def test_upload(client):
     check("不安全的扩展名被拒绝", r2.status_code == 400, f"status={r2.status_code}")
 
 
+def test_upload_dedup(client):
+    content = b"\x89PNG\r\n\x1a\n" + b"\x01" * 64
+    r1 = client.post("/api/upload", files=[("files", ("a.png", content, "image/png"))])
+    r2 = client.post("/api/upload", files=[("files", ("b.png", content, "image/png"))])
+    d1, d2 = r1.json(), r2.json()
+    check(
+        "同一内容重复上传返回同一 URL（内容去重）",
+        r1.status_code == 200 and r2.status_code == 200
+        and d1["files"][0]["url"] == d2["files"][0]["url"],
+        f"{d1} vs {d2}",
+    )
+    path = server.UPLOAD_DIR / Path(d1["files"][0]["url"]).name
+    check("去重后文件确实落盘", path.is_file(), str(path))
+    _UPLOAD_CLEANUP.append(path)
+
+
 def test_chat_vision(client):
     orig_load = server.load_config
     orig_vision = server._try_vision_chat
@@ -149,6 +165,7 @@ def main():
     try:
         with TestClient(server.app) as client:
             test_upload(client)
+            test_upload_dedup(client)
             test_chat_vision(client)
             test_chat_attachment_fallback(client)
             test_text_doc_prompt()

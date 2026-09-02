@@ -3,59 +3,98 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI 拟人系统 · 云电脑部署包下载</title>
+<title>小拟 · 云电脑部署包下载</title>
 <style>
+  :root{
+    --bg:#17120e; --card:#201913; --card2:#292018; --line:#33281f;
+    --text:#f3ebdf; --muted:#a2927e; --faint:#6f6152;
+    --amber1:#f6cd8a; --amber2:#e8a33d; --amber3:#d4762a; --dark-on-amber:#241a0e;
+    --serif:"Noto Serif SC","Source Han Serif SC","STKaiti","KaiTi","Kaiti SC",Georgia,serif;
+  }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
-    font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: #f5f6f8; color: #1f2329;
+    font-family: ui-sans-serif, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text);
     display: flex; align-items: center; justify-content: center;
-    min-height: 100vh; padding: 20px;
+    min-height: 100vh; padding: 24px 18px;
+    -webkit-font-smoothing: antialiased;
   }
+  /* 暖光氛围：与主应用同款的琥珀辉光 */
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;
+    background:radial-gradient(720px 420px at 85% -8%, rgba(232,163,61,.09), transparent 68%),
+               radial-gradient(620px 380px at 4% 110%, rgba(212,118,42,.07), transparent 72%);}
   .card {
-    background: #fff; border-radius: 16px; padding: 40px 44px;
-    max-width: 560px; width: 100%;
-    box-shadow: 0 4px 24px rgba(0,0,0,.06);
-    border: 1px solid #e5e7eb;
+    position: relative; background: var(--card); border-radius: 18px; padding: 38px 36px;
+    max-width: 580px; width: 100%;
+    border: 1px solid var(--line);
+    box-shadow: 0 24px 60px -30px rgba(0,0,0,.7);
   }
-  h1 { font-size: 22px; font-weight: 600; margin-bottom: 8px; }
-  .sub { color: #646a73; font-size: 14px; margin-bottom: 24px; }
+  .brand{display:flex;align-items:center;gap:11px;margin-bottom:16px}
+  .brand-mark{width:34px;height:34px;border-radius:10px;flex:none;
+    background:linear-gradient(140deg,var(--amber1),var(--amber2) 55%,var(--amber3));
+    display:flex;align-items:center;justify-content:center;
+    box-shadow:0 4px 16px -6px rgba(232,163,61,.55), inset 0 1px 0 rgba(255,255,255,.28);}
+  h1 { font-family: var(--serif); font-size: 23px; font-weight: 600; letter-spacing: .02em; margin-bottom: 7px; }
+  .sub { color: var(--muted); font-size: 13.5px; margin-bottom: 26px; line-height: 1.6; }
+  .h2 { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: var(--text); display:flex;align-items:center;gap:8px }
+  .h2::before{content:"";width:5px;height:14px;border-radius:3px;background:linear-gradient(180deg,var(--amber1),var(--amber3))}
   .file {
     display: flex; align-items: center; justify-content: space-between;
-    background: #f7f8fa; border: 1px solid #e5e7eb; border-radius: 10px;
-    padding: 14px 16px; margin-bottom: 14px;
+    background: var(--card2); border: 1px solid var(--line); border-radius: 13px;
+    padding: 14px 16px; margin-bottom: 12px;
   }
-  .file .name { font-size: 15px; font-weight: 500; }
-  .file .size { font-size: 12px; color: #646a73; margin-top: 3px; }
+  .file .name { font-size: 14.5px; font-weight: 500; font-family: ui-monospace, Consolas, monospace; }
+  .file .size { font-size: 12px; color: var(--muted); margin-top: 4px; font-family: ui-sans-serif, system-ui, sans-serif; }
   .file .tag {
-    flex: none; font-size: 11px; color: #185fa5; background: #e6f1fb;
-    border: 1px solid #b5d4f4; border-radius: 6px; padding: 2px 8px; margin-left: 8px;
+    flex: none; font-size: 11px; color: var(--amber1); background: rgba(232,163,61,.12);
+    border: 1px solid rgba(232,163,61,.32); border-radius: 999px; padding: 2px 9px; margin-left: 10px;
+    font-family: ui-sans-serif, system-ui, sans-serif;
   }
   .dl {
     display: block; text-align: center; text-decoration: none;
-    background: #185fa5; color: #fff; font-size: 15px; font-weight: 500;
-    border-radius: 10px; padding: 12px 0; transition: background .15s;
+    background: linear-gradient(140deg,var(--amber1),var(--amber2) 55%,var(--amber3));
+    color: var(--dark-on-amber); font-size: 14.5px; font-weight: 600;
+    border-radius: 12px; padding: 12px 0; margin-bottom: 10px;
+    box-shadow: 0 8px 22px -10px rgba(232,163,61,.6), inset 0 1px 0 rgba(255,255,255,.25);
+    transition: transform .16s ease, box-shadow .16s ease;
   }
-  .dl:hover { background: #0c447c; }
-  .dl.slim { background: #5f5e5a; font-size: 14px; padding: 10px 0; }
-  .dl.slim:hover { background: #444441; }
-  .sep { border-top: 1px solid #e5e7eb; margin: 22px 0 18px; }
-  .h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+  .dl:hover { transform: translateY(-1px); box-shadow: 0 12px 28px -10px rgba(232,163,61,.7), inset 0 1px 0 rgba(255,255,255,.25); }
+  .dl.slim { background: var(--card2); color: var(--text); font-size: 13.5px; font-weight: 500;
+    border: 1px solid var(--line); box-shadow: none; }
+  .dl.slim:hover { border-color: rgba(232,163,61,.45); background: rgba(232,163,61,.08); box-shadow: none; }
+  .sep { border-top: 1px solid var(--line); margin: 24px 0 20px; }
   .note {
-    margin-top: 18px; font-size: 13px; color: #646a73; line-height: 1.7;
-    background: #faf3e3; border: 1px solid #f0dfb8; border-radius: 10px; padding: 12px 14px;
+    margin-top: 20px; font-size: 12.5px; color: var(--muted); line-height: 1.75;
+    background: rgba(232,163,61,.07); border: 1px solid rgba(232,163,61,.22); border-radius: 13px; padding: 13px 15px;
   }
-  .note b { color: #854f0b; }
+  .note b { color: var(--amber1); }
+  /* 手机使用指引：网页端即 App（安卓 APK 已停止开发） */
+  .steps{display:flex;flex-direction:column;gap:9px}
+  .step{display:flex;gap:11px;align-items:flex-start;font-size:13.5px;color:var(--muted);line-height:1.6}
+  .step .no{flex:none;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    font-size:11.5px;font-weight:600;color:var(--dark-on-amber);
+    background:linear-gradient(140deg,var(--amber1),var(--amber2));margin-top:1px}
+  .step b{color:var(--text);font-weight:600}
+  .pwa-tip{margin-top:14px;font-size:12px;color:var(--faint);line-height:1.7}
+  @media (max-width: 480px){ .card{padding:28px 22px} h1{font-size:20px} }
 </style>
 </head>
 <body>
   <div class="card">
-    <h1>AI 拟人系统 · 云电脑部署包</h1>
+    <div class="brand">
+      <div class="brand-mark">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><rect x="4.2" y="10" width="2.6" height="4" rx="1.3" fill="#241a0e" opacity=".85"/><rect x="9.4" y="6" width="2.6" height="12" rx="1.3" fill="#241a0e" opacity=".85"/><rect x="14.6" y="3" width="2.6" height="18" rx="1.3" fill="#241a0e"/><rect x="19.8" y="8" width="2.6" height="8" rx="1.3" fill="#241a0e" opacity=".85"/></svg>
+      </div>
+      <div>
+        <h1>小拟 · 云电脑部署包</h1>
+      </div>
+    </div>
     <p class="sub">部署到云电脑，手机随时可用（电脑关机不影响）</p>
 
+    <div class="h2">首次部署</div>
     <div class="file">
       <div>
-        <div class="name">cloud_deploy_public.zip <span class="tag">首次部署用</span></div>
+        <div class="name">cloud_deploy_public.zip <span class="tag">全量</span></div>
         <div class="size">29.9 MB · 含代码 / 前端 / 会话记录 / 角色记忆</div>
       </div>
     </div>
@@ -63,14 +102,24 @@
 
     <div class="sep"></div>
 
-    <div class="h2">代码更新包</div>
+    <div class="h2">日常更新</div>
     <div class="file">
       <div>
-        <div class="name">update_public.zip <span class="tag">日常更新用</span></div>
+        <div class="name">update_public.zip <span class="tag">增量</span></div>
         <div class="size">0.5 MB · 只含代码/前端/配置，不含 data/（不会覆盖聊天记录）</div>
       </div>
     </div>
     <a class="dl slim" href="update_public.zip" download>下载更新包</a>
+
+    <div class="sep"></div>
+
+    <div class="h2">手机上怎么用</div>
+    <div class="steps">
+      <div class="step"><span class="no">1</span><div>手机浏览器打开 <b>ngrok 隧道地址</b>（电脑上运行 <b>ngrok http 8000</b> 后获得），输入访问口令登录</div></div>
+      <div class="step"><span class="no">2</span><div>在浏览器菜单选择 <b>「添加到主屏幕 / 安装应用」</b></div></div>
+      <div class="step"><span class="no">3</span><div>主屏幕上打开即 <b>独立窗口运行</b>，无地址栏，和原生 App 一样</div></div>
+    </div>
+    <p class="pwa-tip">网页端已支持离线秒开与安装到桌面（PWA）。安卓 APK 已停止开发，后续统一使用网页版。</p>
 
     <div class="note">
       <b>注意：以上均为脱敏版</b>，不含云端 API 密钥（.env 与 config.json 中的 api_key）。

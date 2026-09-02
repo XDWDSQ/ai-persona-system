@@ -20,6 +20,7 @@ import mimetypes
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -217,6 +218,24 @@ def _sess_updated_at(s: dict) -> float:
         return 0.0
 
 
+def _is_placeholder_session(s: dict) -> bool:
+    """空占位会话：无 history、标题仍是前端默认「新对话」、未置顶未改名。
+
+    前端只要以空 localStorage 打开一次 chat.html 就会生成一个这种会话，
+    并随 pagehide 兜底 PUT 上服务端，经并集同步下发到每台设备，
+    把会话列表淹成一片「新对话」。合并时直接丢弃；一旦发出消息、
+    手动改名或置顶，即脱离占位形态，正常保留。"""
+    if not isinstance(s, dict):
+        return False
+    h = s.get("history")
+    if isinstance(h, list) and h:
+        return False
+    if s.get("pinned") or s.get("manualTitle"):
+        return False
+    title = s.get("title")
+    return not title or title == "新对话"
+
+
 def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
     """多端合并：按 id 归并（updatedAt 新者胜，平手取 incoming），再按墓碑过滤。
 
@@ -233,6 +252,7 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
        都不丢（顺序以新者为准，独有消息追加在后）。
     真实事故背景：手机持 130 条旧副本、时钟超前，覆盖了服务端 131 条，丢 2 条。
 
+    空占位会话（_is_placeholder_session）不参与结果，存量垃圾随任意一次 PUT 自动清出。
     会话 updatedAt 新于墓碑时间视为"复活"（保留会话并移除墓碑）；
     返回按 updatedAt 倒序的前 500 条。会就地修改 tombstones（弹出失效项）。"""
 
@@ -279,6 +299,8 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
     by_id: dict = {}
     for s in [*current, *incoming]:
         if not isinstance(s, dict):
+            continue
+        if _is_placeholder_session(s):
             continue
         sid = s.get("id")
         if not isinstance(sid, str) or not sid:
@@ -332,6 +354,10 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
 # 合并前落盘备份：防止多端同步的破坏性合并吞掉本端聊天记录。
 # 最近一次备份时间（按文件路径记），5 分钟内不重复备份，避免频繁写入。
 _sessions_last_backup: dict[str, float] = {}
+
+# 活跃感知：最近一次对话/问候的时间戳（毫秒）。部署机（webhook/poll）在
+# push 后据此判断"是否有人在用"：5 分钟内活跃则延迟重启，避免聊天被打断。
+_last_activity_ts: float = 0.0
 
 
 def _sessions_msg_count(sessions: list) -> int:
@@ -527,13 +553,14 @@ _CLOUD_PROVIDER_ENV = {
 }
 _ALIYUN_ENV_KEYS = ("ALIYUN_API_KEY", "DASHSCOPE_API_KEY")
 _MINIMAX_ENV_KEYS = ("MINIMAX_API_KEY",)
+_GMI_ENV_KEYS = ("GMI_API_KEY",)
 
 # env 覆盖结果缓存：load_config(with_env=True) 每次都对整个 config deepcopy + 读 env，
 # chat 链路上一次请求会调用 3~4 次（chat → llm_chat/llm_chat_stream → 搜索/续写）。
 # env 只在进程启动后改变，签名 = (config mtime, 相关 env 值)；两者都没变时直接复用
 # 上次的合并结果，把每次请求的 deepcopy 开销归零。
 _env_keys_all = tuple(sorted(
-    set(_CLOUD_PROVIDER_ENV.values()) | set(_ALIYUN_ENV_KEYS) | set(_MINIMAX_ENV_KEYS)
+    set(_CLOUD_PROVIDER_ENV.values()) | set(_ALIYUN_ENV_KEYS) | set(_MINIMAX_ENV_KEYS) | set(_GMI_ENV_KEYS)
 ))
 # 缓存 key = (config mtime, env 签名, config 对象身份)：生产路径下 load_config
 # 命中 mtime 缓存时返回同一对象（id 稳定），env 签名不变即可复用合并结果；
@@ -556,6 +583,14 @@ def _env_aliyun_key() -> str:
 
 def _env_minimax_key() -> str:
     for name in _MINIMAX_ENV_KEYS:
+        val = os.getenv(name)
+        if val:
+            return val
+    return ""
+
+
+def _env_gmi_key() -> str:
+    for name in _GMI_ENV_KEYS:
         val = os.getenv(name)
         if val:
             return val
@@ -605,9 +640,22 @@ def _apply_env_overrides(cfg: dict, mtime_ns: int = 0) -> dict:
     aliyun_key = (voice.get("aliyun") or {}).get("api_key") or _env_aliyun_key()
     if aliyun_key:
         voice["aliyun"] = {**voice.get("aliyun", {}), "api_key": aliyun_key}
-    minimax_key = (voice.get("minimax") or {}).get("api_key") or _env_minimax_key()
+    # GMI 模式（api_schema=gmi）优先用 GMI_API_KEY；否则用官方 key。
+    # 优先级：config 显式 api_key > GMI_API_KEY（仅 GMI 模式）> MINIMAX_API_KEY
+    minimax_entry = voice.get("minimax") or {}
+    minimax_key = minimax_entry.get("api_key") or ""
+    if minimax_entry.get("api_schema") == "gmi":
+        minimax_key = minimax_key or _env_gmi_key() or _env_minimax_key()
+    else:
+        minimax_key = minimax_key or _env_minimax_key()
     if minimax_key:
-        voice["minimax"] = {**voice.get("minimax", {}), "api_key": minimax_key}
+        voice["minimax"] = {**minimax_entry, "api_key": minimax_key}
+    # MiMo 语音引擎 key 独立注入（复用文字模型 MIMO_API_KEY）
+    mimo_entry = voice.get("mimo") or {}
+    if not mimo_entry.get("api_key"):
+        mimo_key = os.getenv("MIMO_API_KEY") or ""
+        if mimo_key:
+            voice["mimo"] = {**mimo_entry, "api_key": mimo_key}
     out["voice"] = voice
     _env_override_cache["key"] = ck
     _env_override_cache["value"] = out
@@ -2588,7 +2636,10 @@ async def access_gate(request: Request, call_next):
                 return JSONResponse({"detail": "未配置访问口令时禁止跨源访问"}, status_code=403)
         return await call_next(request)
     path = request.url.path
-    if path in ("/api/health", "/api/login", "/login"):
+    # PWA 元数据（manifest/图标）不含敏感信息，且系统级安装流程与首帧 manifest
+    # 拉取可能不携带会话 cookie（登录 cookie 写入竞态），放行避免首装报错。
+    if path in ("/api/health", "/api/activity", "/api/login", "/login", "/manifest.webmanifest") \
+            or path.startswith("/icons/"):
         return await call_next(request)
     if _auth_ok(request, token):
         return await call_next(request)
@@ -3493,7 +3544,7 @@ async def _tts_do_synthesize_maybe_segmented(text: str, style: str, cfg: dict,
 async def _tts_do_synthesize(text: str, style: str, cfg: dict, cache: Path) -> Path:
     """实际执行合成并写缓存，返回最终可服务的音频路径。"""
     if cfg.get("voice", {}).get("provider") == "mimo":
-        raise HTTPException(400, "MiMo 语音合成已移除，请使用本地合成或阿里云千问")
+        out_path = await mimo_tts_synthesize(text, style, cfg)
     elif cfg.get("voice", {}).get("provider") == "aliyun":
         out_path = await aliyun_tts_synthesize(text, style, cfg)
     elif cfg.get("voice", {}).get("provider") == "minimax":
@@ -3528,6 +3579,39 @@ async def _tts_do_synthesize(text: str, style: str, cfg: dict, cache: Path) -> P
                 raise HTTPException(500, f"语音合成失败: {(detail.group(0).strip() if detail else (err or out)[-500:])}")
     # 写缓存可能触发整 wav 的跨分区拷贝（数 MB），丢线程池别卡事件循环
     return await asyncio.to_thread(_save_tts_cache, cache, out_path)
+
+
+def _normalize_wav_header(data: bytes) -> bytes:
+    """回填 WAV 头的长度字段。
+
+    阿里云 qwen3-tts 流式返回时，RIFF size 与 data chunk size 是占位值
+    （实测 0x7FFFFFFB ≈ 2GB）。浏览器/播放器按头解析会得到几万秒的时长，
+    Android MediaPlayer 等严格实现还可能直接拒绝播放。这里按实际字节数
+    回填 RIFF size 与 data size；头部结构异常时原样返回，不冒险改写。
+    """
+    if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return data
+    out = bytearray()
+    out += data[:4]                              # 'RIFF'
+    out += struct.pack("<I", len(data) - 8)      # RIFF size 按实际字节数回填
+    pos = 12                                     # WAVE 之后的第一个 chunk
+    while pos + 8 <= len(data):
+        cid = data[pos:pos + 4]
+        size = struct.unpack_from("<I", data, pos + 4)[0]
+        body = pos + 8
+        if cid == b"data":
+            actual = len(data) - body
+            # 声明长度大于实际（占位值）说明 data 是末尾 chunk，按实际长度回填；
+            # 小于等于实际说明头部正常，保持原值不动
+            size = min(size, actual) if size > actual else size
+            out += data[8:pos + 4]               # 从 'WAVE' 起原样搬运前置 chunk
+            out += struct.pack("<I", size)       # data size 回填
+            out += data[body:]
+            return bytes(out)
+        if size > len(data) - body:              # 非 data chunk 长度异常，放弃修复
+            return data
+        pos = body + size + (size % 2)
+    return data
 
 
 async def aliyun_tts_synthesize(text: str, style: str = "", cfg: dict | None = None) -> Path:
@@ -3568,14 +3652,15 @@ async def aliyun_tts_synthesize(text: str, style: str = "", cfg: dict | None = N
     audio_data = data.get("data")
     if audio_data:
         try:
-            await asyncio.to_thread(out_path.write_bytes, base64.b64decode(audio_data))
+            raw = base64.b64decode(audio_data)
         except (ValueError, TypeError):
             raise HTTPException(502, "阿里云 TTS 返回的不是有效音频数据")
+        await asyncio.to_thread(out_path.write_bytes, _normalize_wav_header(raw))
     elif data.get("url"):
         try:
             resp = await httpx_client.get(data["url"], timeout=120)
             resp.raise_for_status()
-            await asyncio.to_thread(out_path.write_bytes, resp.content)
+            await asyncio.to_thread(out_path.write_bytes, _normalize_wav_header(resp.content))
         except httpx.HTTPError as exc:
             raise HTTPException(502, f"阿里云 TTS 音频下载失败: {exc}")
     else:
@@ -3589,6 +3674,9 @@ async def minimax_tts_synthesize(text: str, style: str = "", cfg: dict | None = 
     model 支持 speech-02-hd（音质/复刻相似度最佳）/ speech-02-turbo（更快）/
     speech-01-hd 等；voice 填系统音色 id（如 male-qn-jingying）或声音复刻
     返回的 voice_id。返回 wav（非流式接口支持），与长文分段拼接链路兼容。
+
+    voice.minimax.api_schema=gmi 时走 GMI Cloud 队列接口（活动免费模型），
+    提交 requestqueue → 轮询 → 下载 mp3 → ffmpeg 转 wav，保持链路兼容。
     """
     cfg = cfg or load_config()
     m = cfg.get("voice", {}).get("minimax", {})
@@ -3598,7 +3686,8 @@ async def minimax_tts_synthesize(text: str, style: str = "", cfg: dict | None = 
     model = m.get("model") or "speech-02-hd"
     voice = m.get("voice") or "male-qn-jingying"
     base = (m.get("base_url") or "https://api.minimaxi.com/v1").rstrip("/")
-    # 采样参数从配置读取（前端设置页可调），带范围钳制，改值后缓存指纹联动自动重合成
+    if (m.get("api_schema") or "official") == "gmi":
+        return await _gmi_tts_synthesize(text, model, voice, base, api_key, m)    # 采样参数从配置读取（前端设置页可调），带范围钳制，改值后缓存指纹联动自动重合成
     try:
         speed = float(m.get("speed", 1.0))
     except (TypeError, ValueError):
@@ -3649,6 +3738,187 @@ async def minimax_tts_synthesize(text: str, style: str = "", cfg: dict | None = 
         raise HTTPException(502, "MiniMax TTS 返回的不是有效音频数据")
     out_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
     await asyncio.to_thread(out_path.write_bytes, audio_bytes)
+    return out_path
+
+
+async def mimo_tts_synthesize(text: str, style: str = "", cfg: dict | None = None) -> Path:
+    """调用小米 MiMo TTS（chat/completions 兼容接口，OpenAI 协议）。
+
+    model 支持：
+      mimo-v2.5-tts           预置音色（audio.voice 传音色名，如 冰糖/茉莉/苏打/白桦）
+      mimo-v2.5-tts-voiceclone 基于音频样本复刻音色（audio.voice 传 data:audio/...;base64,xxx）
+    user 消息可传风格指令，assistant 消息传要合成的文本；audio.format=wav 返回 wav。
+    返回 wav 文件，与长文分段拼接链路兼容。
+    """
+    cfg = cfg or load_config()
+    m = cfg.get("voice", {}).get("mimo") or {}
+    api_key = m.get("api_key") or ""
+    if not api_key:
+        raise HTTPException(400, "MiMo 音色未配置：请在设置里填写 MiMo API Key")
+    model = m.get("model") or "mimo-v2.5-tts"
+    base = (m.get("base_url") or "https://api.xiaomimimo.com/v1").rstrip("/")
+    # 风格指令：显式 style 参数 > config voice.style > 默认
+    style_cmd = style or (cfg.get("voice") or {}).get("style", "") or "用自然轻松的日常语气，语速适中"
+    # 组装 audio 参数
+    audio_kw = {"format": "wav"}
+    voice_param = m.get("voice")
+    if model.endswith("voiceclone"):
+        # 音色复刻：audio.voice 传参考音频 data URI（mp3/wav，base64 ≤10MB）
+        ref_path = Path(m.get("ref_audio") or "") if m.get("ref_audio") else None
+        if ref_path is None or not ref_path.exists():
+            # 回退：角色专属音色 -> 全局 voice_ref
+            rp, mime = cloud_ref_paths_for_role(cfg)
+            ref_path = rp
+            mime = "audio/mpeg" if rp.suffix.lower() == ".mp3" else "audio/wav"
+        if not ref_path.exists():
+            raise HTTPException(400, "MiMo 音色复刻需要参考音频：请配置 voice.mimo.ref_audio")
+        mime = "audio/mpeg" if ref_path.suffix.lower() == ".mp3" else "audio/wav"
+        try:
+            ref_b64 = await asyncio.to_thread(
+                lambda: base64.b64encode(ref_path.read_bytes()).decode("utf-8"))
+        except OSError as exc:
+            raise HTTPException(502, f"MiMo 参考音频读取失败: {exc}")
+        if len(ref_b64) * 3 // 4 > 10 * 1024 * 1024:
+            raise HTTPException(400, "MiMo 参考音频超过 10MB 限制，请裁剪后再试")
+        audio_kw["voice"] = f"data:{mime};base64,{ref_b64}"
+    else:
+        audio_kw["voice"] = voice_param or "冰糖"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": style_cmd},
+            {"role": "assistant", "content": text},
+        ],
+        "audio": audio_kw,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        r = await httpx_client.post(f"{base}/chat/completions", json=payload,
+                                    headers=headers, timeout=180)
+        r.raise_for_status()
+        data = r.json()
+    except httpx.HTTPError as exc:
+        detail = exc.response.text[:500] if getattr(exc, "response", None) is not None else str(exc)
+        if "429" in detail or "limitation" in detail:
+            detail = f"MiMo TTS 被限流(429)，请稍后重试：{detail}"
+        raise HTTPException(502, f"MiMo TTS 调用失败: {detail}")
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(502, f"MiMo TTS 响应解析失败: {exc}")
+    try:
+        audio_data = data["choices"][0]["message"]["audio"]["data"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise HTTPException(502, f"MiMo TTS 响应缺少音频: {str(data)[:300]}")
+    try:
+        audio_bytes = base64.b64decode(audio_data)
+    except (ValueError, TypeError):
+        raise HTTPException(502, "MiMo TTS 返回的不是有效音频数据")
+    out_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
+    await asyncio.to_thread(out_path.write_bytes, audio_bytes)
+    return out_path
+
+
+async def _gmi_tts_synthesize(text: str, model: str, voice: str, base: str,
+                              api_key: str, m: dict) -> Path:
+    """GMI Cloud MiniMax TTS（requestqueue 队列 + 轮询，同步等待）。
+
+    GMI 接口 POST /api/v1/ie/requestqueue/apikey/requests 提交后返回
+    request_id，状态 queued/processing 需轮询 GET .../requests/{id}，
+    success 后 outcome.media_urls[0].url 为 mp3 直链。本函数把 mp3 用
+    ffmpeg 转成 wav 返回，与官方 minimax 路径的长文分段拼接链路兼容。
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(502, "GMI TTS 需要 ffmpeg 转码，请先安装并加入 PATH")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    base = (base or "https://console.gmicloud.ai").rstrip("/")
+    req_url = f"{base}/api/v1/ie/requestqueue/apikey/requests"
+    payload = {
+        "model": model,
+        "payload": {
+            "text": text,
+            "voice_id": voice,
+            "speed": str(m.get("speed", 1.0)),
+            "vol": str(int(m.get("vol", 1.0))),
+            "pitch": str(int(m.get("pitch", 0))),
+            "emotion": "auto",
+            "language_boost": "auto",
+            "format": "mp3",
+            "audio_sample_rate": str(m.get("sample_rate", 32000)),
+            "bitrate": "128000",
+            "channel": "1",
+        },
+    }
+    try:
+        r = await httpx_client.post(req_url, json=payload, headers=headers, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+    except httpx.HTTPError as exc:
+        detail = exc.response.text[:500] if getattr(exc, "response", None) is not None else str(exc)
+        if "1002" in detail:
+            detail = f"GMI 请求被限流(1002)，key 可能无该模型 TTS 权限：{detail}"
+        if "capacity" in detail or "503" in detail:
+            # 活动期免费模型上游过载，短退避重试（最多 4 次，共 ~30s）
+            _log.warning("GMI TTS upstream overloaded, retrying: %s", detail)
+            for _attempt in range(4):
+                await asyncio.sleep(6 + _attempt * 3)
+                try:
+                    r = await httpx_client.post(req_url, json=payload, headers=headers, timeout=120)
+                    r.raise_for_status()
+                    data = r.json()
+                    break
+                except httpx.HTTPError as exc2:
+                    detail = exc2.response.text[:500] if getattr(exc2, "response", None) is not None else str(exc2)
+                    if "capacity" not in detail and "503" not in detail:
+                        raise HTTPException(502, f"GMI TTS 提交失败: {detail}")
+                    if _attempt == 3:
+                        raise HTTPException(502, f"GMI TTS 上游持续过载，请稍后重试: {detail}")
+            else:
+                raise HTTPException(502, f"GMI TTS 上游持续过载，请稍后重试: {detail}")
+        raise HTTPException(502, f"GMI TTS 提交失败: {detail}")
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(502, f"GMI TTS 响应解析失败: {exc}")
+    req_id = data.get("request_id") or ""
+    if not req_id:
+        raise HTTPException(502, f"GMI TTS 未返回 request_id: {str(data)[:300]}")
+    # 轮询状态：最长 ~100s（GMI 单次合成约 5-20s，长文本更久；每次 sleep 3s）
+    media_url = ""
+    for _ in range(35):
+        status = data.get("status") or ""
+        if status == "success":
+            media_url = ((data.get("outcome") or {}).get("media_urls") or [{}])[0].get("url", "")
+            break
+        if status in ("failed", "cancelled"):
+            raise HTTPException(502, f"GMI TTS 任务失败: {str(data)[:300]}")
+        await asyncio.sleep(3)
+        try:
+            r = await httpx_client.get(f"{req_url}/{req_id}", headers=headers, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+        except httpx.HTTPError as exc:
+            detail = exc.response.text[:300] if getattr(exc, "response", None) is not None else str(exc)
+            raise HTTPException(502, f"GMI TTS 轮询失败: {detail}")
+    if not media_url:
+        raise HTTPException(502, "GMI TTS 合成超时（100s 内未完成）")
+    try:
+        resp = await httpx_client.get(media_url, timeout=120)
+        resp.raise_for_status()
+        mp3_bytes = resp.content
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"GMI TTS 音频下载失败: {exc}")
+    mp3_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.mp3"
+    await asyncio.to_thread(mp3_path.write_bytes, mp3_bytes)
+    out_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-i", str(mp3_path), "-ar", str(m.get("sample_rate", 32000)),
+             "-ac", "1", str(out_path)],
+            capture_output=True, timeout=60, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        err = (getattr(exc, "stderr", b"") or b"")[:300]
+        raise HTTPException(502, f"GMI TTS mp3 转 wav 失败: {err.decode('utf-8', 'ignore')}")
+    finally:
+        mp3_path.unlink(missing_ok=True)
     return out_path
 
 
@@ -4051,7 +4321,8 @@ def _is_degenerate_reply(text: str) -> bool:
 
 @app.get("/")
 async def index():
-    return FileResponse(FRONTEND_DIR / "pages" / "index.html")
+    # 个人产品唯一入口是对话页：原营销落地页（index.html）已删除，根路径直接进聊天
+    return RedirectResponse("/pages/chat.html", status_code=302)
 
 
 @app.get("/api/status")
@@ -4061,9 +4332,10 @@ async def status():
     local_cfg = cfg.get("local", {})
     cloud_cfg = cfg.get("cloud", {})
     active_online, active_error = await probe_active_provider(cfg)
-    # 密钥回传策略：已配置访问口令（公网有门禁）→ 明文回填（前端显隐切换依赖）；
-    # 未配置口令（任何访问者都能调 /api/status）→ 脱敏为 ***+尾4，防密钥泄露/盗刷。
-    mask_keys = _access_token() is None
+    # 密钥回传策略：一律脱敏为 ***+尾4。密钥真值只在 .env，前端保存时
+    # 后端识别掩码值并跳过该字段（_is_masked_key），不会把掩码误存进配置。
+    # （旧行为：配置了访问口令时明文回填——公网隧道下密钥会随每个登录会话传输，已废弃）
+    mask_keys = True
     cloud_out = dict(cloud_cfg)
     providers_out = {k: dict(v) for k, v in cfg.get("cloud_providers", {}).items()}
     # MiniMax 计费模式回填：cloud.billing_mode 缺省（老配置）时从当前供应商条目补
@@ -4104,6 +4376,7 @@ async def status():
         "aliyun_configured": bool(cfg.get("voice", {}).get("aliyun", {}).get("api_key")),
         "voice_aliyun": voice_aliyun_out,
         "minimax_configured": bool(cfg.get("voice", {}).get("minimax", {}).get("api_key")),
+        "mimo_configured": bool(cfg.get("voice", {}).get("mimo", {}).get("api_key")),
         "voice_minimax": voice_minimax_out,
         "voice_style": cfg.get("voice", {}).get("style", ""),
         "voice_manual_provider": bool(cfg.get("voice", {}).get("manual_provider")),
@@ -4315,6 +4588,8 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
+    global _last_activity_ts
+    _last_activity_ts = time.time() * 1000
     user_text = req.message.strip()
     if not user_text and not req.attachments:
         raise HTTPException(400, "消息不能为空")
@@ -4618,6 +4893,15 @@ async def role_state_reset():
     return {"ok": True, "role": role}
 
 
+@app.get("/api/activity")
+async def activity():
+    """部署机活跃感知：最近 5 分钟内有对话/问候视为活跃（自动部署据此延迟重启，
+    避免 push 部署在聊天进行中打断对话）。仅返回时间戳，无敏感信息。"""
+    now_ms = time.time() * 1000
+    last = _last_activity_ts
+    return {"last_chat_ts": last, "active": bool(last) and (now_ms - last) < 300_000}
+
+
 @app.post("/api/greeting")
 async def role_greeting():
     """主动问候：基于记忆+情绪+时间生成大帅的主动开场白。
@@ -4625,6 +4909,8 @@ async def role_greeting():
     前端在页面打开时按阈值调用（距上次聊天够久 / 新的一天还没问候过）。
     频率控制在前端 localStorage（每天最多 1-2 次），后端只负责生成。
     """
+    global _last_activity_ts
+    _last_activity_ts = time.time() * 1000
     cfg = load_config()
     active_role = cfg.get("active_role", "")
     engine_cfg = cfg.get("role_engine") or {}
@@ -5030,7 +5316,12 @@ def _merge_config_update(cfg: dict, upd: ConfigUpdate) -> None:
         cloud_cfg["billing_mode"] = upd.cloud_billing_mode
         entry["billing_mode"] = upd.cloud_billing_mode
     if upd.persona:
+        # 人设双写：顶层字段与当前角色的 persona 同步更新，杜绝两份文本漂移
+        # （current_persona 读取时角色 persona 优先，只写顶层会导致编辑"不生效"的错觉）
         cfg["persona"] = upd.persona
+        role = (cfg.get("roles") or {}).get(cfg.get("active_role", "") or "")
+        if isinstance(role, dict):
+            role["persona"] = upd.persona
     if upd.voice_language:
         cfg.setdefault("voice", {})["language"] = upd.voice_language
     # 声音克隆引擎（与对话 API 完全独立的另一套配置）
@@ -5464,6 +5755,11 @@ async def gzip_and_security_headers(request: Request, call_next):
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
     if request.method == "HEAD":
+        return response
+    # 客户端没声明支持 gzip 就别压缩：curl 等工具不带 Accept-Encoding，
+    # 压缩后它拿到的是无法解码的字节流（浏览器始终带该头，不受影响）
+    accept_enc = (request.headers.get("accept-encoding") or "").lower()
+    if "gzip" not in accept_enc and "*" not in accept_enc:
         return response
     if response.headers.get("content-encoding"):
         return response  # 已压缩过（如 FileResponse 自带编码），跳过

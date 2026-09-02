@@ -4,11 +4,11 @@
 
 ## 功能
 
-- 多角色人设对话：本地 Qwen3.5-4B（llama.cpp / CUDA，8GB 显存友好）或云端 OpenAI 兼容 API（MiMo / DeepSeek / 火山方舟 / 自定义）
+- 多角色人设对话：本地 Qwen3.5-4B（llama.cpp / CUDA，8GB 显存友好）或云端 OpenAI 兼容 API（小米 MiMo / DeepSeek / 火山方舟 / MiniMax / 自定义）
 - 角色引擎：按角色持久化记忆与状态，对话注入时间/位置/天气/状态/现实动态/记忆上下文，回复后异步更新；大帅支持主动问候
-- 图片/文件附件：发送栏可发图片、文档和其他文件，图片会优先走本地视觉模型，让角色真正“看到”
+- 图片/文件附件：发送栏可发图片、文档和其他文件；图片走视觉链路（默认 `auto`：云端多模态优先、本地 Qwen2.5-VL 兜底），让角色真正"看到"
 - 联网搜索：模型判断知识过时时会自动搜索最新消息（默认 DuckDuckGo，Bing RSS 兜底），尤其适合查自己的比赛、战队与近况
-- 语音合成与音色克隆：支持本地 Qwen3-TTS、阿里云千问（qwen3-tts-flash）与 MiniMax 海螺（T2A v2）三条链路（MiMo TTS 已下线，不再支持）；MiniMax 支持声音克隆，合成采样参数（语速/音量/音调/采样率）可在设置页调整
+- 语音合成与音色克隆：支持本地 Qwen3-TTS、阿里云千问（qwen3-tts / qwen3-tts-vc 克隆音色）、MiniMax 海螺、小米 MiMo 四条链路；阿里云与 MiniMax 支持声音克隆，合成采样参数（语速/音量/音调/采样率）可在设置页调整
 - 人设、语音参数可视化配置
 - **2027 赛季剧情分支**：大帅·2027 独立角色——虚拟 KPL 赛程（55 场预生成）、剧情时钟（现实一天=虚拟一天 + 任意跳转）、情感状态机（暗恋隐忍→相爱相杀→暧昧升温→在一起）、旁白双声部、今日剧情引导卡
 - **主对话模式**：每个角色固定一个主对话（不能新建/删除），切角色自动切换，聊天记录零散落
@@ -17,8 +17,9 @@
 
 ```bat
 setup.bat              # 首次初始化依赖（一次性）
-start.bat              # 一键启动（含本地 LLM）
-restart_service.bat    # 重启 8000 端口服务
+start.bat              # 一键启动服务（端口 8000）
+restart_service.bat    # 改代码后重启 8000 端口服务（加载最新代码）
+run_tests.bat          # 一键跑全部离线测试
 ```
 
 启动后访问 http://127.0.0.1:8000
@@ -67,13 +68,14 @@ restart_service.bat    # 重启 8000 端口服务
   - `POST /api/story/flag` 推进剧情标志位（如 `{"flag":"command_win"}`）
 - 分支人设与剧情设定（用户逐条确认定稿）：[docs-specs/大帅2027人设档案.md](docs-specs/大帅2027人设档案.md)（全网搜集的大帅真实资料 + 分支人设 + 玩家卡「岚风」+ 训练室排布 + 情感线设定）
 
-## 手机 App（Android APK）
+## 手机端使用（PWA 网页版）
 
-项目内置手机端 Android 应用（`android/` 目录）：**界面打包在 APK 里（秒开、离线可见），数据接口经 APK 内本地代理转发到远程服务器**（隧道/云电脑地址）。前端与服务端零改动。
+安卓 APK 已**停止开发**，手机端统一使用网页版（PWA），体验对齐原生 App：
 
-- 已构建好的 APK 在 `release/` 目录（debug 调试版 + release 正式签名版），直接拷到手机安装（允许未知来源）
-- 安装后填「服务器地址 + 访问口令」即用；服务器重启后隧道地址变了，在应用「⚙ 设置」里更新即可
-- 构建/更新/签名说明见 [android/README.md](android/README.md)
+- 手机浏览器打开隧道地址，登录后在浏览器菜单选「**添加到主屏幕 / 安装应用**」
+- 主屏幕打开即独立窗口运行（无地址栏），应用壳由 Service Worker 缓存，**秒开、弱网可用**
+- 服务器重启后隧道地址变了，在页面「⚙ 设置 → 服务器连接」里更新即可
+- 旧 APK 工程保留在 `android/` 目录仅作存档，不再构建更新
 
 ## 配置参考
 
@@ -180,7 +182,7 @@ python minimax_clone.py
 
 | 变量 | 用途 |
 | --- | --- |
-| `MIMO_API_KEY` | 小米 MiMo（LLM 对话） |
+| `MIMO_API_KEY` | 小米 MiMo（LLM 对话 + TTS 语音合成） |
 | `DEEPSEEK_API_KEY` | DeepSeek（LLM 对话） |
 | `ARK_API_KEY` | 火山方舟（LLM 对话） |
 | `ALIYUN_API_KEY` | 阿里云（TTS 语音合成） |
@@ -193,30 +195,22 @@ python minimax_clone.py
 
 ## 密钥与安全说明
 
-- `.env.example` 是密钥模板：首次使用时复制为 `.env` 并填入真实密钥；`.env` 已在 .gitignore 中，不会入库。
-- `/api/status` 接口会**明文返回当前配置的密钥**，这是为了前端设置页能回填已配置的 key（设计意图）。
-- **访问口令保护**：在 `config.json` 顶层配置 `access_token`（或环境变量 `ACCESS_TOKEN`）后，所有页面与 API 均需口令才能访问，未登录请求会被重定向到 `/login` 或返回 401。未配置口令时保持仅本机可访问的旧行为。
-- 开放远程访问（局域网 / Cloudflare Tunnel）前**必须先配置访问口令**，否则同网络下任何人可查看 `/api/status` 中的明文密钥。
+- `.env.example` 是密钥模板：首次使用时复制为 `.env` 并填入真实密钥；`.env` 已在 .gitignore 中，不会入库。**密钥只存 `.env`，config.json 不再保存明文 key**（运行时由 `_apply_env_overrides` 自动注入）。
+- `/api/status` 接口对密钥一律返回 `***+尾4` 掩码；设置页保存时后端识别掩码值并跳过该字段，不会覆盖已有配置。
+- **访问口令保护**：在 `config.json` 顶层配置 `access_token`（或环境变量 `ACCESS_TOKEN`）后，所有页面与 API 均需口令才能访问，未登录请求会被重定向到 `/login` 或返回 401。口令请使用足够长度的随机串，弱口令有被爆破风险。
+- **登录防护**：`/api/login` 口令比对使用 `hmac.compare_digest` 防时序侧信道；失败时固定 1 秒退避，拖慢公网在线爆破。会话 cookie 为 `HttpOnly` + `SameSite=Lax`（HTTPS 下 `Secure`），有效期 30 天。口令仍是唯一防线，务必使用足够长度的随机串。
+- 开放远程访问（局域网 / ngrok）前**必须先配置访问口令**。
 - 服务绑定 `0.0.0.0` 以支持局域网直连与隧道接入，安全边界由访问口令兜底。
 
-## 手机远程访问（Cloudflare Tunnel）
+## 手机远程访问（ngrok）
 
-电脑跑本地服务、手机随时随地访问：
+电脑跑本地服务、手机随时随地访问（当前实际使用 ngrok 免费版，不是 Cloudflare Tunnel）：
 
 1. 在 `config.json` 顶层配置访问口令：`"access_token": "你的口令"`（或设置环境变量 `ACCESS_TOKEN`）。
 2. 启动服务：`start.bat`（或 `restart_service.bat` 重启）。
-3. 安装并登录 cloudflared：`winget install cloudflare.cloudflared`，然后 `cloudflared tunnel login`。
-4. 创建隧道并绑定域名：
-
-   ```bat
-   cloudflared tunnel create ai-persona
-   cloudflared tunnel route dns ai-persona ai.yourdomain.com
-   ```
-
-5. 写 `cloudflared.yml`（隧道名、凭据路径、url 指向 `http://127.0.0.1:8000`）后运行 `cloudflared tunnel run ai-persona`。
-6. 手机浏览器打开 `https://ai.yourdomain.com`，输入访问口令即可使用（自动走 HTTPS）。
-
-没有自有域名时，可临时用 `cloudflared tunnel --url http://127.0.0.1:8000` 获取 trycloudflare.com 随机网址（重启会失效，仅适合临时演示）；也可直接运行 `start_tunnel.bat` 一键启动，窗口内会显示本次的访问地址。
+3. 另开窗口启动隧道：`ngrok http 8000`。ngrok 免费版每次重启会换域名，启动后 URL 自动写入 `data/tunnel_url.txt`。
+4. 手机浏览器打开该地址，输入访问口令即可使用（自动 HTTPS）；可「添加到主屏幕」像 App 一样运行。
+5. ngrok 自带管理界面 <http://127.0.0.1:4040>，可查看流量与状态。
 
 ## 运行与环境说明
 
@@ -230,13 +224,17 @@ python minimax_clone.py
 ## API
 
 - `POST /api/chat` 对话（注入角色上下文，返回 `{reply, narration?, style}`；旁白分支角色返回 `narration`）
-- `POST /api/greeting` 主动问候；`GET/DELETE /api/state` 查看/重置角色状态
-- `POST /api/tts` 语音合成
+- `POST /api/greeting` 主动问候；`GET /api/state` / `DELETE /api/state` 查看/重置角色状态；`GET /api/roles/memories` 查看记忆；`GET /api/activity` 活动
+- `POST /api/tts` 语音合成；`GET /api/tts/file` 取缓存音频
 - `POST /api/upload` 附件上传；`GET /uploads/...` 附件访问
 - `POST /api/search` 联网搜索；对话中模型输出 `[search:关键词]` 会自动触发
-- `GET /api/status`、`GET/POST /api/config`、`GET /api/roles`、`POST /api/roles/apply`
-- `GET/PUT /api/sessions` 会话持久化；`POST /api/llm-models` 拉取云端模型列表
+- `GET /api/status` 状态（密钥一律脱敏）；`GET /api/config` / `POST /api/config` 读写配置
+- `GET /api/roles` 角色列表；`POST /api/roles/apply` 切换角色
+- `GET /api/sessions` / `PUT /api/sessions` 会话持久化；`GET /api/sync/stream` 多端 SSE 同步
 - `GET /api/story/status`、`GET /api/story/calendar`、`POST /api/story/jump|resume|result|flag` 2027 剧情分支（仅 story 角色）
+- `POST /api/llm-models` 拉取云端模型列表；`POST /api/llm-quota` 查询 MiniMax Token Plan 额度
+- `GET /api/weather` / `POST /api/weather/refresh` 天气；`GET /api/role-news` / `POST /api/role-news/refresh` / `POST /api/role-news/update` 角色现实动态
+- `GET /login`、`POST /api/login`、`POST /api/logout` 访问口令登录
 - `GET /api/health` 健康检查
 
 ## 目录
@@ -245,16 +243,30 @@ python minimax_clone.py
 server.py               FastAPI 后端主程序（端口 8000）
 role_engine.py          角色运行引擎（记忆/状态/时间/位置/天气/后处理）
 story_kpl2027.py        2027 赛季剧情分支引擎（赛程生成/剧情时钟/情感状态机/剧情指引）
+minimax_llm.py          MiniMax 云端文字生成适配器（OpenAI 兼容，payg / token_plan 双计费）
+minimax_clone.py        MiniMax 声音克隆脚本
+pet_process.py          桌宠视频 → 透明循环 WebP 批处理工具
 config.example.json     配置模板（复制为 config.json 使用）
+requirements.txt        Python 依赖
+setup.bat / start.bat / restart_service.bat / run_tests.bat   初始化 / 启动 / 重启 / 测试
 llm/                    llama.cpp 运行时（llm/bin）、模型（llm/models）与启动脚本
-xiaoni-ai-persona/      前端页面源码（pages/chat.html、pages/story.html 赛程表）
-docs-specs/             设计文档（角色引擎设计、大帅2027人设档案）
-data/                   运行时数据（会话、音频、记忆、状态，不入库）
+xiaoni-ai-persona/      前端页面源码（pages/ 单页 chat.html + css/chat.css + js/app.js + pet.js + 桌宠素材、pages/story.html 赛程表、PWA manifest/sw）
+deploy/                 打包与部署脚本（pack_cloud / pack_update / webhook 自动部署）
+download_site/          下载引导站
+android/                安卓 APK 工程（已停止开发，仅存档）
+docs-specs/             设计文档（角色引擎设计、大帅2027人设档案）与优化报告
+data/                   运行时数据（会话、记忆、状态、TTS 缓存、上传，不入库）
 ```
 
 ## 测试
 
-以下 4 个测试可离线运行（无需密钥、无需启动服务）：
+一键运行全部离线测试（无需密钥、无需启动服务）：
+
+```bat
+run_tests.bat
+```
+
+单独运行某个套件（用本地 TTS 的 venv python）：
 
 ```bat
 REM 角色引擎：记忆/状态/时间感知/后处理
@@ -271,6 +283,12 @@ REM 附件上传与处理
 
 REM 2027 赛季剧情分支（赛程生成/种子确定性/跳转/情感状态机，12 用例）
 "%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_story_kpl2027.py
+
+REM 配置读写 API
+"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_config_api.py
+
+REM TTS 缓存清理策略
+"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_tts_cache.py
 ```
 
 需要真实云端密钥才能运行的脚本：
@@ -301,6 +319,8 @@ REM 2027 赛季剧情分支（赛程生成/种子确定性/跳转/情感状态�
 3. 查看被过滤的测试会话：`GET /api/sessions?include_test=1`。
 
 ## 本地 LLM 说明
+
+> **2026-08-29 起，本地引擎已从界面下线**（设置面板与侧栏不再提供本地/云端切换，当前唯一引擎为云端 API）。后端 local 分支代码保留，换机复用时手动运行 `llm/start_llm.bat` 并把 config.json 的 `provider` 改回 `local` 即可恢复。
 
 - **模型**：`llm/models/Qwen3.5-4B-Q4_K_M.gguf`（Q4_K_M 量化约 2.6GB，8GB 显存可全层 GPU 推理）。旧 Qwen3-4B 已移除。
 - **思考模式**：Qwen3.5 系列默认开启思考模式，长人设下思考过程会吃光 `max_tokens` 导致空回复。`server.py` 已在 local 分支自动下发 `chat_template_kwargs.enable_thinking=false` 关闭思考，无需手动配置。
