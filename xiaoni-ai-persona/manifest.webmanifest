@@ -1,0 +1,19 @@
+{
+  "name": "小拟 · AI 拟人陪伴",
+  "short_name": "小拟",
+  "description": "用我的声音聊天——AI 拟人陪伴系统",
+  "id": "/pages/chat.html",
+  "start_url": "/pages/chat.html",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0F0D11",
+  "theme_color": "#0F0D11",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

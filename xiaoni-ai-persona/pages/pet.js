@@ -111,7 +111,7 @@
       '@keyframes pet-fadein{from{opacity:.35}to{opacity:1}}',
       /* 最小化圆点 */
       '#pet.mini{width:' + MINI_SIZE + 'px;height:' + MINI_SIZE + 'px;right:12px;bottom:calc(env(safe-area-inset-bottom, 0px) + 12px)}',
-      '#pet.mini .pet-stage{border-radius:50%;background:var(--chart-2,#4f6ef7);',
+      '#pet.mini .pet-stage{border-radius:50%;background:var(--chart-2,#FF8A3D);',
       'box-shadow:0 2px 10px -2px rgba(0,0,0,.5)}',
       '#pet.mini .pet-img{display:none}',
       '#pet.mini .pet-bubble{display:none}',
@@ -133,17 +133,18 @@
       '#pet-ctx .pet-ctx-item.active{background:var(--accent,#f5f5f5);font-weight:600}',
       '#pet-ctx .pet-ctx-item.missing{opacity:.4;cursor:default}',
       '#pet-ctx .pet-ctx-sep{height:1px;background:var(--border,#e5e5e5);margin:4px 0}',
-      '#pet-ctx .pet-ctx-danger{color:#d33}',
-      /* 移动端适配：小屏缩小 + 菜单满宽 */
+      '#pet-ctx .pet-ctx-danger{color:#E8605A}',
+      /* 移动端适配：小屏缩小 + 菜单满宽；默认位置抬到输入栏上方，不遮发送键 */
       '@media (max-width: 640px){',
-      '  #pet:not(.mini){width:120px;height:120px}',
+      '  #pet:not(.mini){width:120px;height:120px;bottom:calc(env(safe-area-inset-bottom, 0px) + 84px)}',
+      '  #pet.mini{bottom:calc(env(safe-area-inset-bottom, 0px) + 78px)}',
       '  #pet .pet-bubble{font-size:12px;max-width:120px}',
       '  #pet-ctx{left:8px !important;right:8px;width:auto;min-width:0;',
       '  transform-origin:bottom center}',
       '}',
       '@media (prefers-color-scheme: dark){',
-      '  #pet .pet-bubble,#pet-ctx{background:#171717;color:#fafafa;border-color:#262626}',
-      '  #pet-ctx .pet-ctx-item:hover{background:#262626}',
+      '  #pet .pet-bubble,#pet-ctx{background:#17131A;color:#F2EAE2;border-color:#2A2331}',
+      '  #pet-ctx .pet-ctx-item:hover{background:#272030}',
       '}'
     ].join('');
     document.head.appendChild(s);
@@ -160,7 +161,9 @@
       img.decoding = 'async';
       img.src = 'pet/' + state + '.webp?v=' + ASSET_VERSION;  // 固定版本，可被长缓存
       img.onload  = function () { resolve(img); };
-      img.onerror = function () { resolve(null); };
+      /* 失败不缓存：网络抖一下就把某情绪的失败 Promise 永久留住，
+         会导致该情绪裂图直到刷新页面；删掉缓存让下次切换重试 */
+      img.onerror = function () { delete _cache[state]; resolve(null); };
     });
     _cache[state] = p;
     return p;
@@ -168,6 +171,9 @@
 
   /* ---------- 空闲预加载：切换零等待 ---------- */
   function preloadRest() {
+    /* 素材总量 6MB+：省流量模式 / 弱网（2g）下不预载，各情绪按需加载即可 */
+    var conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (conn && (conn.saveData || /(^|-)2g$/.test(conn.effectiveType || ''))) return;
     var queue = PRELOAD_ORDER.slice();
     function next() {
       var st = queue.shift();
