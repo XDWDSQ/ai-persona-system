@@ -2345,7 +2345,7 @@
             return null;
           }
           function currentSession() {
-            return ensureMainSession();
+            return findSession(currentSessionId) || ensureMainSession();
           }
           /* 会话列表排序：置顶优先，组内按最近活跃时间倒序。
              渲染、删除后选会话、服务端合并三处共用，保证顺序一致 */
@@ -2608,17 +2608,25 @@
             persistLocal();
             return s;
           }
-          /* 会话按角色可见性：2027 分支会话只归自己；其余角色互相可见（旧行为不变） */
+          /* 会话按角色可见性：主对话固定排最前；2027 分支会话只归自己；
+             其余角色互相可见历史会话（占位空会话不显示） */
           function visibleSessions() {
-            return [ensureMainSession()];
+            var main = ensureMainSession();
+            if (currentRoleKey === 'dashuai2027') return [main];
+            return [main].concat(sessions.filter(function(x){
+              return x.id !== main.id && x.role !== 'dashuai2027' && !isPlaceholderSession(x);
+            }));
           }
-          /* 切角色后校正当前会话归属：始终指向当前角色的主对话；
-             仅归属变化时重渲染聊天区，避免每次状态刷新闪屏/打断朗读 */
+          /* 角色变化时才把当前会话校正回主对话；同一角色内用户自由切换历史会话，
+             不被周期性状态刷新拽回 */
+          var _lastSyncedRole = null;
           function syncSessionForRole() {
             var main = ensureMainSession();
-            var changed = currentSessionId !== main.id;
-            currentSessionId = main.id;
-            if (changed) renderCurrentSession();
+            if (_lastSyncedRole !== currentRoleKey) {
+              _lastSyncedRole = currentRoleKey;
+              currentSessionId = main.id;
+              renderCurrentSession();
+            }
             renderSessions();
           }
           /* 2027 赛季入口：仅 dashuai2027 角色激活时显示（跳赛程表页面），标签实时带今日剧情 */
@@ -2653,8 +2661,10 @@
           }
           function renderSessions() {
             if (!sessionsBox) return;
+            /* 主对话固定排最前，其余按置顶/活跃时间排序；key 与渲染共用同一顺序 */
             var vis = visibleSessions();
-            var key = sortSessions(vis).map(function(x){
+            var ordered = vis.slice(0, 1).concat(sortSessions(vis.slice(1)));
+            var key = ordered.map(function(x){
               return x.id + '|' + (x.pinned ? 1 : 0) + '|' + (x.title || '') + '|' + (x.updatedAt || 0) + '|' + (x.id === currentSessionId ? 1 : 0);
             }).join('~');
             if (key === sessionsRenderKey && sessionsBox.childNodes.length) return;
@@ -2662,9 +2672,7 @@
             sessionsBox.innerHTML = '';
             /* 文档片段批量挂载：几十个会话一次性 append，只触发一次布局/重绘 */
             var frag = document.createDocumentFragment();
-            sortSessions(sessions).forEach(function(session, idx){
-              /* 空占位会话不进列表（当前正打开的草稿除外，否则没有落脚点） */
-              if (isPlaceholderSession(session) && session.id !== currentSessionId) return;
+            ordered.forEach(function(session, idx){
               var s = document.createElement('button');
               s.className = 'session' + (!sessionsAnimatedOnce ? ' side-in' : '') + (session.id === currentSessionId ? ' active' : '') + (session.pinned ? ' pinned' : '');
               if (!sessionsAnimatedOnce) s.style.animationDelay = Math.min(idx * 30, 300) + 'ms';
@@ -3200,10 +3208,13 @@
                 setTimeout(function(){ toast('Safari 分享菜单 →「添加到主屏幕」，即可像 App 一样使用', 6000); }, 2500);
               }
             } catch(e) { /* 隐私模式下 localStorage 不可用，忽略 */ }
-            /* Service Worker：应用壳缓存，秒开 + 弱网可用 */
+            /* Service Worker：应用壳缓存，秒开 + 弱网可用。
+               updateViaCache:'none' —— sw.js 本体绝不走 HTTP 缓存，保证服务端一发新版
+               （CACHE 版本号变更）本次加载就能检测到并激活，不让设备卡在旧壳上 */
             if ('serviceWorker' in navigator) {
               window.addEventListener('load', function(){
-                navigator.serviceWorker.register('/sw.js').catch(function(){ /* 注册失败不影响聊天 */ });
+                navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
+                  .catch(function(){ /* 注册失败不影响聊天 */ });
               });
             }
           })();

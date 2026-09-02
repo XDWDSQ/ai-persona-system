@@ -278,6 +278,30 @@ def test_persona_single_source(client):
           f"status={r2.status_code}")
 
 
+def test_roles_apply_single_source(client):
+    """切角色（POST /api/roles/apply）同样遵循人设单一真值：不把角色 persona 复制到顶层。
+    （第四轮曾漏改此路径，导致每次切角色把顶层 persona 重新写回，破坏去重成果。）"""
+    cfg = json.loads(server.CONFIG_PATH.read_text(encoding="utf-8"))
+    cfg["active_role"] = "dashuai"
+    cfg["roles"] = {
+        "dashuai": {"name": "大帅", "persona": "大帅人设", "news": {"auto_refresh": False}},
+        "xiaoni": {"name": "小拟", "persona": "小拟人设", "news": {"auto_refresh": False}},
+    }
+    cfg["persona"] = "旧顶层人设"  # 存量重复：模拟旧版双写残留
+    server.CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    server._cfg_cache["_mtime_ns"] = 0
+    r = client.post("/api/roles/apply", json={"key": "xiaoni"})
+    check("切角色返回 ok", r.status_code == 200 and r.json().get("ok") is True,
+          f"status={r.status_code} data={r.json()}")
+    disk = json.loads(server.CONFIG_PATH.read_text(encoding="utf-8"))
+    check("切角色后顶层 persona 不再被复制",
+          disk.get("persona") == "旧顶层人设", str(disk.get("persona")))
+    check("切角色返回值 persona 来自角色",
+          r.json().get("persona") == "小拟人设", str(r.json()))
+    check("current_persona 返回新角色人设",
+          server.current_persona(disk) == "小拟人设", server.current_persona(disk))
+
+
 def test_health(client):
     r = client.get("/api/health")
     data = r.json()
@@ -296,6 +320,7 @@ def main():
             test_sessions_roundtrip(client)
             test_placeholder_sessions_filtered(client)
             test_persona_single_source(client)
+            test_roles_apply_single_source(client)
             test_health(client)
         test_apply_env_overrides()
     finally:

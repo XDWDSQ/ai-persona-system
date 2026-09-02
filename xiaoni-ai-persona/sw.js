@@ -1,7 +1,7 @@
 /* 小拟 PWA Service Worker —— 应用壳缓存，替代原 APK 的秒开体验。
    策略：导航请求网络优先（更新即时生效，离线回退缓存）；
    静态资源缓存优先 + 后台刷新；API 与上传目录一律不缓存。 */
-var CACHE = 'xiaoni-shell-v3';
+var CACHE = 'xiaoni-shell-v4';
 var SHELL = [
   '/pages/chat.html',
   '/pages/css/chat.css',

@@ -2638,7 +2638,9 @@ async def access_gate(request: Request, call_next):
     path = request.url.path
     # PWA 元数据（manifest/图标）不含敏感信息，且系统级安装流程与首帧 manifest
     # 拉取可能不携带会话 cookie（登录 cookie 写入竞态），放行避免首装报错。
-    if path in ("/api/health", "/api/activity", "/api/login", "/login", "/manifest.webmanifest") \
+    # sw.js 同理：不含数据且是缓存更新入口，被 302 拦会让设备永远卡在旧版前端。
+    if path in ("/api/health", "/api/activity", "/api/login", "/login",
+                "/manifest.webmanifest", "/sw.js") \
             or path.startswith("/icons/"):
         return await call_next(request)
     if _auth_ok(request, token):
@@ -2719,13 +2721,36 @@ async def login_page():
     return HTMLResponse(_LOGIN_PAGE_HTML)
 
 
+# 登录限流：按来源 IP 记录连续失败次数，达到上限锁定（防隧道公网在线爆破）。
+# 锁定在 _LOGIN_LOCK_SECONDS 后自动过期；成功登录清零。_login_track 供测试直接 clear。
+_LOGIN_FAIL_MAX = 8
+_LOGIN_LOCK_SECONDS = 600
+_login_track: dict[str, dict] = {}
+
+
+def _login_locked(ip: str) -> bool:
+    rec = _login_track.get(ip)
+    if not rec:
+        return False
+    if time.time() - rec["first"] > _LOGIN_LOCK_SECONDS:
+        _login_track.pop(ip, None)
+        return False
+    return rec["fails"] >= _LOGIN_FAIL_MAX
+
+
 @app.post("/api/login")
 async def login_api(req: Request, payload: LoginRequest):
+    ip = req.client.host if req.client else "?"
+    if _login_locked(ip):
+        raise HTTPException(429, "失败次数过多，请 10 分钟后再试")
     token = _access_token()
     if not token or not hmac.compare_digest(payload.token.strip(), token):
+        rec = _login_track.setdefault(ip, {"fails": 0, "first": time.time()})
+        rec["fails"] += 1
         # 固定退避：经隧道暴露公网时显著拖慢在线爆破
         await asyncio.sleep(1.0)
         raise HTTPException(401, "访问口令错误")
+    _login_track.pop(ip, None)
     resp = JSONResponse({"ok": True})
     resp.set_cookie(_COOKIE_NAME, token, httponly=True, samesite="lax",
                     secure=req.url.scheme == "https", max_age=30 * 86400)
@@ -4263,6 +4288,7 @@ def _fix_addressing(text: str) -> str:
     text = _re.sub(r"的女生", "的人", text)
     text = _re.sub(r"的的人", "的人", text)
     text = _re.sub(r"人家可", "我可", text)
+    text = text.replace("本宝宝", "我")
     text = text.replace("小棉袄", "贴心人")
     text = _re.sub(r"小仙女", "宝贝", text)
     # 6) Qwen3 thinking 泄漏：模型偶发先输出内部推理（"好的，在处理..."等）再输出回复。
@@ -4279,8 +4305,11 @@ def _fix_addressing(text: str) -> str:
                     text = rest
         if text.startswith(marker):
             break
-    # 5) 英文夹杂（保留 KPL/AG/MVP/BO7/FMVP/KWC/TTG 等大写赛事术语）
-    text = _re.sub(r"(?<![A-Z])(?![A-Z])[a-zA-Z]{2,}(?![A-Z])", "", text)
+    # 5) 英文夹杂（保留 KPL/AG/MVP/BO7/FMVP/KWC/TTG 等大写赛事术语；
+    #    小写游戏术语 carry/bp/solo 等也保留，其余小写英文视为口癖清理）
+    _esports_keep = {"carry", "bp", "solo", "buff", "nerf", "gank", "poke"}
+    text = _re.sub(r"(?<![A-Z])(?![A-Z])[a-zA-Z]{2,}(?![A-Z])",
+                   lambda m: m.group(0) if m.group(0).lower() in _esports_keep else "", text)
     # 6) 残留的风格/状态标记：[:xxx] (:xxx) [state:xxx] 等（8B 模型输出的变体格式）
     text = _re.sub(r"\[[:：]\s*[^\]\r\n]{0,12}\]", "", text)
     text = _re.sub(r"\([:：]\s*[^\)\r\n]{0,12}\)", "", text)
@@ -5082,6 +5111,12 @@ def _is_test_session(item) -> bool:
     return isinstance(sid, str) and sid.startswith(_TEST_SESSION_PREFIX)
 
 
+def _sessions_fp(payload_str: str) -> str:
+    """sessions.json 内容的轻量指纹（sha1 前 16 位）：多端同步用于快速判断
+    服务端数据是否变化，避免每轮比对都让前端拉全量再本地合并。"""
+    return hashlib.sha1(payload_str.encode("utf-8")).hexdigest()[:16]
+
+
 @app.get("/api/sessions")
 async def get_sessions(include_test: int = 0):
     """读取持久化的会话历史（data/sessions.json），文件不存在或损坏时返回空列表。
@@ -5089,11 +5124,11 @@ async def get_sessions(include_test: int = 0):
     deleted 为删除墓碑列表（多端同步用：任一端删除的会话不应被另一端复活）。
     默认过滤测试会话（id 以 t- 开头），include_test=1 时全部返回。"""
     if not SESSIONS_PATH.exists():
-        return {"sessions": [], "deleted": []}
+        return {"sessions": [], "deleted": [], "fp": ""}
     try:
         mtime = SESSIONS_PATH.stat().st_mtime_ns
     except OSError:
-        return {"sessions": [], "deleted": []}
+        return {"sessions": [], "deleted": [], "fp": ""}
     if mtime != _sess_cache["_mtime_ns"]:
         try:
             raw = await asyncio.to_thread(SESSIONS_PATH.read_text, encoding="utf-8")
@@ -5105,9 +5140,10 @@ async def get_sessions(include_test: int = 0):
                 "sessions": sessions if isinstance(sessions, list) else [],
                 "deleted": deleted if isinstance(deleted, list) else [],
             }
+            fp = _sessions_fp(raw)
         except (json.JSONDecodeError, OSError, AttributeError):
             # 读/解析失败不动缓存（可能是瞬时故障），本次返回空即可
-            return {"sessions": [], "deleted": []}
+            return {"sessions": [], "deleted": [], "fp": ""}
         # 复核窗口：读盘期间可能有并发 put_sessions 写了新文件。
         # 持锁后再看 mtime，文件已变就放弃本次缓存更新（下一请求重读），
         # 避免旧内容覆盖并发写入的新缓存
@@ -5119,6 +5155,7 @@ async def get_sessions(include_test: int = 0):
             if cur_mtime == mtime:
                 _sess_cache["_value"] = value
                 _sess_cache["_mtime_ns"] = mtime
+                _sess_cache["_fp"] = fp
     value = _sess_cache["_value"]
     sessions = list(value.get("sessions", []))
     deleted = list(value.get("deleted", []))
@@ -5127,7 +5164,21 @@ async def get_sessions(include_test: int = 0):
         # 真实前端（手机/桌面）永远收不到，也就不会显示在会话列表。
         sessions = [s for s in sessions if not _is_test_session(s)]
         deleted = [t for t in deleted if not _is_test_session(t)]
-    return {"sessions": sessions, "deleted": deleted}
+    return {"sessions": sessions, "deleted": deleted, "fp": _sess_cache.get("_fp", "")}
+
+
+@app.get("/api/sessions/fingerprint")
+async def sessions_fingerprint():
+    """轻量指纹探测：只返回 sessions.json 的内容指纹，供多端判断是否需要拉全量。"""
+    if not SESSIONS_PATH.exists():
+        return {"fp": ""}
+    try:
+        mtime = SESSIONS_PATH.stat().st_mtime_ns
+    except OSError:
+        return {"fp": ""}
+    if mtime != _sess_cache.get("_mtime_ns"):
+        await get_sessions()  # 走一次带缓存的完整读取，刷新 _fp
+    return {"fp": _sess_cache.get("_fp", "")}
 
 
 @app.put("/api/sessions")
@@ -5202,8 +5253,9 @@ async def put_sessions(req: SessionsRequest, client: str = ""):
         except OSError:
             _sess_cache["_mtime_ns"] = 0
         _sess_cache["_value"] = payload_obj
+        _sess_cache["_fp"] = _sessions_fp(payload_str)
     _broadcast_sessions_changed(client)
-    return {"ok": True}
+    return {"ok": True, "fp": _sess_cache.get("_fp", "")}
 
 
 @app.get("/api/sync/stream")
@@ -5316,12 +5368,14 @@ def _merge_config_update(cfg: dict, upd: ConfigUpdate) -> None:
         cloud_cfg["billing_mode"] = upd.cloud_billing_mode
         entry["billing_mode"] = upd.cloud_billing_mode
     if upd.persona:
-        # 人设双写：顶层字段与当前角色的 persona 同步更新，杜绝两份文本漂移
-        # （current_persona 读取时角色 persona 优先，只写顶层会导致编辑"不生效"的错觉）
-        cfg["persona"] = upd.persona
+        # 人设单一真值：当前角色存在时只写 roles[active].persona，顶层不再复制
+        # （两份大文本重复存储且易漂移；current_persona 读取时角色 persona 优先，
+        #   行为不变）。无角色（遗留配置）时才写顶层兜底。
         role = (cfg.get("roles") or {}).get(cfg.get("active_role", "") or "")
         if isinstance(role, dict):
             role["persona"] = upd.persona
+        else:
+            cfg["persona"] = upd.persona
     if upd.voice_language:
         cfg.setdefault("voice", {})["language"] = upd.voice_language
     # 声音克隆引擎（与对话 API 完全独立的另一套配置）
@@ -5402,7 +5456,8 @@ async def roles_apply(req: dict):
         if not role:
             raise HTTPException(404, f"未知角色: {key}")
         cfg["active_role"] = key
-        cfg["persona"] = role.get("persona") or cfg.get("persona", "")
+        # 人设单一真值：切角色不把 persona 复制到顶层（current_persona 读角色优先，
+        # 顶层 persona 仅作遗留配置兜底，不再被写回，避免两份大文本再次漂移）
         v = role.get("voice", {})
         cfg.setdefault("voice", {})
         if not cfg["voice"].get("manual_provider"):
@@ -5415,7 +5470,7 @@ async def roles_apply(req: dict):
     # 按需模式（auto_refresh=false）跳过自动搜索，动态由人工写入
     if _role_news_auto_refresh():
         _spawn_bg(_bg_role_news_refresh(force=True))
-    return {"ok": True, "role": key, "persona": cfg["persona"]}
+    return {"ok": True, "role": key, "persona": role.get("persona") or cfg.get("persona", "")}
 
 
 # ------------------------------------------------------------ 2027 赛季剧情分支 --------
@@ -5661,11 +5716,14 @@ async def upload_files(files: list[UploadFile] = File(...)):
         if suffix not in _ALLOWED_ATTACH_SUFFIXES:
             _cleanup_batch()
             raise HTTPException(400, f"不支持的文件类型: {suffix or '无扩展名'}（{original}）")
-        stored = f"att_{uuid.uuid4().hex[:12]}{suffix}"
-        dest = UPLOAD_DIR / stored
+        # 内容寻址：文件名 = 内容 sha256 前 12 位。同一文件重复上传（改备注名/重发）
+        # 直接命中已有文件，不占双份磁盘，URL 也稳定（历史消息里的链接仍然有效）。
+        tmp = UPLOAD_DIR / f"att_inflight_{uuid.uuid4().hex[:12]}{suffix}"
+        dest = tmp
         total = 0
+        h = hashlib.sha256()
         try:
-            with dest.open("wb") as fout:
+            with tmp.open("wb") as fout:
                 while True:
                     chunk = await f.read(256 * 1024)
                     if not chunk:
@@ -5675,21 +5733,28 @@ async def upload_files(files: list[UploadFile] = File(...)):
                         raise HTTPException(
                             413, f"文件过大（上限 {_MAX_ATTACH_UPLOAD_BYTES // 1024 // 1024}MB）"
                         )
+                    h.update(chunk)
                     # 同步写盘丢线程池：Windows 杀软扫描下单次 write 可达数十 ms，会卡住 SSE 流
                     await asyncio.to_thread(fout.write, chunk)
         except HTTPException:
-            dest.unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)
             _cleanup_batch()
             raise
         except OSError as exc:
-            dest.unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)
             _cleanup_batch()
             raise HTTPException(500, f"上传保存失败: {exc}")
         if total == 0:
-            dest.unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)
             _cleanup_batch()
             raise HTTPException(400, f"文件为空: {original}")
-        written.append(dest)
+        dest = UPLOAD_DIR / f"att_{h.hexdigest()[:12]}{suffix}"
+        if dest.exists() and dest.stat().st_size == total:
+            tmp.unlink(missing_ok=True)  # 已有同内容文件：去重复用
+        else:
+            tmp.replace(dest)
+            written.append(dest)
+        stored = dest.name
         kind = "image" if suffix in _IMAGE_SUFFIXES else ("doc" if suffix in _DOC_SUFFIXES else "file")
         # iPhone 照片默认 HEIC：文件后缀可能是 .jpg 但内容仍是 HEIC，浏览器 img 无法解码，
         # 云端视觉模型也只认 bmp/gif/png/jpeg/webp。上传时直接转成 JPEG 存盘，

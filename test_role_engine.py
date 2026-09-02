@@ -140,9 +140,10 @@ def test_emotion_decay():
     # 模拟 5 小时前更新：手动改 last_update 并落盘
     st2 = st.get_decayed()
     st2["last_update"] = (datetime.now().astimezone() - timedelta(hours=5)).isoformat(timespec="seconds")
-    # 直接通过内部落盘
-    from role_engine import _atomic_write
-    _atomic_write(st.path, st2)
+    # 通过 _save 落盘（内部会置空 _cache，强制下次 get_decayed 重新读盘）；
+    # 直接用 _atomic_write 不失效缓存，Windows 下 mtime 纳秒精度不足会偶发命中
+    # 旧缓存导致"5h 后不衰减"的 flaky 失败。
+    st._save(st2)
     st3 = st.get_decayed()
     check("情绪衰减：5h 后向基线靠拢", st3["emotion"]["valence"] < st2["emotion"]["valence"] and st3["emotion"]["valence"] > 0.2,
           f"before={st2['emotion']['valence']:.3f} after={st3['emotion']['valence']:.3f}")
