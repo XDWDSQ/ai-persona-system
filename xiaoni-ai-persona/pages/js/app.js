@@ -289,7 +289,9 @@
                   div = addMsg('assistant', clean);
                 } else {
                   var b2 = div.querySelector('.bubble');
-                  b2.textContent = clean; /* 以 clean 为准：剥净残留 style/元话语标记 */
+                  /* 以 clean 为准：剥净残留 style/元话语标记；走 fillBubbleText 保留
+                     APK 点字跳播的 .tts-seg 分段（直接 textContent 会销毁分段） */
+                  fillBubbleText(b2, clean);
                   b2.classList.remove('no-text');
                 }
                 var meta = div.querySelector('.msg-meta');
@@ -313,7 +315,7 @@
                   f2.history.push({ role: 'assistant', content: kept, style: style || '' });
                   markSessionActivity(sessionId);
                   if (div && div.querySelector('.bubble')) {
-                    div.querySelector('.bubble').textContent = kept;
+                    fillBubbleText(div.querySelector('.bubble'), kept);
                     div.classList.remove('no-text');
                   }
                   toast('网络中断，已保留已生成的内容');
@@ -435,7 +437,7 @@
             var ct = document.getElementById('cloud_thinking');
             /* 仅在后端明确给出布尔值时回填：老配置缺字段时保留用户当前选择，不强制改回开启 */
             if (ct && typeof cc.thinking === 'boolean') ct.checked = cc.thinking;
-            document.getElementById('persona').value = s.persona;
+            document.getElementById('persona').value = s.persona || '';
             var va = s.voice_aliyun || {};
             document.getElementById('aliyun_api_key').value = va.api_key || '';
             document.getElementById('aliyun_base_url').value = va.base_url || 'https://dashscope.aliyuncs.com/api/v1';
@@ -813,6 +815,30 @@
             });
             bubble.parentNode.insertBefore(wrap, bubble);
           }
+          /* assistant 气泡填字：APK（AndroidBridge）环境按句切 .tts-seg span，
+             供「点击文字跳转音频进度」；其余环境直接 textContent。
+             流式收尾也必须走这里——直接 textContent 整段覆盖会把分段结构销毁，
+             导致点字跳播失效。 */
+          function fillBubbleText(bubble, text) {
+            if (!window.AndroidBridge || !text) { bubble.textContent = text || ''; return; }
+            var parts = [], cur = '', _i;
+            for (_i = 0; _i < text.length; _i++) {
+              cur += text[_i];
+              if (/[。！？…；\n]/.test(text[_i]) || cur.length >= 24) { parts.push(cur); cur = ''; }
+            }
+            if (cur) parts.push(cur);
+            var cs = 0, frag = document.createDocumentFragment();
+            parts.forEach(function(p){
+              var sp = document.createElement('span');
+              sp.className = 'tts-seg';
+              sp.dataset.cs = cs;  /* 该块在全文中的字符起始偏移 */
+              sp.textContent = p;
+              frag.appendChild(sp);
+              cs += p.length;
+            });
+            bubble.textContent = '';
+            bubble.appendChild(frag);
+          }
           function addMsg(role, text, opts) {
             opts = opts || {};
             if (role === 'assistant') text = stripStyleTag(text);  // 展示前剥离残留标记
@@ -850,24 +876,9 @@
               });
             }
             var bubble = div.querySelector('.bubble');
-            if (text && window.AndroidBridge && role === 'assistant') {
+            if (text && role === 'assistant') {
               /* APK 播放中对齐：assistant 消息文字按句切块，点击跳转对应音频位置 */
-              var parts = [], cur = '', _i;
-              for (_i = 0; _i < text.length; _i++) {
-                cur += text[_i];
-                if (/[。！？…；\n]/.test(text[_i]) || cur.length >= 24) { parts.push(cur); cur = ''; }
-              }
-              if (cur) parts.push(cur);
-              var cs = 0, frag = document.createDocumentFragment();
-              parts.forEach(function(p){
-                var sp = document.createElement('span');
-                sp.className = 'tts-seg';
-                sp.dataset.cs = cs;  /* 该块在全文中的字符起始偏移 */
-                sp.textContent = p;
-                frag.appendChild(sp);
-                cs += p.length;
-              });
-              bubble.appendChild(frag);
+              fillBubbleText(bubble, text);
             } else if (text) {
               bubble.textContent = text;
             } else {
@@ -2570,6 +2581,8 @@
               };
               /* 断线由 EventSource 自动重连（服务端 retry: 3000）；
                  重连失败期间的变更由下方可见性/定时轮询兜底补齐 */
+              /* 页面卸载/后台冻结时主动断开，避免服务端挂着死连接 */
+              window.addEventListener('pagehide', function(){ try { es.close(); } catch (e) {} });
             } catch (e) {}
           }
           startSyncStream();
@@ -2697,7 +2710,9 @@
             stopAudio();
             state.playSeq++; /* 切换会话：作废所有在飞/挂起的朗读请求，防止旧结果晚到抢播 */
             hideTyping();
-            msgsInner.querySelectorAll('.msg').forEach(function(m){ m.remove(); });
+            /* 连 .msg-guide（2027 剧情引导卡）一起清：它的类名不含 .msg，
+               漏清会残留，切回时叠加一张新卡 */
+            msgsInner.querySelectorAll('.msg, .msg-guide').forEach(function(m){ m.remove(); });
             var s = currentSession();
             state.history = s ? s.history : [];
             /* 有历史消息时收起欢迎区：landing 状态与聊天记录不该同屏 */
@@ -2735,9 +2750,17 @@
                 if (stickBottom) snapBottom();
               }).catch(function(){});
             }
-            (state.history || []).forEach(function(m, i){
+            /* 历史窗口化：长会话首屏只渲染最近 HISTORY_WINDOW 条，更早的收进顶部
+               「加载更早」按钮（每次补 HISTORY_CHUNK 条）。上千条历史一次性建 DOM
+               会卡死切会话/重渲染；hidx 始终用真实下标，编辑/删除/重生成都按它寻址 */
+            var hist = state.history || [];
+            var from = Math.max(0, hist.length - HISTORY_WINDOW);
+            historyRenderedFrom = from;
+            if (from > 0) frag.appendChild(makeLoadEarlierBtn());
+            hist.slice(from).forEach(function(m, k){
+              var i = from + k;
               /* 长历史（>16 条）瞬时渲染：不播入场动画，切会话零等待也不掉帧 */
-              var animOn = state.history.length <= 16;
+              var animOn = hist.length <= 16;
               /* 旁白双声部：assistant 消息带 narration 时先渲染旁白气泡（不占 hidx、不带按钮） */
               if (m.role === 'assistant' && m.narration) {
                 addMsg('narration', m.narration, {
@@ -2745,7 +2768,7 @@
                 });
               }
               var div = addMsg(m.role, m.content, {
-                delay: animOn ? Math.min(i * 45, 400) : 0, noScroll: true,
+                delay: animOn ? Math.min(k * 45, 400) : 0, noScroll: true,
                 attachments: m.attachments || [], animate: animOn,
                 container: frag
               });

@@ -414,6 +414,8 @@
         .session .s-time{font-family:var(--font-mono);font-size:10px;opacity:.7;flex:none}
         .session:hover{background:var(--accent);color:var(--foreground)}
         .session.active{background:color-mix(in srgb,var(--chart-2) 13%,var(--card));color:var(--foreground);box-shadow:inset 2px 0 0 var(--chart-2)}
+        /* 置顶会话：淡底色标识（配合 .s-pin 图钉图标），与普通会话拉开层次 */
+        .session.pinned:not(.active){background:color-mix(in srgb,var(--chart-2) 5%,transparent)}
         .session.active svg{color:var(--chart-2);opacity:1}
         .role-list{padding:0 8px 8px;display:flex;flex-direction:column;gap:2px;max-height:230px;overflow-y:auto}
         .story-entry{margin:2px 8px 8px;display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:10px;border:1px dashed color-mix(in srgb,var(--chart-2) 55%,transparent);background:color-mix(in srgb,var(--chart-2) 7%,transparent);color:var(--chart-2);font-size:12.5px;font-weight:600;text-decoration:none;transition:background .2s ease}
@@ -669,7 +671,9 @@
         /* ===== Provider row 微动效已随「不可点击状态卡」化移除 ===== */
         .role-caret{display:inline-block;transition:transform .25s cubic-bezier(.2,.7,.2,1)}
         .role-label.collapsed .role-caret{transform:rotate(-90deg)}
-        .role-list{overflow:hidden;transition:max-height .35s cubic-bezier(.2,.7,.2,1),opacity .3s ease,margin .3s ease}
+        /* 只锁横向：保留第 418 行的 overflow-y:auto，角色超出 230px 时可滚动；
+           折叠态靠 max-height:0 + 滚动端口裁剪，无需 overflow:hidden */
+        .role-list{overflow-x:hidden;transition:max-height .35s cubic-bezier(.2,.7,.2,1),opacity .3s ease,margin .3s ease}
         .role-list.collapsed{max-height:0 !important;opacity:0;margin:0}
 
         /* ===== 细节打磨：排版/滚动条/聚焦/选区/图标动效 ===== */
@@ -783,9 +787,6 @@
           .ctx-menu button{padding:11px 10px}
           #settings .set-panel{width:min(520px,calc(100vw - 20px))}
           #settings .set-foot{padding-bottom:calc(16px + env(safe-area-inset-bottom,0px))}
-        }
-        @media (max-width:640px){
-          /* 窄屏：优先保标题与发送区 */
         }
         /* ===== 动画增强：欢迎区入场 / 侧栏错峰 / 朗读状态 / Toast 进度条 ===== */
         @keyframes riseIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
