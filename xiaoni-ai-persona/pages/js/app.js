@@ -65,7 +65,38 @@
               ta.placeholder = ph;
             };
             ta.addEventListener('input', grow);
+            /* 输入即存草稿（防抖 300ms）：刷新/掉线/切会话都不丢未发送内容 */
+            ta.addEventListener('input', function(){ saveDraft(false); });
             grow();
+          }
+
+          /* ---------- 输入草稿：按会话分开存，刷新或切会话后自动恢复 ---------- */
+          var _draftTimer = 0;
+          function draftKey(id){ return 'xiaoni_draft_' + id; }
+          function saveDraft(immediate){
+            if (!ta) return;
+            var persist = function(){
+              try {
+                var v = ta.value;
+                if (v) localStorage.setItem(draftKey(currentSessionId), v);
+                else localStorage.removeItem(draftKey(currentSessionId));
+              } catch (e) {}
+            };
+            if (immediate) { clearTimeout(_draftTimer); persist(); return; }
+            clearTimeout(_draftTimer);
+            _draftTimer = setTimeout(persist, 300);
+          }
+          function restoreDraft(){
+            if (!ta) return;
+            var v = '';
+            try { v = localStorage.getItem(draftKey(currentSessionId)) || ''; } catch (e) {}
+            if (ta.value !== v) {
+              ta.value = v;
+              ta.dispatchEvent(new Event('input'));  /* 触发 auto-grow 恢复高度 */
+            }
+          }
+          function clearDraft(){
+            try { localStorage.removeItem(draftKey(currentSessionId)); } catch (e) {}
           }
 
           /* ---------- toast ---------- */
@@ -2201,6 +2232,7 @@
           if (sendBtn) sendBtn.addEventListener('click', function(){
             var t = document.getElementById('text');
             var v = t.value; t.value = ''; t.style.height = 'auto';
+            clearDraft();  /* 已发出：清掉该会话草稿 */
             send(v);
           });
           if (ta) ta.addEventListener('keydown', function(e){
@@ -2208,6 +2240,31 @@
                keyCode 229 双守卫（部分 IME 只暴露其中一种信号） */
             if (e.isComposing || e.keyCode === 229) return;
             if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (sendBtn) sendBtn.click(); }
+          });
+          /* 粘贴板文件（截图/复制的图片等）直接进待发送附件；
+             不 preventDefault，文本内容照常粘贴 */
+          if (ta) ta.addEventListener('paste', function(e){
+            var items = e.clipboardData && e.clipboardData.items;
+            if (!items) return;
+            var files = [];
+            for (var i = 0; i < items.length; i++) {
+              if (items[i].kind === 'file') {
+                var f = items[i].getAsFile();
+                if (f) files.push(f);
+              }
+            }
+            if (!files.length) return;
+            var pad = function(n){ return (n < 10 ? '0' : '') + n; };
+            files.forEach(function(f){
+              /* 截图通常无名（image.png），给个可读的唯一名 */
+              var ext = ((f.type || '').split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png';
+              var d = new Date();
+              var name = '粘贴-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
+                         '-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + '.' + ext;
+              try { addPendingAttachment(new File([f], name, { type: f.type })); }
+              catch (err) { addPendingAttachment(f); }
+            });
+            toast('已添加 ' + files.length + ' 个粘贴的文件');
           });
           if (attachBtn && attachMenu) {
             attachBtn.addEventListener('click', function(e){ e.stopPropagation(); toggleAttachMenu(); });
@@ -2348,7 +2405,7 @@
             else saveTimer = setTimeout(doSave, 300);
           }
           /* 关页/刷新前兜底刷盘，避免 300ms 防抖窗口内的消息丢失 */
-          window.addEventListener('pagehide', function(){ saveSessions(true); });
+          window.addEventListener('pagehide', function(){ saveSessions(true); saveDraft(true); });
           function findSession(id) {
             for (var i = 0; i < sessions.length; i++) {
               if (sessions[i].id === id) return sessions[i];
@@ -2706,6 +2763,52 @@
             sessionsBox.appendChild(frag);
             sessionsAnimatedOnce = true;
           }
+          /* 历史窗口化参数与「加载更早」按钮（渲染逻辑见 renderCurrentSession） */
+          var HISTORY_WINDOW = 60, HISTORY_CHUNK = 40;
+          var historyRenderedFrom = 0;  /* 当前已渲染的历史起始下标 */
+          function renderHistoryRange(rangeFrom, rangeTo, container) {
+            var hist = state.history || [];
+            hist.slice(rangeFrom, rangeTo).forEach(function(m, k){
+              var i = rangeFrom + k;
+              if (m.role === 'assistant' && m.narration) {
+                addMsg('narration', m.narration, { noScroll: true, animate: false, container: container });
+              }
+              var div = addMsg(m.role, m.content, {
+                noScroll: true, attachments: m.attachments || [], animate: false, container: container
+              });
+              div.dataset.hidx = String(i);
+              if (m.role === 'assistant') {
+                var meta = div.querySelector('.msg-meta');
+                meta.appendChild(makeSpeakBtn(m.content, m.style || '', m, currentSessionId));
+                meta.appendChild(makeResynthBtn(m.content, m.style || '', m, currentSessionId));
+                meta.appendChild(makeRegenBtn(div));
+              }
+            });
+          }
+          function makeLoadEarlierBtn() {
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'load-earlier';
+            btn.textContent = '加载更早消息（还有 ' + historyRenderedFrom + ' 条）';
+            btn.addEventListener('click', function(){
+              var scroller = document.getElementById('msgs');
+              var prevH = scroller ? scroller.scrollHeight : 0;
+              var newFrom = Math.max(0, historyRenderedFrom - HISTORY_CHUNK);
+              var frag = document.createDocumentFragment();
+              renderHistoryRange(newFrom, historyRenderedFrom, frag);
+              historyRenderedFrom = newFrom;
+              if (newFrom > 0) {
+                btn.textContent = '加载更早消息（还有 ' + newFrom + ' 条）';
+                msgsInner.insertBefore(frag, btn);
+              } else {
+                msgsInner.insertBefore(frag, btn);
+                btn.remove();
+              }
+              /* 视口锚定：新内容插在上方会把视口顶走，按高度差补回 scrollTop */
+              if (scroller) scroller.scrollTop += (scroller.scrollHeight - prevH);
+            });
+            return btn;
+          }
           function renderCurrentSession() {
             stopAudio();
             state.playSeq++; /* 切换会话：作废所有在飞/挂起的朗读请求，防止旧结果晚到抢播 */
@@ -2794,6 +2897,7 @@
             }
             updateChatTitle();
             scrollBottom(true);
+            restoreDraft();  /* 恢复当前会话未发送的草稿 */
           }
           function switchSession(id) {
             if (id === currentSessionId) return;
