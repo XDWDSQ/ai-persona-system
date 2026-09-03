@@ -2813,9 +2813,9 @@
             stopAudio();
             state.playSeq++; /* 切换会话：作废所有在飞/挂起的朗读请求，防止旧结果晚到抢播 */
             hideTyping();
-            /* 连 .msg-guide（2027 剧情引导卡）一起清：它的类名不含 .msg，
-               漏清会残留，切回时叠加一张新卡 */
-            msgsInner.querySelectorAll('.msg, .msg-guide').forEach(function(m){ m.remove(); });
+            /* 连 .msg-guide（2027 剧情引导卡）与 .load-earlier（窗口化按钮）一起清：
+               类名都不含 .msg，漏清会残留并叠加（多次重渲染出现多张卡/多个按钮） */
+            msgsInner.querySelectorAll('.msg, .msg-guide, .load-earlier').forEach(function(m){ m.remove(); });
             var s = currentSession();
             state.history = s ? s.history : [];
             /* 有历史消息时收起欢迎区：landing 状态与聊天记录不该同屏 */
