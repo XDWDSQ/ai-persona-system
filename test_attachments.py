@@ -75,6 +75,37 @@ def test_upload_dedup(client):
     _UPLOAD_CLEANUP.append(path)
 
 
+def test_upload_heic_dedup(client):
+    """HEIC 转码后按转码结果内容寻址：重复上传同一 HEIC 应去重命中同一 URL，
+    且落盘内容是转码后的 JPEG（文件名哈希 = 内容哈希）。"""
+    import hashlib
+    orig_heic = server._heic_to_jpeg_bytes
+    # 固定转码结果，避免依赖真实 pillow_heif/PIL
+    jpeg_bytes = b"\xff\xd8\xff\xe0" + b"\x99" * 64  # 假的 JPEG 头 + 填充
+    server._heic_to_jpeg_bytes = lambda raw: jpeg_bytes
+    # ISO-BMFF 容器：4:8 = 'ftyp'，触发 HEIC 转码分支
+    heic = b"\x00\x00\x00\x18" + b"ftyp" + b"heic" + b"\x00" * 16
+    try:
+        r1 = client.post("/api/upload", files=[("files", ("photo.jpg", heic, "image/jpeg"))])
+        r2 = client.post("/api/upload", files=[("files", ("photo2.jpg", heic, "image/jpeg"))])
+        d1, d2 = r1.json(), r2.json()
+        u1 = d1["files"][0]
+        check("HEIC 上传转码后返回 .jpg", r1.status_code == 200 and u1["suffix"] == ".jpg",
+              f"status={r1.status_code} data={d1}")
+        check("重复上传同一 HEIC 命中同一 URL（去重）",
+              r1.status_code == 200 and r2.status_code == 200 and u1["url"] == d2["files"][0]["url"],
+              f"{d1} vs {d2}")
+        path = server.UPLOAD_DIR / Path(u1["url"]).name
+        disk = path.read_bytes() if path.is_file() else b""
+        expect_prefix = "att_" + hashlib.sha256(jpeg_bytes).hexdigest()[:12]
+        check("落盘内容为转码后 JPEG（文件名哈希=内容哈希）",
+              disk == jpeg_bytes and path.name.startswith(expect_prefix) and path.name.endswith(".jpg"),
+              f"name={path.name} size={len(disk)}")
+        _UPLOAD_CLEANUP.append(path)
+    finally:
+        server._heic_to_jpeg_bytes = orig_heic
+
+
 def test_chat_vision(client):
     orig_load = server.load_config
     orig_vision = server._try_vision_chat
@@ -166,6 +197,7 @@ def main():
         with TestClient(server.app) as client:
             test_upload(client)
             test_upload_dedup(client)
+            test_upload_heic_dedup(client)
             test_chat_vision(client)
             test_chat_attachment_fallback(client)
             test_text_doc_prompt()

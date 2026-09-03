@@ -5719,7 +5719,6 @@ async def upload_files(files: list[UploadFile] = File(...)):
         # 内容寻址：文件名 = 内容 sha256 前 12 位。同一文件重复上传（改备注名/重发）
         # 直接命中已有文件，不占双份磁盘，URL 也稳定（历史消息里的链接仍然有效）。
         tmp = UPLOAD_DIR / f"att_inflight_{uuid.uuid4().hex[:12]}{suffix}"
-        dest = tmp
         total = 0
         h = hashlib.sha256()
         try:
@@ -5748,35 +5747,37 @@ async def upload_files(files: list[UploadFile] = File(...)):
             tmp.unlink(missing_ok=True)
             _cleanup_batch()
             raise HTTPException(400, f"文件为空: {original}")
-        dest = UPLOAD_DIR / f"att_{h.hexdigest()[:12]}{suffix}"
+        # iPhone 照片默认 HEIC：后缀可能是 .jpg 但内容仍是 HEIC，浏览器 img 无法解码，
+        # 云端视觉模型也只认 bmp/gif/png/jpeg/webp。在确定内容寻址哈希之前就转成 JPEG，
+        # 保证「文件名哈希 = 最终内容哈希」——否则转码后文件大小变化，会让下面的
+        # st_size 去重失效，重复上传同一 HEIC 时每次都重转码。
+        final_suffix = suffix
+        if suffix in _IMAGE_SUFFIXES:
+            try:
+                raw = await asyncio.to_thread(tmp.read_bytes)
+                if len(raw) >= 12 and raw[:4] != b"\xff\xd8\xff" and raw[4:8] == b"ftyp":
+                    jpeg = await asyncio.to_thread(_heic_to_jpeg_bytes, raw)
+                    if jpeg:
+                        h = hashlib.sha256(jpeg)  # 按转码结果重新寻址
+                        total = len(jpeg)
+                        final_suffix = ".jpg"
+                        await asyncio.to_thread(tmp.write_bytes, jpeg)
+            except OSError:
+                pass  # 转码失败保留原文件，交给视觉链路兜底转码
+        dest = UPLOAD_DIR / f"att_{h.hexdigest()[:12]}{final_suffix}"
         if dest.exists() and dest.stat().st_size == total:
             tmp.unlink(missing_ok=True)  # 已有同内容文件：去重复用
         else:
             tmp.replace(dest)
             written.append(dest)
         stored = dest.name
-        kind = "image" if suffix in _IMAGE_SUFFIXES else ("doc" if suffix in _DOC_SUFFIXES else "file")
-        # iPhone 照片默认 HEIC：文件后缀可能是 .jpg 但内容仍是 HEIC，浏览器 img 无法解码，
-        # 云端视觉模型也只认 bmp/gif/png/jpeg/webp。上传时直接转成 JPEG 存盘，
-        # 前端显示与视觉链路一并解决（转码失败保留原文件，交给视觉链路兜底转码）。
-        if kind == "image":
-            try:
-                raw = dest.read_bytes()
-                if len(raw) >= 12 and raw[:4] != b"\xff\xd8\xff" and raw[4:8] == b"ftyp":
-                    jpeg = await asyncio.to_thread(_heic_to_jpeg_bytes, raw)
-                    if jpeg:
-                        # 覆盖写回原文件（保持同一 URL），并把元数据统一为 jpeg
-                        await asyncio.to_thread(dest.write_bytes, jpeg)
-                        total = len(jpeg)
-                        suffix = ".jpg"
-                        stored = dest.name
-            except OSError:
-                pass  # 转码阶段读/写失败不影响已上传成功的文件
+        kind = ("image" if final_suffix in _IMAGE_SUFFIXES
+                else ("doc" if final_suffix in _DOC_SUFFIXES else "file"))
         results.append({
             "name": original,
             "url": f"/uploads/{stored}",
             "kind": kind,
-            "suffix": suffix,
+            "suffix": final_suffix,
             "size": total,
             "mime": mimetypes.guess_type(stored)[0] or "application/octet-stream",
         })
