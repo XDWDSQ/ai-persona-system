@@ -589,7 +589,9 @@
         .prompt-chip:hover{border-color:color-mix(in srgb,var(--chart-2) 50%,transparent);background:color-mix(in srgb,var(--chart-2) 9%,var(--card));transform:translateY(-1px);box-shadow:0 6px 18px -10px color-mix(in srgb,var(--chart-2) 45%,transparent)}
 
         /* ===== Input ===== */
-        .inputbar{flex:none;padding:10px 22px 20px}
+        /* 输入栏层级高于桌宠（#pet z-60）：窄窗口下居中的输入胶囊会被右下角桌宠压住，
+           曾导致发送按钮点不到；输入栏抬到 61 后桌宠从输入栏下方滑过，其余区域照常覆盖 */
+        .inputbar{flex:none;padding:10px 22px 20px;position:relative;z-index:61}
         /* 胶囊输入栏：大圆角 + 悬浮投影，聚焦时珊瑚描边 + 外发光 */
         .inputbar-inner{position:relative;max-width:760px;margin:0 auto;display:flex;gap:10px;align-items:flex-end;border:1px solid var(--border);border-radius:24px;background:color-mix(in srgb,var(--card) 94%,transparent);padding:8px 8px 8px 10px;transition:border-color .18s ease,box-shadow .18s ease;box-shadow:0 10px 34px -20px rgba(0,0,0,.5)}
         .inputbar-inner:focus-within{border-color:color-mix(in srgb,var(--chart-2) 55%,transparent);box-shadow:0 0 0 3px color-mix(in srgb,var(--chart-2) 16%,transparent),0 10px 34px -18px color-mix(in srgb,var(--chart-2) 30%,transparent)}
@@ -934,3 +936,67 @@
       #confirm-modal .cf-btn.primary{background:linear-gradient(140deg,var(--chart-1),var(--chart-2) 55%,var(--chart-3));color:var(--on-accent);border-color:color-mix(in srgb,var(--chart-2) 70%,transparent);font-weight:600}
       #confirm-modal .cf-btn.primary:hover{transform:translateY(-1px);box-shadow:0 8px 20px -10px color-mix(in srgb,var(--chart-2) 60%,transparent)}
       #confirm-modal .cf-btn:active{transform:scale(.97)}
+
+      /* ===== 6. 会话搜索 / 消息搜索 / 长文折叠 / 链接 / 灯箱 / 字号 ===== */
+      /* 会话搜索框：侧栏"最近会话"标签下方，过滤标题与正文 */
+      .sess-search{display:flex;align-items:center;gap:8px;margin:0 8px 6px;padding:7px 10px;border:1px solid var(--border);border-radius:9px;background:var(--background)}
+      .sess-search svg{width:14px;height:14px;color:var(--muted-foreground);flex:none}
+      .sess-search input{flex:1;min-width:0;background:transparent;border:none;outline:none;color:var(--foreground);font-size:12.5px;font-family:inherit}
+      .sess-search input::placeholder{color:var(--muted-foreground)}
+      .sess-search input::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none}
+      .sessions-empty{padding:14px 12px;font-size:12px;color:var(--muted-foreground);text-align:center;line-height:1.6}
+      /* 消息内搜索条：顶栏下方通栏，sticky 贴在消息区顶部 */
+      .msg-search{display:flex;align-items:center;gap:8px;margin:0 auto;padding:8px 22px 0;max-width:806px;width:100%;box-sizing:border-box}
+      .msg-search[hidden]{display:none}
+      .msg-search svg{width:14px;height:14px;color:var(--muted-foreground);flex:none}
+      .msg-search input{flex:1;min-width:0;background:var(--card);border:1px solid var(--border);border-radius:9px;color:var(--foreground);padding:7px 10px;font-size:13px;font-family:inherit;outline:none}
+      .msg-search input:focus{border-color:color-mix(in srgb,var(--chart-2) 55%,transparent);box-shadow:0 0 0 3px color-mix(in srgb,var(--chart-2) 14%,transparent)}
+      .msg-search-count{font-family:var(--font-mono);font-size:11px;color:var(--muted-foreground);min-width:44px;text-align:center;flex:none}
+      .msg-search button{flex:none;min-width:28px;height:28px;padding:0 6px;border-radius:7px;border:1px solid var(--border);background:var(--card);color:var(--muted-foreground);font-size:13px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
+      .msg-search button:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--chart-2) 40%,transparent)}
+      .msg-search button svg{width:12px;height:12px}
+      /* 搜索命中高亮：当前命中用主题色底，其余命中描边 */
+      .msg-search-hit{outline:2px solid color-mix(in srgb,var(--chart-2) 55%,transparent);outline-offset:2px;border-radius:12px}
+      .msg-search-current{outline:2px solid var(--chart-2);outline-offset:2px;border-radius:12px}
+      /* 长消息折叠：超长气泡收起到约 8 行，展开按钮跟在正文后 */
+      .bubble.clamped{max-height:calc(1.72em * 8 + 24px);overflow:hidden;position:relative}
+      .bubble.clamped::after{content:"";position:absolute;left:0;right:0;bottom:0;height:44px;background:linear-gradient(180deg,transparent,var(--card) 85%);pointer-events:none}
+      .msg.user .bubble.clamped::after{background:linear-gradient(180deg,transparent,color-mix(in srgb,var(--chart-3) 88%,transparent) 85%)}
+      .clamp-toggle{display:inline-flex;align-items:center;gap:4px;margin-top:6px;padding:3px 10px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--chart-2);font-size:11px;font-family:var(--font-mono);cursor:pointer}
+      .clamp-toggle:hover{border-color:color-mix(in srgb,var(--chart-2) 50%,transparent);background:color-mix(in srgb,var(--chart-2) 8%,transparent)}
+      /* 气泡内链接：主题色下划线，换行不断链 */
+      .bubble a{color:var(--chart-2);text-decoration:underline;text-underline-offset:3px;overflow-wrap:anywhere}
+      .msg.user .bubble a{color:var(--on-accent);text-decoration-color:color-mix(in srgb,var(--on-accent) 60%,transparent)}
+      /* 图片灯箱：全屏深底，图片 contain 居中，点按任意处关闭 */
+      #lightbox{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:rgba(10,7,12,.88);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);cursor:zoom-out;padding:24px;box-sizing:border-box}
+      #lightbox[hidden]{display:none}
+      #lightbox img{max-width:100%;max-height:100%;border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6);object-fit:contain}
+      /* 字号三档：只放大消息正文与输入框，不动导航/标签 */
+      html[data-font="lg"] .bubble{font-size:16px}
+      html[data-font="lg"] .inputbar textarea{font-size:16px}
+      html[data-font="xl"] .bubble{font-size:17.5px;line-height:1.8}
+      html[data-font="xl"] .inputbar textarea{font-size:17px}
+      /* 顶栏同步指示：圆点颜色表状态（灰=未同步，绿=已同步，红=失败），点击重试 */
+      .top-chip.sync{cursor:pointer;justify-content:center}
+      .top-chip.sync .sync-dot{width:7px;height:7px;border-radius:50%;background:var(--muted-foreground);flex:none;align-self:center;animation:dotPulse .9s ease-in-out infinite}
+      .top-chip.sync.ok{color:var(--success)}
+      .top-chip.sync.ok .sync-dot{background:var(--success);box-shadow:0 0 8px var(--success);animation:liveBlink 1.8s ease-in-out infinite}
+      .top-chip.sync.err{color:var(--destructive);border-color:color-mix(in srgb,var(--destructive) 50%,transparent)}
+      .top-chip.sync.err .sync-dot{background:var(--destructive);box-shadow:0 0 8px var(--destructive);animation:none}
+      .top-chip.sync.saving{color:var(--chart-2)}
+      .top-chip.sync.saving .sync-dot{background:var(--chart-2);box-shadow:0 0 8px var(--chart-2);animation:dotPulse .9s ease-in-out infinite}
+      html[data-font="xl"] .msg-body{max-width:82%}
+      /* 同步状态行：侧栏底部常驻，保存成功显示时间，失败常驻红字，点击重试 */
+      .sync-status{font-family:var(--font-mono);font-size:10.5px;color:var(--muted-foreground);text-align:center;letter-spacing:.03em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;user-select:none}
+      .sync-status.ok{color:var(--success)}
+      .sync-status.err{color:var(--destructive)}
+      .sync-status.saving{color:var(--chart-2)}
+      @media (max-width:900px){
+        .msg-search{padding:8px 12px 0}
+        .sess-search{margin:0 8px 6px}
+      }
+      /* 减少动态：跟随系统偏好，关入场/呼吸动画（JS 侧同步关平滑滚动，见 reduceMotion） */
+      @media (prefers-reduced-motion: reduce){
+        .msg.anim > *,.msg.anim .avatar,.msg.anim .msg-body,.session.side-in,.role-item.side-in,.msg.ai.speaking .avatar,.typing i,.mini-wave i,.send-btn .spinner{animation:none !important}
+        .jump-bottom,.ctx-menu,.attach-menu,.toast,.prompt-chip,.send-btn{transition:none !important}
+      }

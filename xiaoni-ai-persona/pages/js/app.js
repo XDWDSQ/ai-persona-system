@@ -46,7 +46,7 @@
             var seg = e.target && e.target.closest ? e.target.closest('.tts-seg') : null;
             if (seg) seekBySeg(seg);
           });
-          var state = { history: [], cloudProviders: {}, soundOn: (function(){ try { return localStorage.getItem('xiaoni_sound_on') !== '0'; } catch(e) { return true; } })(), speed: (function(){ try { return parseFloat(localStorage.getItem('xiaoni_speed') || '1.0') || 1.0; } catch(e) { return 1.0; } })(), provider: 'cloud', voiceProvider: 'local', aliyunConfigured: false, minimaxConfigured: false, audioCache: {}, ttsInflight: {}, playing: null, playingBtn: null, playSeq: 0, pendingAttachments: [], attachMenuOpen: false, awaiting: {} };
+          var state = { history: [], cloudProviders: {}, soundOn: (function(){ try { return localStorage.getItem('xiaoni_sound_on') !== '0'; } catch(e) { return true; } })(), speed: (function(){ try { return parseFloat(localStorage.getItem('xiaoni_speed') || '1.0') || 1.0; } catch(e) { return 1.0; } })(), provider: 'cloud', voiceProvider: 'local', voiceKey: '', aliyunConfigured: false, minimaxConfigured: false, audioCache: {}, ttsInflight: {}, playing: null, playingBtn: null, playSeq: 0, pendingAttachments: [], attachMenuOpen: false, awaiting: {}, sendingCount: 0, lastSync: null };
           /* 当前激活角色 key：同步维护，页面加载即生效（默认与后端 config 一致为大帅），
              避免头像判断依赖异步的 /api/status 返回导致首帧渲染成首字 */
           var currentRoleKey = 'dashuai';
@@ -181,15 +181,52 @@
           }
 
           /* ---------- API ---------- */
+          /* 网络错误中文映射：浏览器原生 TypeError: Failed to fetch 对用户毫无信息量，
+             统一翻译成可操作的中文（本地确认 8000 端口、远程确认 ngrok 隧道+警告页）。 */
+          function friendlyNetError(e) {
+            var m = (e && e.message) || '';
+            if (e && e.message === '__ABORT__') return '已停止生成';
+            if (/Failed to fetch|NetworkError|Load failed|Network request failed|fetch failed/i.test(m)
+                || (e && e.name === 'TypeError' && !m)) {
+              return '网络连接失败：连不上后端。请检查：1) 电脑上服务在跑（打开 http://127.0.0.1:8000 看能否进登录页）；'
+                + '2) 手机远程时 ngrok 在跑且用 data/tunnel_url.txt 里最新地址（免费版重启会换域名，旧地址报离线）；'
+                + '3) 新浏览器首次打开隧道地址先点 Visit Site 过 ERR_NGROK_6024 警告页再回聊天';
+            }
+            if (/Unexpected token '<'|is not valid JSON|JSON\.parse/i.test(m)) {
+              return '隧道返回了网页而非数据（多为 ngrok 免费警告页 ERR_NGROK_6024）：新浏览器先打开隧道地址点 Visit Site，通过后再回聊天页重试';
+            }
+            return m || '网络异常';
+          }
           async function api(path, opt) {
-            var r = await fetch(path, opt);
+            var r;
+            try {
+              r = await fetch(path, opt);
+            } catch (e) {
+              throw new Error(friendlyNetError(e));
+            }
             if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
             if (!r.ok) {
               var m = '请求失败(' + r.status + ')';
+              if (r.status === 404) {
+                /* ngrok 隧道离线时（ERR_NGROK_3200）同样是 404 但 body 是 ngrok 错误页 HTML，
+                   直接报 404 会误导去查接口；先看 body 是否 ngrok 错误页。 */
+                try {
+                  var t404 = await r.text();
+                  if (/ERR_NGROK_3200|endpoint .* is offline/i.test(t404)) {
+                    throw new Error('隧道已离线（ngrok 未运行）：电脑上执行 ngrok http 8000，并用 data/tunnel_url.txt 里最新地址重进');
+                  }
+                  try { m = (JSON.parse(t404)).detail || m; } catch (e2) {}
+                } catch (e2) { if (e2 && /隧道已离线/.test(e2.message)) throw e2; }
+                throw new Error(m);
+              }
               try { m = (await r.json()).detail || m; } catch (e) {}
               throw new Error(m);
             }
-            return r.status === 200 ? r.json() : null;
+            try {
+              return r.status === 200 ? await r.json() : null;
+            } catch (e) {
+              throw new Error(friendlyNetError(e));
+            }
           }
 
           /* ---------- 流式输出（SSE） ---------- */
@@ -208,15 +245,33 @@
           /* SSE 流式请求：POST /api/chat (stream:true)，逐事件回调。
              事件：{"d":增量} / {"reset":true} / {"done":true,...} / {"err":"..."}
              onDelta(fullRaw) 在每次增量/重置后回调。
+             signal：用户点"停止生成"/切会话时 abort，调用方按 __ABORT__ 识别。
              返回 {clean, style, searched, vision_used}；中途出错 throw。 */
-          async function chatStreamRequest(payload, onDelta) {
-            var resp = await fetch('/api/chat', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(Object.assign({ stream: true }, payload)),
-            });
+          async function chatStreamRequest(payload, onDelta, signal) {
+            var resp;
+            try {
+              resp = await fetch('/api/chat', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(Object.assign({ stream: true }, payload)),
+                signal: signal || undefined,
+              });
+            } catch (e) {
+              if (signal && signal.aborted) throw new Error('__ABORT__');
+              throw new Error(friendlyNetError(e));
+            }
             if (!resp.ok) {
               if (resp.status === 401) { location.href = '/login'; }
               var m = '请求失败(' + resp.status + ')';
+              if (resp.status === 404) {
+                try {
+                  var t404 = await resp.text();
+                  if (/ERR_NGROK_3200|endpoint .* is offline/i.test(t404)) {
+                    throw new Error('隧道已离线（ngrok 未运行）：电脑上执行 ngrok http 8000，并用 data/tunnel_url.txt 里最新地址重进');
+                  }
+                  try { m = (JSON.parse(t404)).detail || m; } catch (e2) {}
+                } catch (e2) { if (e2 && /隧道已离线/.test(e2.message)) throw e2; }
+                throw new Error(m);
+              }
               try { m = (await resp.json()).detail || m; } catch (e) {}
               throw new Error(m);
             }
@@ -226,8 +281,15 @@
             var fullRaw = '';
             var out = null;
             for (;;) {
-              var r = await reader.read();
+              var r;
+              try {
+                r = await reader.read();
+              } catch (e) {
+                if (signal && signal.aborted) throw new Error('__ABORT__');
+                throw new Error(friendlyNetError(e));
+              }
               if (r.done) break;
+              if (signal && signal.aborted) throw new Error('__ABORT__');
               buf += dec.decode(r.value, { stream: true });
               var parts = buf.split('\n\n');
               buf = parts.pop();
@@ -253,6 +315,23 @@
 
           /* 流式对话统一入口：随 SSE 增量渲染气泡；结束后入库、挂操作按钮、可选朗读。
              失败时保留已流出的部分并落失败气泡（带重试按钮）。send/重新生成/重试共用。 */
+          /* 在飞的生成请求控制器：点发送按钮（停止态）/ 切会话 / 新对话 / 删会话时 abort，
+             不再让旧流在后台继续写旧会话、也不让发送按钮永久转圈。 */
+          var chatAborter = null;
+          function abortChatInFlight() {
+            if (chatAborter) { try { chatAborter.abort(); } catch (e) {} }
+          }
+          /* 发送按钮双态：空闲 = 发送；生成中 = 停止生成（保持可点，点按即 abort）。
+             上传附件的短阶段仍用 disabled（见 send），流式阶段绝不 disabled。 */
+          function syncSendBtn() {
+            var b = document.querySelector('.send-btn');
+            if (!b) return;
+            var on = (state.sendingCount || 0) > 0;
+            b.classList.toggle('loading', on);
+            if (!on) b.disabled = false;
+            b.title = on ? '停止生成' : '发送';
+            b.setAttribute('aria-label', on ? '停止生成' : '发送');
+          }
           async function streamReplyInto(sessionId, snap, payload) {
             var s = findSession(sessionId);
             var div = null;
@@ -261,6 +340,15 @@
             var clean = '', style = '';
             var bubble = null;    /* 缓存气泡引用，避免每帧 querySelector */
             var renderer = null;  /* rAF 帧合并 + 增量渲染器 */
+            var ctl = null;
+            try { ctl = new AbortController(); } catch (e) { ctl = null; }
+            chatAborter = ctl;
+            state.sendingCount = (state.sendingCount || 0) + 1;
+            syncSendBtn();
+            /* 兜底超时 180s：隧道挂死 / SSE 半开连接时不再卡死，用户也可随时手动停止 */
+            var timedOut = false;
+            var timeoutId = 0;
+            if (ctl) timeoutId = setTimeout(function(){ timedOut = true; try { ctl.abort(); } catch (e) {} }, 180000);
             try {
               var res = await chatStreamRequest(payload, function(fullText){
                 fullRaw = fullText;
@@ -279,7 +367,7 @@
                 } else if (renderer) {
                   renderer(fullText); /* 帧合并 + 增量追加，渲染频率锁到屏幕刷新率 */
                 }
-              });
+              }, ctl && ctl.signal);
               hideTyping();
               clean = res.clean || stripStyleTag(fullRaw);
               style = res.style || '';
@@ -320,9 +408,11 @@
                   div = addMsg('assistant', clean);
                 } else {
                   var b2 = div.querySelector('.bubble');
-                  /* 以 clean 为准：剥净残留 style/元话语标记；走 fillBubbleText 保留
-                     APK 点字跳播的 .tts-seg 分段（直接 textContent 会销毁分段） */
-                  fillBubbleText(b2, clean);
+                  /* 以 clean 为准：剥净残留 style/元话语标记；走 setBubbleContent 保留
+                     APK 点字跳播的 .tts-seg 分段（直接 textContent 会销毁分段），
+                     网页端同时做链接化；超长回复顺手折叠 */
+                  setBubbleContent(b2, clean);
+                  applyClamp(div, clean);
                   b2.classList.remove('no-text');
                 }
                 var meta = div.querySelector('.msg-meta');
@@ -336,7 +426,9 @@
               }
             } catch (e) {
               hideTyping();
-              /* 流中断但已流出内容（如收尾断连/部署重启/隧道抖动）：把已生成内容入库，
+              var aborted = (e && e.message === '__ABORT__') || (ctl && ctl.signal && ctl.signal.aborted);
+              var abortReason = timedOut ? '响应超时' : '已停止生成';
+              /* 流中断但已流出内容（如收尾断连/部署重启/隧道抖动/手动停止）：把已生成内容入库，
                  否则重进后历史以用户消息结尾，误报"上次回复没有生成成功"。
                  没有任何内容才落失败气泡（可重试）。 */
               var kept = clean || stripStyleTag(fullRaw);
@@ -346,21 +438,72 @@
                   f2.history.push({ role: 'assistant', content: kept, style: style || '' });
                   markSessionActivity(sessionId);
                   if (div && div.querySelector('.bubble')) {
-                    fillBubbleText(div.querySelector('.bubble'), kept);
+                    setBubbleContent(div.querySelector('.bubble'), kept);
+                    applyClamp(div, kept);
                     div.classList.remove('no-text');
                   }
-                  toast('网络中断，已保留已生成的内容');
+                  toast(aborted
+                    ? (timedOut ? '响应超时，已保留已生成的内容' : '已停止生成，已保留已生成的内容')
+                    : '网络中断，已保留已生成的内容');
                 } else if (div && div.parentNode) {
                   div.remove();
                   addFailureMsg(sessionId, '会话已被删除', snap);
                 }
               } else {
                 if (div && div.parentNode) div.remove(); /* 流中断：删掉半成品，落失败气泡 */
-                addFailureMsg(sessionId, (e && e.message) || '生成失败，请重试', snap);
+                addFailureMsg(sessionId, aborted ? abortReason : ((e && e.message) || '生成失败，请重试'), snap);
               }
+            } finally {
+              if (timeoutId) clearTimeout(timeoutId);
+              if (chatAborter === ctl) chatAborter = null;
+              state.sendingCount = Math.max(0, (state.sendingCount || 1) - 1);
+              syncSendBtn();
             }
           }
 
+          /* ---------- 气泡内容：转义 + 链接化 + 长文折叠 ----------
+             APK（AndroidBridge）环境保持 .tts-seg 分句结构（点字跳播依赖）；
+             其余环境把纯文本转义后将 http(s) 链接变成可点击的 <a>。
+             textContent 读回仍是纯文本，编辑/重试/删除的按内容寻址不受影响。 */
+          var MSG_CLAMP_LEN = 600;
+          function escapeHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function(ch){
+              return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch];
+            });
+          }
+          function linkifyHtml(text) {
+            var esc = escapeHtml(text);
+            return esc.replace(/https?:\/\/[^\s<>"'）】｝}]+/g, function(url){
+              var trail = '';
+              var m = url.match(/[.,;:!?'"'，。！？；：、）】》〉,.!?;:]+$/);
+              if (m) { trail = m[0]; url = url.slice(0, -trail.length); }
+              if (!url) return trail;
+              return '<a href="' + url + '" target="_blank" rel="noreferrer noopener">' + url + '</a>';
+            });
+          }
+          function setBubbleContent(bubble, text) {
+            if (window.AndroidBridge) { fillBubbleText(bubble, text || ''); return; }
+            bubble.innerHTML = linkifyHtml(text || '');
+          }
+          /* 超长消息折叠：气泡收起到约 8 行，附「展开全文/收起」按钮（插在 meta 前） */
+          function applyClamp(div, text) {
+            if (!div || !text || text.length < MSG_CLAMP_LEN) return;
+            var bubble = div.querySelector('.bubble');
+            var body = div.querySelector('.msg-body');
+            if (!bubble || !body || div.querySelector('.clamp-toggle')) return;
+            bubble.classList.add('clamped');
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'clamp-toggle';
+            btn.textContent = '展开全文';
+            btn.addEventListener('click', function(){
+              bubble.classList.toggle('clamped');
+              btn.textContent = bubble.classList.contains('clamped') ? '展开全文' : '收起';
+            });
+            var meta = div.querySelector('.msg-meta');
+            if (meta) body.insertBefore(btn, meta);
+            else body.appendChild(btn);
+          }
           /* 防御性清理：LLM 有时把 [style:xxx] 风格标记放在回复中间/末尾（后端解析只保证剥离开头），
              这里在展示与朗读前统一剥离，保证历史消息也不会把标记显示出来或被 TTS 读出来。
              兼容 [style:x]/[风格:x]/【style：x】/全角冒号/大小写。 */
@@ -625,6 +768,14 @@
               state.voiceRegistered = !!s.voice_registered;
               state.cloudProviders = s.cloud_providers || {};
               state.voiceManualProvider = !!s.voice_manual_provider;
+              /* TTS 缓存维度：同句不同引擎/音色/模型不得复用同一份 blob，
+                 否则切换引擎后点朗读会播出旧引擎的旧声音 */
+              try {
+                var _vk = state.voiceProvider || '';
+                if (_vk === 'aliyun' && s.voice_aliyun) _vk += ' ' + (s.voice_aliyun.model || '') + ' ' + (s.voice_aliyun.voice || '');
+                else if ((_vk === 'minimax' || _vk === 'mimo') && s.voice_minimax) _vk += ' ' + (s.voice_minimax.model || '') + ' ' + (s.voice_minimax.voice || '');
+                state.voiceKey = _vk;
+              } catch (_e) { state.voiceKey = state.voiceProvider || ''; }
               var cc2 = s.cloud || {};  /* 防御：后端字段缺失时不抛 TypeError */
               var cp = state.cloudProviders[cc2.provider];
               var pName = $('.p-name'), pDetail = $('.p-detail'), cSub = $('.c-sub');
@@ -693,7 +844,8 @@
               var pn = $('.p-name');
               if (pn) pn.textContent = '后端未连接';
               var pd = $('.p-detail');
-              if (pd) pd.textContent = '—';
+              /* 失败原因直接展示中文可操作提示（此前只显示 —，用户只能看到 Failed to fetch） */
+              if (pd) pd.textContent = friendlyNetError(e);
               applyOnlineState(false);
             }
           }
@@ -737,6 +889,9 @@
               .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
               .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
           }
+          /* 减少动态：跟随系统偏好，减弱平滑滚动/搜索定位动画（无障碍） */
+          var reduceMotion = false;
+          try { reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) {}
           /* 贴底跟随：用户手动上翻时暂停跟随；贴底状态下内容高度变化自动补滚 */
           var stickBottom = true;
           function scrollBottom(instant){
@@ -744,7 +899,7 @@
             if (!m) return;
             stickBottom = true;
             /* instant 场景（切会话/补滚）必须瞬时到位，不能走平滑动画，否则迟滞 */
-            if (instant) { snapBottom(); return; }
+            if (instant || reduceMotion) { snapBottom(); return; }
             if (!m.scrollTo) { m.scrollTop = m.scrollHeight; }
             else { m.scrollTo({ top: m.scrollHeight, behavior: 'smooth' }); }
           }
@@ -907,11 +1062,11 @@
               });
             }
             var bubble = div.querySelector('.bubble');
-            if (text && role === 'assistant') {
-              /* APK 播放中对齐：assistant 消息文字按句切块，点击跳转对应音频位置 */
-              fillBubbleText(bubble, text);
-            } else if (text) {
-              bubble.textContent = text;
+            if (text) {
+              /* APK 播放中对齐：assistant 消息文字按句切块，点击跳转对应音频位置；
+                 其余环境统一转义+链接化；超长消息折叠 */
+              setBubbleContent(bubble, text);
+              applyClamp(div, text);
             } else {
               bubble.classList.add('no-text');
             }
@@ -1036,6 +1191,7 @@
             ctxMenu.style.left = Math.max(8, Math.min(x, window.innerWidth - mw - 8)) + 'px';
             ctxMenu.style.top = Math.max(8, Math.min(y, window.innerHeight - mh - 8)) + 'px';
             ctxMenuOpen = true;
+            ctxMenuOpenedAt = Date.now();  /* 滚动关闭宽限计时起点 */
             requestAnimationFrame(function(){ requestAnimationFrame(function(){ ctxMenu.classList.add('show'); }); });
           }
           function hideCtxMenu() {
@@ -1051,7 +1207,7 @@
             if (!isNaN(idx) && state.history[idx] && state.history[idx].role === role) {
               state.history.splice(idx, 1);
               saveSessions();
-              renderCurrentSession();
+              renderCurrentSession({ preserveScroll: true, keepAudio: true });
               return;
             }
             var content = div.querySelector('.bubble').textContent;
@@ -1060,18 +1216,25 @@
                 state.history.splice(i, 1);
                 saveSessions();
                 /* 必须重渲染：其余消息 DOM 的 dataset.hidx 已失效，不重渲染会导致
-                   下次按 hidx 删除时下标错位误删另一条同角色消息 */
-                renderCurrentSession();
+                   下次按 hidx 删除时下标错位误删另一条同角色消息。
+                   preserveScroll + keepAudio：删旧消息不拽视口、不断正在听的音频 */
+                renderCurrentSession({ preserveScroll: true, keepAudio: true });
                 return;
               }
             }
           }
-          /* 点击其他区域 / 右键非消息处 / 滚动 / 窗口缩放 -> 关闭菜单 */
+          /* 点击其他区域 / 右键非消息处 / 滚动 / 窗口缩放 -> 关闭菜单。
+             滚动关闭带 500ms 宽限：右键/长按弹出菜单的瞬间，浏览器常因焦点/锚定
+             触发一次 #msgs 微滚动（约 3ms 后），无宽限会把刚弹出的菜单立刻吞掉。 */
+          var ctxMenuOpenedAt = 0;
           document.addEventListener('click', hideCtxMenu);
           document.addEventListener('contextmenu', function(e){
             if (!(e.target.closest && e.target.closest('.msg, .session'))) hideCtxMenu();
           });
-          document.addEventListener('scroll', hideCtxMenu, true);
+          document.addEventListener('scroll', function(){
+            if (Date.now() - ctxMenuOpenedAt < 500) return;
+            hideCtxMenu();
+          }, true);
           window.addEventListener('resize', hideCtxMenu);
 
           /* ---------- 修改消息 ----------
@@ -1233,6 +1396,30 @@
               }
             };
           }
+          /* 重渲染后重绑播放按钮：删除旧消息等轻量重绘不应掐断正在听的音频。
+             按播放文本找回新 DOM 里的朗读按钮并恢复播放态；
+             找不到（删的正是播放中的那条）才真正停止。 */
+          function rebindPlayingBtn() {
+            if (!state.playing || !state.playingText) return;
+            var found = null;
+            msgsInner.querySelectorAll('.msg.ai').forEach(function(m){
+              if (found) return;
+              var b = m.querySelector('.bubble');
+              if (b && b.textContent === state.playingText) found = m;
+            });
+            if (found) {
+              var nb = found.querySelector('.speak-wrap .speak-btn') || found.querySelector('.speak-btn');
+              state.playingBtn = nb || null;
+              state.playingMsg = found;
+              if (nb) {
+                setSpeak(nb, state.playing.paused ? '已暂停' : '播放中…', true);
+                setBtnWave(nb, !state.playing.paused);
+                setMsgSpeaking(nb, true);
+              }
+            } else {
+              stopAudio();
+            }
+          }
           function stopAudio() {
             if (state.playing) {
               try {
@@ -1349,11 +1536,16 @@
             b._msg = msg || null;
             b._sid = sid || null;
             b.onclick = function(){ ttsAndPlay(text, b, style, false, msg, sid); };
-            /* 循环播放开关：开启后该条音频播完自动从头再播 */
+            /* 循环播放开关：开启后该条音频播完自动从头再播。
+               偏好持久化进消息（msg.loop，随会话保存）：切会话/重渲染后仍保持。 */
             var lb = document.createElement('button');
             lb.type = 'button';
             lb.className = 'loop-btn';
             lb.title = '循环播放';
+            b._loop = !!(msg && msg.loop);
+            lb.classList.toggle('on', !!b._loop);
+            lb.setAttribute('aria-pressed', b._loop ? 'true' : 'false');
+            if (b._loop) lb.title = '已开启循环播放';
             lb.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/><path d="M11 10h1v4"/></svg>';
             lb.onclick = function(ev) {
               if (ev) { ev.preventDefault(); ev.stopPropagation(); }
@@ -1361,6 +1553,10 @@
               lb.classList.toggle('on', !!b._loop);
               lb.setAttribute('aria-pressed', b._loop ? 'true' : 'false');
               lb.title = b._loop ? '已开启循环播放' : '循环播放';
+              try {
+                if (msg) msg.loop = !!b._loop;
+                saveSessions();
+              } catch (e) {}
               /* 若该条正在播放，实时生效，无需重新点朗读 */
               if (state.playingBtn === b && state.playing) state.playing.loop = !!b._loop;
             };
@@ -1408,8 +1604,9 @@
             /* 立即打断当前播放：点新朗读/新自动播放即刻静音旧的，
                不再等新音频合成完成才切换（合成期间旧音频继续响 = "同时播放"的观感） */
             stopAudio();
-            // 语速由 Audio.playbackRate 控制，不再作为 cache key — 同一句不同语速复用同一份音频
-            var key = (style || '') + '\u0001' + text;
+            // 语速由 Audio.playbackRate 控制，不再作为 cache key — 同一句不同语速复用同一份音频；
+            // 引擎/音色/模型是 cache key 的一部分（state.voiceKey），切引擎后自动重新合成、不串音
+            var key = (state.voiceKey || state.voiceProvider || '') + '\u0001' + (style || '') + '\u0001' + text;
             var url = state.audioCache[key];
             var prog = null;
             var a = null;  /* 先声明：合成在 new Audio 之前失败时，catch 分支可安全引用 */
@@ -1811,8 +2008,11 @@
           }
           function friendlySendError(e) {
             var m = (e && e.message) || '';
-            if (/405|404|Method Not Allowed|Not Found/.test(m)) return '后端版本太旧，请先重启服务再发送附件';
-            return m;
+            /* 已是中文友好提示（api/chatStream 抛出的隧道/网络文案）直接透传，不再二次包装 */
+            if (/网络连接失败|隧道已离线|隧道返回了网页|已停止生成/.test(m)) return m;
+            if (/405|Method Not Allowed/.test(m)) return '后端版本太旧，请先重启服务再发送附件';
+            if (/404|Not Found/.test(m)) return '后端版本太旧，请先重启服务再发送附件';
+            return friendlyNetError(e);
           }
 
           /* ---------- 对话 ---------- */
@@ -1820,15 +2020,31 @@
             text = (text || '').trim();
             var sendBtn = document.querySelector('.send-btn');
             var pending = state.pendingAttachments.slice();
-            if ((!text && !pending.length) || sendBtn.disabled) return;
+            if (!text && !pending.length) return;
+            /* 生成中：Enter/粘贴发送不再吞字（旧实现点击入口先清空输入框，
+               这里直接拒收并提示，用发送按钮点按来停止） */
+            if ((state.sendingCount || 0) > 0) { toast('正在生成中，点击发送按钮可停止'); return; }
+            if (sendBtn && sendBtn.disabled) return;
             toggleAttachMenu(false);
             var sessionId = currentSessionId;
             var s = findSession(sessionId);
-            if (!s) return;
-            sendBtn.disabled = true;
-            sendBtn.classList.add('loading');
+            if (!s) {
+              /* 当前会话已失效：输入框内容原样保留（本次不再预清空），切回主对话再提示 */
+              currentSession();
+              renderCurrentSession();
+              toast('当前会话已失效，已为你切回主对话，请再发一次');
+              return;
+            }
+            /* 输入框清空收归 send() 独占：准入检查通过后才清空。
+               旧实现点击入口先清空再调 send，生成中连按 Enter 会清空后被拒收 = 丢消息。 */
+            var t0 = document.getElementById('text');
+            if (t0) { t0.value = ''; t0.style.height = 'auto'; }
+            clearDraft();
             stickBottom = true; /* 自己发消息：强制恢复贴底跟随 */
+            /* 附件上传阶段短暂禁用按钮（上传不可 abort，时间很短）；流式阶段按钮保持可点=停止 */
+            if (sendBtn) { sendBtn.disabled = true; sendBtn.classList.add('loading'); }
             var atts = [];
+            var snap = null;
             try {
               if (pending.length) {
                 atts = await uploadPendingAttachments();
@@ -1838,12 +2054,14 @@
               s.history.push({ role: 'user', content: text, attachments: atts });
               userDiv.dataset.hidx = String(s.history.length - 1);
               /* 记录本轮用户消息的定位信息：生成失败时用它挂「重试」按钮 */
-              var snap = { idx: s.history.length - 1, text: text, atts: atts };
+              snap = { idx: s.history.length - 1, text: text, atts: atts };
               markSessionActivity(sessionId, text || (atts[0] && atts[0].name));
               clearPendingAttachments();
               try { localStorage.setItem('xiaoni_last_chat_time', Date.now().toString()); } catch(e) {}
               showTyping();
               markAwaiting(sessionId, true);
+              /* 上传结束进入流式：恢复按钮可点态（点按=停止生成），转圈由 syncSendBtn 接管 */
+              if (sendBtn) sendBtn.disabled = false;
               try {
                 var historyPayload = s.history.slice(0, -1).slice(-20).map(function(m){
                   if (m.content) return m;
@@ -1869,8 +2087,12 @@
                 if (t2 && text && !t2.value) { t2.value = text; t2.dispatchEvent(new Event('input')); }
               }
             } finally {
-              sendBtn.classList.remove('loading');
-              sendBtn.disabled = false;
+              /* 流式阶段的按钮态由 streamReplyInto 的 syncSendBtn 接管；
+                 这里只处理"流开始前就失败"（如附件上传失败）的复位 */
+              if ((state.sendingCount || 0) === 0 && sendBtn) {
+                sendBtn.classList.remove('loading');
+                sendBtn.disabled = false;
+              }
             }
           }
 
@@ -2134,11 +2356,15 @@
               modelsBtn.disabled = true;
               modelsBtn.textContent = '获取中…';
               try {
+                /* 掩码值（***+尾4）按空串发：后端识别为空即复用已存密钥（与保存设置的掩码规则一致），
+                   直接发掩码会被供应商当成真 key 拒掉（502） */
+                var _mk = document.getElementById('cloud_api_key').value || '';
+                if (_mk.indexOf('***') === 0) _mk = '';
                 var r = await api('/api/llm-models', {
                   method: 'POST', headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     base_url: document.getElementById('cloud_base_url').value,
-                    api_key: document.getElementById('cloud_api_key').value,
+                    api_key: _mk,
                   }),
                 });
                 var sel = document.getElementById('cloud-models-sel');
@@ -2230,16 +2456,17 @@
           /* ---------- 事件 ---------- */
           var sendBtn = document.querySelector('.send-btn');
           if (sendBtn) sendBtn.addEventListener('click', function(){
+            /* 生成中点按 = 停止生成；空闲点按 = 发送（清空输入框收归 send() 内，避免拒收丢字） */
+            if ((state.sendingCount || 0) > 0) { abortChatInFlight(); return; }
             var t = document.getElementById('text');
-            var v = t.value; t.value = ''; t.style.height = 'auto';
-            clearDraft();  /* 已发出：清掉该会话草稿 */
-            send(v);
+            send(t ? t.value : '');
           });
           if (ta) ta.addEventListener('keydown', function(e){
             /* 中文输入法合成期按 Enter 是"确认候选词"不是发送：isComposing 与
                keyCode 229 双守卫（部分 IME 只暴露其中一种信号） */
             if (e.isComposing || e.keyCode === 229) return;
-            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (sendBtn) sendBtn.click(); }
+            /* 生成中 Enter 不发送也不停止（防误触吞字/误停）；停止请点发送按钮 */
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if ((state.sendingCount || 0) > 0) return; if (sendBtn) sendBtn.click(); }
           });
           /* 粘贴板文件（截图/复制的图片等）直接进待发送附件；
              不 preventDefault，文本内容照常粘贴 */
@@ -2278,6 +2505,9 @@
               attachInput.value = '';
             });
             document.addEventListener('click', function(){ toggleAttachMenu(false); });
+            /* 滚动/缩放时收起附件菜单：悬空菜单不再钉在旧位置 */
+            document.addEventListener('scroll', function(){ toggleAttachMenu(false); }, true);
+            window.addEventListener('resize', function(){ toggleAttachMenu(false); });
           }
           var settingsBtn = document.querySelector('[data-dom-id="btn-settings"]');
           if (settingsBtn) settingsBtn.addEventListener('click', openSettings);
@@ -2292,6 +2522,8 @@
           var ACTIVE_KEY = 'xiaoni_active_session_v1';
           var CLIENT_ID_KEY = 'xiaoni_client_id';
           var TOMBSTONE_KEY = 'xiaoni_tombstones_v1';
+          /* 会话搜索关键词（侧栏搜索框写入，renderSessions 读取过滤） */
+          var sessionSearchQuery = '';
           /* 设备 id：多端同步时服务端广播跳过来源自身，避免自己保存触发自己重拉 */
           var CLIENT_ID = (function(){
             var id = '';
@@ -2368,6 +2600,20 @@
               }
             } catch (e) {}
             list = list.map(normalizeSession).filter(function(s){ return !isSeedSession(s) && !isTestSession(s) && !isPlaceholderSession(s); });
+            /* 主数据丢失/损坏但快照还在：从快照恢复，避免打开即空白（已删会话由墓碑在同步时继续过滤，不会复活）。
+               注意：此处用字面量 key——SYNC_BAK_KEY 的赋值在 loadSessions 首次执行之后才跑（var 提升但赋值不提升）。 */
+            if (!list.length) {
+              try {
+                var bak = localStorage.getItem('xiaoni_sessions_bak');
+                if (bak) {
+                  var arr = JSON.parse(bak);
+                  if (Array.isArray(arr) && arr.length) {
+                    var restored = arr.map(normalizeSession).filter(function(s){ return !isSeedSession(s) && !isTestSession(s) && !isPlaceholderSession(s); });
+                    if (restored.length) { list = restored; window.__xiaoniRestored = true; }
+                  }
+                }
+              } catch (e) {}
+            }
             /* 存储为空或只剩垃圾记录时，自动建一个干净的新对话，保证页面始终有当前会话 */
             if (!list.length) list.push(makeSession('新对话'));
             return list;
@@ -2376,36 +2622,188 @@
           var currentSessionId = sessions.length ? sessions[0].id : null;
           var saveTimer = null;
           function persistLocal() {
-            try { localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions)); } catch (e) {}
-            try { localStorage.setItem(ACTIVE_KEY, currentSessionId || ''); } catch (e) {}
+            /* 返回 true/false：Safari 隐私模式配额为 0、配额写满时 setItem 会抛异常，
+               旧实现静默吞掉，用户误以为已保存，刷新后记录"消失" */
+            try {
+              var payload = JSON.stringify(sessions);
+              localStorage.setItem(SESSIONS_KEY, payload);
+              /* 回读校验：写完读回对不上同样视为失败 */
+              if (localStorage.getItem(SESSIONS_KEY) !== payload) throw new Error('回读不一致');
+              localStorage.setItem(ACTIVE_KEY, currentSessionId || '');
+              return true;
+            } catch (e) {
+              return false;
+            }
           }
-          function saveSessions(immediate) {
-            persistLocal();
+          /* ---------- 同步状态机 + 自动重试 + 本地快照兜底 ----------
+             状态：unsynced（从未同步）/ saving（同步中）/ ok（已同步）/
+                   error（失败，带原因）/ offline（断网）
+             state.dirty：有未落盘到服务端的变更。失败/离线时保持 true，
+             由 15s 轮询 + online 事件 + 切回前台自动补推，不再依赖用户手动重试。
+             上次同步时间持久化（SYNC_KEY），刷新后不回到"未同步"。 */
+          var SYNC_KEY = 'xiaoni_last_sync';
+          var SYNC_BAK_KEY = 'xiaoni_sessions_bak';
+          var SYNC_BAK_AT = 'xiaoni_sessions_bak_at';
+          var SYNC_BAK_MAX = 2500000;  /* 快照超 2.5MB 不写备份，防 localStorage 配额爆炸 */
+          state.syncState = state.syncState || 'unsynced';
+          state.dirty = false;
+          state.saving = false;
+          (function initLastSync(){
+            try {
+              var raw = localStorage.getItem(SYNC_KEY);
+              if (raw) {
+                var o = JSON.parse(raw);
+                if (o && o.at) {
+                  state.lastSync = o;
+                  state.syncState = (o.ok === false) ? 'error' : 'ok';
+                }
+              }
+            } catch (e) {}
+          })();
+          function isOnlineNow() {
+            try {
+              if (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean') return navigator.onLine;
+            } catch (e) {}
+            return true;
+          }
+          function setSyncState(s, err) {
+            state.syncState = s;
+            if (s === 'ok') state.lastSync = { ok: true, at: Date.now(), err: '' };
+            else if (s === 'error') state.lastSync = { ok: false, at: Date.now(), err: err || '同步失败' };
+            if (s === 'ok' || s === 'error') {
+              try { localStorage.setItem(SYNC_KEY, JSON.stringify(state.lastSync)); } catch (e) {}
+            }
+            renderSyncStatus();
+          }
+          /* 侧栏状态行 + 顶栏指示：同一状态，两处一起刷 */
+          function renderSyncStatus() {
+            var el = document.getElementById('sync-status');
+            var chip = document.getElementById('sync-chip');
+            var chipText = document.getElementById('sync-chip-text');
+            var st = state.syncState || 'unsynced';
+            var last = state.lastSync;
+            function hm(ms) {
+              var t = new Date(ms);
+              var pad = function(n){ return (n < 10 ? '0' : '') + n; };
+              return pad(t.getHours()) + ':' + pad(t.getMinutes()) + ':' + pad(t.getSeconds());
+            }
+            function paint(target, cls, txt, title) {
+              if (!target) return;
+              target.classList.remove('ok', 'err', 'saving');
+              if (cls) target.classList.add(cls);
+              if (txt !== undefined && 'textContent' in target) target.textContent = txt;
+              if (title !== undefined) target.title = title;
+            }
+            if (st === 'saving') {
+              paint(el, 'saving', '同步中…', '正在保存到服务端…');
+              paint(chip, 'saving', undefined, '正在保存到服务端…');
+              if (chipText) chipText.textContent = '同步中';
+            } else if (st === 'offline') {
+              var lastTxt = (last && last.at) ? ' · 上次 ' + hm(last.at) : '';
+              paint(el, 'err', '离线 · 未同步' + lastTxt, '网络已断开，恢复后自动补推（点击立即重试）');
+              paint(chip, 'err', undefined, '网络已断开，恢复后自动补推（点击立即重试）');
+              if (chipText) chipText.textContent = '离线';
+            } else if (st === 'ok' && last) {
+              paint(el, 'ok', '已同步 · ' + hm(last.at), '本地与服务端已同步，点击立即再同步一次');
+              paint(chip, 'ok', undefined, '已同步 · ' + hm(last.at) + '（点击立即再同步一次）');
+              if (chipText) chipText.textContent = '已同步';
+            } else if (st === 'error' && last) {
+              paint(el, 'err', '同步失败 · ' + hm(last.at), (last.err || '同步失败') + '（点击重试）');
+              paint(chip, 'err', undefined, '同步失败 · ' + hm(last.at) + '：' + (last.err || '') + '（点击重试）');
+              if (chipText) chipText.textContent = '同步失败';
+            } else {
+              paint(el, false, '未同步', '尚未与服务端同步，点击重试');
+              paint(chip, false, undefined, '尚未与服务端同步，点击重试');
+              if (chipText) chipText.textContent = '未同步';
+            }
+          }
+          /* 成功后节流写快照（最多 1 分钟一次）：主数据丢失/损坏时 loadSessions 可从快照恢复 */
+          var _bakAt = 0;
+          function writeBackup() {
+            try {
+              var now = Date.now();
+              if (now - _bakAt < 60000) return;
+              var payload = JSON.stringify(sessions);
+              if (!payload || payload.length < 10 || payload.length > SYNC_BAK_MAX) return;
+              localStorage.setItem(SYNC_BAK_KEY, payload);
+              localStorage.setItem(SYNC_BAK_AT, String(now));
+              _bakAt = now;
+            } catch (e) {
+              try { console.warn('[xiaoni] 会话快照备份失败：', (e && e.message) || e); } catch (_) {}
+            }
+          }
+          /* keepalive 只用于关页刷盘：Chrome 对 keepalive 请求体限 64KB（按编码后字节计，
+             中文多 3 倍体积，超限直接 "Failed to fetch" 且不发包），日常保存绝不能带它 */
+          function saveSessions(immediate, keepalive) {
+            state.dirty = true;
+            var localOk = persistLocal();
+            if (!localOk && (!saveSessions._lastLocalErrAt || Date.now() - saveSessions._lastLocalErrAt > 10000)) {
+              saveSessions._lastLocalErrAt = Date.now();
+              try {
+                console.error('[xiaoni] 本机保存失败：localStorage 写入或回读校验未通过');
+                toast('本机保存失败：浏览器存储不可用，刷新后新消息可能丢失');
+              } catch (_) {}
+            }
             clearTimeout(saveTimer);
             var doSave = function(){
+              if (!isOnlineNow()) { state.saving = false; setSyncState('offline'); return; }
+              var body;
+              try {
+                body = JSON.stringify({ sessions: sessions, deleted: loadTombstones() });
+              } catch (e) {
+                /* 序列化失败必须可见：旧实现在这里被外层 catch 静默吞掉，
+                   localStorage 与服务端同时写不进、又没有任何提示 */
+                state.saving = false;
+                setSyncState('error', '序列化失败：' + ((e && e.message) || '未知错误'));
+                try {
+                  console.error('[xiaoni] 会话序列化失败：', e);
+                  toast('记录保存失败：数据异常无法序列化（' + ((e && e.message) || '未知错误') + '）');
+                } catch (_) {}
+                return;
+              }
+              state.saving = true;
+              setSyncState('saving');
               try {
                 fetch('/api/sessions?client=' + encodeURIComponent(CLIENT_ID), {
                   method: 'PUT', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ sessions: sessions, deleted: loadTombstones() }),
-                  keepalive: true, /* 页面关闭时的刷盘请求也能发出去 */
+                  body: body,
+                  keepalive: keepalive === true, /* 仅关页刷盘时 true（页面存活时发包），平时 false */
                 }).then(function(r){
+                    state.saving = false;
                     if (r && r.status === 401) { location.href = '/login'; return; }
                     if (r && !r.ok) throw new Error('HTTP ' + r.status);
+                    state.dirty = false;
+                    setSyncState('ok');
+                    writeBackup();
                 }).catch(function(e){
                     /* 保存失败必须可见：服务挂了/网络断时若静默吞错，用户会误以为
                        已保存，重开页面/换设备后聊天记录就"消失"了。限频提示避免刷屏。 */
+                    state.saving = false;
+                    setSyncState('error', (e && e.message) || '网络异常');
                     if (!saveSessions._lastErrAt || Date.now() - saveSessions._lastErrAt > 10000) {
                       saveSessions._lastErrAt = Date.now();
                       try { toast('记录保存失败，仅存本机：' + ((e && e.message) || '网络异常')); } catch (_) {}
                     }
                 });
-              } catch (e) {}
+              } catch (e) { state.saving = false; }
             };
             if (immediate) doSave();
             else saveTimer = setTimeout(doSave, 300);
           }
-          /* 关页/刷新前兜底刷盘，避免 300ms 防抖窗口内的消息丢失 */
-          window.addEventListener('pagehide', function(){ saveSessions(true); saveDraft(true); });
+          /* 脏数据自动补推：失败/离线的变更每 15s 重试一次（页面可见时），直到落盘 */
+          setInterval(function(){
+            try {
+              if (state.dirty && !state.saving && isOnlineNow() && !document.hidden) saveSessions(true);
+            } catch (e) {}
+          }, 15000);
+          window.addEventListener('online', function(){
+            renderSyncStatus();
+            if (state.dirty) saveSessions(true);
+          });
+          window.addEventListener('offline', function(){ state.saving = false; setSyncState('offline'); });
+          /* 关页/刷新前兜底刷盘，避免 300ms 防抖窗口内的消息丢失。
+             唯一使用 keepalive 的地方：页面存活时的请求一律不用（超 64KB 直接发不出去） */
+          window.addEventListener('pagehide', function(){ saveSessions(true, true); saveDraft(true); });
           function findSession(id) {
             for (var i = 0; i < sessions.length; i++) {
               if (sessions[i].id === id) return sessions[i];
@@ -2413,7 +2811,15 @@
             return null;
           }
           function currentSession() {
-            return findSession(currentSessionId) || ensureMainSession();
+            var s = findSession(currentSessionId);
+            if (s) return s;
+            /* 当前 id 已失效（会话被删/合并丢失）：修回主对话并同步选中态，
+               否则后续发送静默失败、侧栏无高亮（"点不开"的根源之一） */
+            var main = ensureMainSession();
+            currentSessionId = main.id;
+            persistLocal();
+            renderSessions();
+            return main;
           }
           /* 会话列表排序：置顶优先，组内按最近活跃时间倒序。
              渲染、删除后选会话、服务端合并三处共用，保证顺序一致 */
@@ -2453,9 +2859,22 @@
             var last = (s.history && s.history.length) ? s.history[s.history.length - 1] : null;
             return [s.updatedAt || 0, s.history ? s.history.length : 0, s.title || '',
               s.pinned ? 1 : 0, s.manualTitle ? 1 : 0,
-              last ? ((last.content || '').length + '|' + (last.role || '')) : '-'].join('~');
+              last ? ((last.content || '').length + '|' + (last.role || '') + '|' + ((last.attachments || []).length)) : '-'].join('~');
           }
-          /* 竞态防御：shorter 是否严格是 longer 的消息序列前缀（逐条 role+content 一致）。
+          /* 消息指纹：role+content+style+附件。同一文本配不同图片/附件
+             不得视为同一条（旧实现只比 role+content，同文不同图的并发合并会丢消息）。
+             注意 audio（TTS 持久化 URL）故意不进指纹：它是任一端事后独立写入的
+             易变元数据，两端同一条消息一方带 audio 一方不带时若视为不同，
+             分歧合并会把"同一条"追加两次（相邻双胞胎 bug）。与后端 _msg_key 同规则。 */
+          function msgSig(m) {
+            if (!m) return '';
+            var atts = '';
+            try {
+              atts = (m.attachments || []).map(function(a){ return (a.name || '') + ':' + (a.size || 0); }).join(',');
+            } catch (e) {}
+            return (m.role || '') + ' ' + (m.content || '') + ' ' + (m.style || '') + ' ' + atts;
+          }
+          /* 竞态防御：shorter 是否严格是 longer 的消息序列前缀（逐条指纹一致）。
              多端同会话并发写/时钟偏移时，持旧快照的一端 updatedAt 可能更新但消息更少，
              若允许它覆盖另一端，会把刚保存的消息整段抹掉（与后端 _merge_sessions 同一规则） */
           function isPrefixSeq(shorter, longer) {
@@ -2464,7 +2883,7 @@
             for (var i = 0; i < shorter.length; i++) {
               var a = shorter[i], b = longer[i];
               if (!a || !b) return false;
-              if (a.role !== b.role || (a.content || '') !== (b.content || '')) return false;
+              if (msgSig(a) !== msgSig(b)) return false;
             }
             return true;
           }
@@ -2478,7 +2897,7 @@
               var a = shorter[i], found = false;
               while (j < n) {
                 var b = longer[j++];
-                if (a && b && a.role === b.role && (a.content || '') === (b.content || '')) { found = true; break; }
+                if (a && b && msgSig(a) === msgSig(b)) { found = true; break; }
               }
               if (!found) return false;
             }
@@ -2487,9 +2906,9 @@
           /* 消息级合并：保留 base 顺序，extra 中不在 base 里的消息按原顺序追加（去重）。 */
           function unionHistory(base, extra) {
             var seen = {}, out = (base || []).slice();
-            (base || []).forEach(function(m){ seen[m.role + '\u0000' + (m.content || '')] = true; });
+            (base || []).forEach(function(m){ seen[msgSig(m)] = true; });
             (extra || []).forEach(function(m){
-              var k = m.role + '\u0000' + (m.content || '');
+              var k = msgSig(m);
               if (!seen[k]) { seen[k] = true; out.push(m); }
             });
             return out;
@@ -2574,8 +2993,12 @@
               });
               saveTombstones(newTomb);
 
-              /* 与远端完全一致：不渲染也不回传，避免两端互相 PUT 乒乓 */
-              if (!changed && merged.length === sessions.length) return;
+              /* 与远端完全一致：不渲染也不回传，避免两端互相 PUT 乒乓；
+                 内容一致即服务端已有全量，顺手清掉 dirty（省掉 15s 补推的一次空跑） */
+              if (!changed && merged.length === sessions.length) {
+                if (state.dirty) { state.dirty = false; if (state.syncState !== 'ok') setSyncState('ok'); }
+                return;
+              }
 
               sessions = merged;
               var activeIdBefore = currentSessionId;
@@ -2656,8 +3079,8 @@
              但排序/置顶/标题/活跃时间/选中态都没变时 DOM 无需重建。
              用轻量指纹串比对（不依赖深比较），不变直接跳过 → 连续收发消息不再反复重建列表 */
           var sessionsRenderKey = '';
-          /* ---- 主对话模式：每角色一个固定主对话（id=main_{role}），禁新建、不切换 ----
-             首次进入某角色时，若存在旧会话，取最新一个的内容迁移进主对话（旧数据保留不显示）。 */
+          /* ---- 主对话：每角色一个固定主对话（id=main_{role}），置顶常驻 ----
+             首次进入某角色时，若存在旧会话，取最新一个的内容迁移进主对话（旧会话保留在下方列表，可随时切回）。 */
           function mainSessionId(){ return 'main_' + (currentRoleKey || 'role'); }
           function ensureMainSession(){
             var mid = mainSessionId();
@@ -2688,14 +3111,27 @@
             }));
           }
           /* 角色变化时才把当前会话校正回主对话；同一角色内用户自由切换历史会话，
-             不被周期性状态刷新拽回 */
+             不被周期性状态刷新拽回。
+             冷启动首轮（_lastSyncedRole 为 null）不硬切：初始化已按 savedActive
+             恢复过有效会话，硬切会让"刷新即回到主对话"（历史看起来像被回退）。 */
           var _lastSyncedRole = null;
           function syncSessionForRole() {
             var main = ensureMainSession();
             if (_lastSyncedRole !== currentRoleKey) {
+              var first = (_lastSyncedRole === null);
               _lastSyncedRole = currentRoleKey;
-              currentSessionId = main.id;
-              renderCurrentSession();
+              var keep = false;
+              if (first) {
+                try {
+                  var visIds = {};
+                  visibleSessions().forEach(function(x){ visIds[x.id] = true; });
+                  keep = !!visIds[currentSessionId];
+                } catch (e) { keep = false; }
+              }
+              if (!keep) {
+                currentSessionId = main.id;
+                renderCurrentSession();
+              }
             }
             renderSessions();
           }
@@ -2734,12 +3170,33 @@
             /* 主对话固定排最前，其余按置顶/活跃时间排序；key 与渲染共用同一顺序 */
             var vis = visibleSessions();
             var ordered = vis.slice(0, 1).concat(sortSessions(vis.slice(1)));
-            var key = ordered.map(function(x){
+            /* 会话搜索：标题或正文命中即保留（正文从新往旧扫，命中即停） */
+            var q = (sessionSearchQuery || '').trim().toLowerCase();
+            if (q) {
+              ordered = ordered.filter(function(x){
+                if ((x.title || '').toLowerCase().indexOf(q) >= 0) return true;
+                var h = x.history || [];
+                for (var hi = h.length - 1; hi >= 0; hi--) {
+                  var c = h[hi] && h[hi].content;
+                  if (c && String(c).toLowerCase().indexOf(q) >= 0) return true;
+                }
+                return false;
+              });
+            }
+            var key = q + '~~' + ordered.map(function(x){
               return x.id + '|' + (x.pinned ? 1 : 0) + '|' + (x.title || '') + '|' + (x.updatedAt || 0) + '|' + (x.id === currentSessionId ? 1 : 0);
             }).join('~');
             if (key === sessionsRenderKey && sessionsBox.childNodes.length) return;
             sessionsRenderKey = key;
             sessionsBox.innerHTML = '';
+            if (!ordered.length) {
+              var empty = document.createElement('div');
+              empty.className = 'sessions-empty';
+              empty.textContent = q ? '没有匹配的会话，换个关键词试试' : '还没有会话，点「新对话」开始聊吧';
+              sessionsBox.appendChild(empty);
+              sessionsAnimatedOnce = true;
+              return;
+            }
             /* 文档片段批量挂载：几十个会话一次性 append，只触发一次布局/重绘 */
             var frag = document.createDocumentFragment();
             ordered.forEach(function(session, idx){
@@ -2757,7 +3214,7 @@
               }
               s.querySelector('.s-time').textContent = timeLabel(session.updatedAt);
               bindSessionClick(s);
-              /* 主对话模式：不绑定右键/长按菜单（禁删除/重命名/置顶主对话） */
+              bindSessionMenu(s);
               frag.appendChild(s);
             });
             sessionsBox.appendChild(frag);
@@ -2809,10 +3266,20 @@
             });
             return btn;
           }
-          function renderCurrentSession() {
-            stopAudio();
-            state.playSeq++; /* 切换会话：作废所有在飞/挂起的朗读请求，防止旧结果晚到抢播 */
+          function renderCurrentSession(opts) {
+            opts = opts || {};
+            /* 默认行为不变：切会话/新对话/删当前会话时停掉朗读并作废挂起请求。
+               删除单条消息等轻量重绘传 {keepAudio:true}，不断正在听的音频。 */
+            if (!opts.keepAudio) {
+              stopAudio();
+              state.playSeq++; /* 切换会话：作废所有在飞/挂起的朗读请求，防止旧结果晚到抢播 */
+            }
             hideTyping();
+            /* preserveScroll：删除旧消息时记住"距底部距离"，重绘后恢复，
+               不再把正在上翻看历史的用户拽到底部 */
+            var scrollerEl = (opts.preserveScroll && document.getElementById('msgs')) || null;
+            var keepDist = scrollerEl
+              ? (scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight) : 0;
             /* 连 .msg-guide（2027 剧情引导卡）与 .load-earlier（窗口化按钮）一起清：
                类名都不含 .msg，漏清会残留并叠加（多次重渲染出现多张卡/多个按钮） */
             msgsInner.querySelectorAll('.msg, .msg-guide, .load-earlier').forEach(function(m){ m.remove(); });
@@ -2884,6 +3351,8 @@
               }
             });
             msgsInner.appendChild(frag);
+            /* 消息搜索开着时按新视图重跑，保证命中与当前内容一致 */
+            try { if (typeof runMsgSearch === 'function' && msgSearchBar && !msgSearchBar.hidden) runMsgSearch(); } catch (e) {}
             /* 历史以用户消息结尾 = 上一轮生成失败/中断，回复没入库（失败气泡不持久化）。
                补一条带「重试」按钮的失败气泡，避免只剩用户消息无法重新生成；
                正在等待回复时不补（此时末尾用户消息属于进行中的请求） */
@@ -2896,11 +3365,18 @@
               }, { noScroll: true });
             }
             updateChatTitle();
-            scrollBottom(true);
+            if (opts.keepAudio && state.playing) rebindPlayingBtn();
+            if (scrollerEl) {
+              scrollerEl.scrollTop = Math.max(0, scrollerEl.scrollHeight - scrollerEl.clientHeight - keepDist);
+            } else {
+              scrollBottom(true);
+            }
             restoreDraft();  /* 恢复当前会话未发送的草稿 */
           }
           function switchSession(id) {
             if (id === currentSessionId) return;
+            abortChatInFlight();  /* 切走即停掉旧会话的在飞生成：旧流晚到不再写回错误视图 */
+            saveDraft(true);  /* 切走前存下旧会话的草稿 */
             currentSessionId = id;
             saveSessions();
             renderSessions();
@@ -2952,13 +3428,17 @@
             }, { passive: true });
             document.addEventListener('touchend', function(){ tracking = false; }, { passive: true });
           })();
-          /* Esc 统一收起浮层：抽屉 / 设置弹窗 / 附件菜单 / 右键菜单 */
+          /* Esc 统一收起浮层：抽屉 / 设置弹窗 / 附件菜单 / 右键菜单 / 消息搜索 / 灯箱 */
           document.addEventListener('keydown', function(e){
             if (e.key !== 'Escape') return;
+            /* 确认弹窗打开时只让它自己处理 Esc（取消），别顺手关掉底下的设置/抽屉 */
+            try { if (_cfModal && _cfModal.classList.contains('show')) return; } catch (err) {}
             closeDrawer();
             closeSettings();
             toggleAttachMenu(false);
             hideCtxMenu();
+            try { closeMsgSearch(); } catch (err) {}
+            try { closeLightbox(); } catch (err2) {}
           });
           /* 点击抽屉内条目（会话/角色/新对话/引擎切换/导航）后自动收起；
              重命名输入框(.renaming)除外，否则打字时抽屉会被关掉 */
@@ -2980,8 +3460,17 @@
               switchSession(s.dataset.id);
             });
           }
-          /* 会话菜单项：桌面右键与触屏长按共用同一份 */
+          /* 会话菜单项：桌面右键与触屏长按共用同一份。
+             主对话是固定入口，禁重命名/置顶/删除，仅保留复制与导出 */
           function sessionMenuItems(sess){
+            if (sess && sess.id === mainSessionId()) {
+              return [
+                { label: '复制对话记录', icon: 'copy', onClick: function(){
+                  copyToClipboard(sessionTranscript(sess), '已复制对话记录');
+                } },
+                { label: '导出对话记录', icon: 'download', onClick: function(){ exportSession(sess); } },
+              ];
+            }
             return [
               { label: '重命名', icon: 'edit', onClick: function(){ startRenameSession(sess); } },
               { label: sess.pinned ? '取消置顶' : '置顶会话', icon: 'pin', onClick: function(){
@@ -2997,12 +3486,16 @@
               { divider: true },
               { label: '删除会话', icon: 'trash', danger: true, onClick: function(){
                 var wasActive = sess.id === currentSessionId;
+                abortChatInFlight();  /* 删会话先停在飞生成，防旧流晚到写回已删会话 */
                 stopAudio();
                 state.playSeq++; /* 删除会话：作废所有在飞/挂起的朗读请求 */
                 addTombstone(sess.id); /* 墓碑：其他设备同步时不得复活该会话 */
                 sessions = sessions.filter(function(x){ return x.id !== sess.id; });
                 if (wasActive) {
-                  var next = sortSessions(sessions)[0];
+                  /* 删的是当前会话：优先回主对话（必可见），保证总有有效 currentSessionId；
+                     删光（仅剩主对话也被删的极端情况）才建新会话兜底 */
+                  var main = ensureMainSession();
+                  var next = findSession(main.id) || sortSessions(sessions)[0];
                   if (next) currentSessionId = next.id;
                   else {
                     // 删光后新建会话：必须同步 currentSessionId，否则它仍指向已删除的会话，
@@ -3145,9 +3638,12 @@
             toast('已导出：' + fname);
           }
           function newSession(){
+            abortChatInFlight();  /* 新对话即停掉旧会话的在飞生成 */
+            saveDraft(true);  /* 先存下当前会话的草稿，再切走 */
             var s = makeSession('新对话');
             sessions.unshift(s);
             currentSessionId = s.id;
+            persistLocal();
             renderSessions();
             renderCurrentSession();
             /* 占位会话不落库：此时没有消息，saveSessions 会把空「新对话」同步到
@@ -3156,18 +3652,22 @@
           }
           var newBtn = document.querySelector('[data-dom-id="btn-new"]');
           if (newBtn) {
-            /* 主对话模式：每角色一个主对话，禁新建（按钮隐藏 + 事件拦截双保险） */
-            newBtn.style.display = 'none';
+            /* 多会话模式：主对话置顶常驻，历史会话列在下方，可自由新建/切换 */
             newBtn.addEventListener('click', function(e){
               e.preventDefault();
               e.stopPropagation();
-              toast('主对话模式：所有消息都在与当前角色的主对话里');
+              newSession();
+              closeDrawer();
             });
           }
-          var savedActive = localStorage.getItem(ACTIVE_KEY);
-          /* 主对话模式：忽略历史保存的会话 id，统一指向当前角色主对话（服务端真实角色由 refreshStatus 同步校正） */
+          var savedActive = null;
+          try { savedActive = localStorage.getItem(ACTIVE_KEY); } catch (e) {}
+          /* 恢复上次打开的会话（仍在可见列表里才用），否则回落主对话；
+             服务端真实角色由 refreshStatus 同步校正（syncSessionForRole） */
           ensureMainSession();
-          currentSessionId = mainSessionId();
+          var _visIds = {};
+          visibleSessions().forEach(function(x){ _visIds[x.id] = true; });
+          currentSessionId = (savedActive && _visIds[savedActive]) ? savedActive : mainSessionId();
           /* 初始化只写本地：若 localStorage 为空而服务端有真实历史，
              此时 PUT 会把种子会话推上去覆盖历史（GET/PUT 竞态）。
              真正的服务端同步由 syncSessionsFromServer 合并后回传 */
@@ -3244,6 +3744,254 @@
               c.style.transitionDelay = (i * 60).toFixed(0) + 'ms';
             });
           })();
+
+          /* ---------- 同步状态行：点击重试 + 初始渲染 + 存储自检 ---------- */
+          (function(){
+            var el = document.getElementById('sync-status');
+            if (el) el.addEventListener('click', function(){ saveSessions(true); });
+            var chip = document.getElementById('sync-chip');
+            if (chip) chip.addEventListener('click', function(){ saveSessions(true); });
+            if (!isOnlineNow()) setSyncState('offline');
+            else renderSyncStatus();
+            /* 启动自检：localStorage 不可用（隐私模式/配额满/被禁用）立刻告警，
+               别等到丢数据才发现 */
+            try {
+              localStorage.setItem('xiaoni_probe', '1');
+              var probeOk = localStorage.getItem('xiaoni_probe') === '1';
+              localStorage.removeItem('xiaoni_probe');
+              if (!probeOk) throw new Error('probe mismatch');
+            } catch (e) {
+              setSyncState('error', '浏览器存储不可用');
+              setTimeout(function(){ toast('浏览器存储不可用：聊天记录无法保存在本机，请检查隐私模式/存储权限'); }, 1500);
+            }
+            /* 开机即从快照恢复过：明确告诉用户，而不是静默多出记录 */
+            if (window.__xiaoniRestored) {
+              setTimeout(function(){ toast('已从本地快照恢复聊天记录'); }, 1200);
+            }
+          })();
+
+          /* ---------- 诊断入口：Console 里执行 __xiaoniDiag()，把返回贴回来即可定位 ---------- */
+          window.__xiaoniDiag = function() {
+            var info = { sessions: 0, totalMsgs: 0, current: null,
+              lastSync: null, syncState: null, dirty: false, saving: false, online: true,
+              localOk: false, localLen: 0, localSessions: -1,
+              bakAt: null, bakLen: 0, restored: !!window.__xiaoniRestored,
+              serializable: false, serialErr: '' };
+            try {
+              info.sessions = sessions.length;
+              info.totalMsgs = sessions.reduce(function(n, s){ return n + ((s.history || []).length); }, 0);
+              info.current = currentSessionId;
+              info.lastSync = state.lastSync;
+              info.syncState = state.syncState;
+              info.dirty = !!state.dirty;
+              info.saving = !!state.saving;
+              info.online = isOnlineNow();
+            } catch (e) {}
+            try {
+              var raw = localStorage.getItem(SESSIONS_KEY);
+              info.localLen = raw ? raw.length : 0;
+              info.localSessions = raw ? JSON.parse(raw).length : -1;
+              info.localOk = true;
+            } catch (e) { info.localOk = false; info.localErr = (e && e.message) || String(e); }
+            try { JSON.stringify(sessions); info.serializable = true; }
+            catch (e) { info.serializable = false; info.serialErr = (e && e.message) || String(e); }
+            try {
+              var bat = localStorage.getItem(SYNC_BAK_AT);
+              info.bakAt = bat ? new Date(parseInt(bat, 10)).toLocaleString('zh-CN') : null;
+              var bak = localStorage.getItem(SYNC_BAK_KEY);
+              info.bakLen = bak ? bak.length : 0;
+            } catch (e) {}
+            return info;
+          };
+
+          /* ---------- 会话搜索框（侧栏过滤标题与正文） ---------- */
+          (function(){
+            var inp = document.getElementById('sess-search-input');
+            if (!inp) return;
+            inp.addEventListener('input', function(){
+              sessionSearchQuery = inp.value || '';
+              sessionsRenderKey = '';  /* query 已进 key，这里再清一次防旧 key 残留 */
+              renderSessions();
+            });
+          })();
+
+          /* ---------- 消息内搜索（当前会话，↑/↓ 跳转） ---------- */
+          var msgSearchBar = document.getElementById('msg-search');
+          var msgSearchInput = document.getElementById('msg-search-input');
+          var msgSearchCount = document.getElementById('msg-search-count');
+          var msgSearchPrev = document.getElementById('msg-search-prev');
+          var msgSearchNext = document.getElementById('msg-search-next');
+          var msgSearchClose = document.getElementById('msg-search-close');
+          var msgHits = [], msgHitIdx = -1;
+          var msgSearchCapped = false;  /* 更早历史还有未载入的匹配（触 600 条加载上限） */
+          function clearMsgSearchHi() {
+            msgsInner.querySelectorAll('.msg-search-hit,.msg-search-current').forEach(function(el){
+              el.classList.remove('msg-search-hit', 'msg-search-current');
+            });
+          }
+          function paintMsgSearchCurrent() {
+            msgsInner.querySelectorAll('.msg-search-current').forEach(function(el){ el.classList.remove('msg-search-current'); });
+            var el = msgHits[msgHitIdx];
+            if (!el) return;
+            el.classList.add('msg-search-current');
+            try { el.scrollIntoView({ block: 'center', behavior: reduceMotion ? 'auto' : 'smooth' }); } catch (e) {
+              try { el.scrollIntoView({ block: 'center' }); } catch (e2) {}
+            }
+            /* 尾缀 + 表示更早历史里还有匹配：点「加载更早消息」继续载入后计数会自动补全 */
+            if (msgSearchCount) msgSearchCount.textContent = (msgHitIdx + 1) + '/' + msgHits.length + (msgSearchCapped ? '+' : '');
+          }
+          function runMsgSearch() {
+            var q = msgSearchInput ? (msgSearchInput.value || '').trim().toLowerCase() : '';
+            clearMsgSearchHi();
+            msgHits = []; msgHitIdx = -1; msgSearchCapped = false;
+            if (msgSearchCount) msgSearchCount.textContent = '';
+            if (!q || !msgsInner) return;
+            /* 全量搜索：窗口化后更早消息不在 DOM 里。先在 state.history 按下标全量匹配，
+               把命中所需的最早消息批量补载入（上限约 600 条防长会话卡死），再高亮。
+               旧实现只扫已渲染 DOM，长会话搜更早内容永远显示"无匹配"。 */
+            try {
+              var histAll = state.history || [];
+              var earliest = -1;
+              for (var hi = 0; hi < histAll.length; hi++) {
+                var hc = histAll[hi] && histAll[hi].content;
+                if (hc && String(hc).toLowerCase().indexOf(q) >= 0) { if (earliest < 0) earliest = hi; }
+              }
+              while (earliest >= 0 && earliest < historyRenderedFrom
+                  && (histAll.length - historyRenderedFrom) < 600) {
+                var nf = Math.max(0, historyRenderedFrom - 120);
+                var f2 = document.createDocumentFragment();
+                renderHistoryRange(nf, historyRenderedFrom, f2);
+                var lb = msgsInner.querySelector('.load-earlier');
+                historyRenderedFrom = nf;
+                if (lb) {
+                  msgsInner.insertBefore(f2, lb);
+                  if (nf > 0) lb.textContent = '加载更早消息（还有 ' + nf + ' 条）';
+                  else lb.remove();
+                } else if (msgsInner.firstChild) {
+                  msgsInner.insertBefore(f2, msgsInner.firstChild);
+                } else {
+                  msgsInner.appendChild(f2);
+                }
+              }
+              msgSearchCapped = earliest >= 0 && earliest < historyRenderedFrom;
+            } catch (err) {}
+            msgsInner.querySelectorAll('.msg').forEach(function(m){
+              var b = m.querySelector('.bubble');
+              if (b && (b.textContent || '').toLowerCase().indexOf(q) >= 0) {
+                m.classList.add('msg-search-hit');
+                msgHits.push(m);
+              }
+            });
+            if (!msgHits.length) {
+              if (msgSearchCount) msgSearchCount.textContent = '无匹配';
+              return;
+            }
+            msgHitIdx = 0;
+            paintMsgSearchCurrent();
+          }
+          function stepMsgSearch(d) {
+            if (!msgHits.length) return;
+            msgHitIdx = (msgHitIdx + d + msgHits.length) % msgHits.length;
+            paintMsgSearchCurrent();
+          }
+          function closeMsgSearch() {
+            if (!msgSearchBar || msgSearchBar.hidden) return;
+            msgSearchBar.hidden = true;
+            clearMsgSearchHi();
+            msgHits = []; msgHitIdx = -1;
+          }
+          (function(){
+            var openBtn = document.getElementById('btn-msg-search');
+            if (openBtn) openBtn.addEventListener('click', function(){
+              if (!msgSearchBar) return;
+              if (msgSearchBar.hidden) {
+                msgSearchBar.hidden = false;
+                if (msgSearchInput) { msgSearchInput.focus(); runMsgSearch(); }
+              } else {
+                closeMsgSearch();
+              }
+            });
+            if (msgSearchClose) msgSearchClose.addEventListener('click', closeMsgSearch);
+            if (msgSearchPrev) msgSearchPrev.addEventListener('click', function(){ stepMsgSearch(-1); });
+            if (msgSearchNext) msgSearchNext.addEventListener('click', function(){ stepMsgSearch(1); });
+            if (msgSearchInput) {
+              msgSearchInput.addEventListener('input', runMsgSearch);
+              msgSearchInput.addEventListener('keydown', function(e){
+                if (e.key === 'Enter') { e.preventDefault(); stepMsgSearch(e.shiftKey ? -1 : 1); }
+              });
+            }
+          })();
+
+          /* ---------- 浅色/深色主题（默认深色，localStorage 持久化） ---------- */
+          var THEME_KEY = 'xiaoni_theme';
+          function applyTheme(t) {
+            if (t !== 'light') t = 'dark';
+            document.documentElement.classList.toggle('dark', t === 'dark');
+            try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+            var btn = document.getElementById('btn-theme');
+            if (btn) btn.title = t === 'dark' ? '切换到浅色主题' : '切换到深色主题';
+          }
+          (function(){
+            var t = 'dark';
+            try { t = localStorage.getItem(THEME_KEY) || 'dark'; } catch (e) {}
+            applyTheme(t === 'light' ? 'light' : 'dark');
+            var btn = document.getElementById('btn-theme');
+            if (btn) btn.addEventListener('click', function(){
+              applyTheme(document.documentElement.classList.contains('dark') ? 'light' : 'dark');
+            });
+          })();
+
+          /* ---------- 消息字号三档（设置面板，仅放大正文与输入框） ---------- */
+          var FONT_KEY = 'xiaoni_font';
+          function applyFont(f) {
+            if (f !== 'lg' && f !== 'xl') f = 'std';
+            if (f === 'std') document.documentElement.removeAttribute('data-font');
+            else document.documentElement.setAttribute('data-font', f);
+            try { localStorage.setItem(FONT_KEY, f); } catch (e) {}
+            document.querySelectorAll('#font-tabs .set-tab').forEach(function(b){
+              b.classList.toggle('active', b.dataset.font === f);
+            });
+          }
+
+          /* ---------- 图片灯箱（点击消息图片全屏查看） ---------- */
+          var lightboxEl = null, lightboxImg = null;
+          function openLightbox(src) {
+            if (!lightboxEl) lightboxEl = document.getElementById('lightbox');
+            if (!lightboxImg) lightboxImg = document.getElementById('lightbox-img');
+            if (!lightboxEl || !lightboxImg || !src) return;
+            lightboxImg.src = src;
+            lightboxEl.hidden = false;
+          }
+          function closeLightbox() {
+            if (!lightboxEl) lightboxEl = document.getElementById('lightbox');
+            if (!lightboxEl || lightboxEl.hidden) return;
+            lightboxEl.hidden = true;
+            if (lightboxImg) lightboxImg.removeAttribute('src');
+          }
+          /* 字号初始化 + 字号监听 + 灯箱接线统一入口：#font-tabs / #lightbox 都在
+             app.js script 标签之后（</main> 后），直接执行时 DOM 还不存在，
+             必须等 DOMContentLoaded（与 initSettings 同一原因，注释见其上） */
+          function initAppearance(){
+            var f = 'std';
+            try { f = localStorage.getItem(FONT_KEY) || 'std'; } catch (e) {}
+            applyFont(f);
+            document.querySelectorAll('#font-tabs .set-tab').forEach(function(b){
+              b.addEventListener('click', function(){ applyFont(b.dataset.font); });
+            });
+            lightboxEl = document.getElementById('lightbox');
+            lightboxImg = document.getElementById('lightbox-img');
+            if (lightboxEl) lightboxEl.addEventListener('click', closeLightbox);
+            /* 委托：附件图片点击进灯箱（阻止默认的新标签页跳转） */
+            msgsInner.addEventListener('click', function(e){
+              var a = e.target && e.target.closest ? e.target.closest('.att-img') : null;
+              if (!a) return;
+              var img = a.querySelector('img');
+              var src = (img && img.currentSrc) || (img && img.src) || a.href;
+              if (src) { e.preventDefault(); openLightbox(src); }
+            });
+          }
+          if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initAppearance);
+          else initAppearance();
 
           refreshStatus();
 

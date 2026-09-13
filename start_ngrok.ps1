@@ -1,10 +1,12 @@
 # 启动 ngrok 隧道（手机远程访问 8000 端口服务）
-# 用法：由 Win32_Process.Create 或双击调用；隧道 URL 自动写入 data/tunnel_url.txt
+# 用法：双击调用；隧道 URL（单行）自动写入 data/tunnel_url.txt（AGENTS.md 约定的唯一真值）
 $ErrorActionPreference = 'Stop'
+$root = $PSScriptRoot
+if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $ng = 'C:\Users\31557\AppData\Local\ngrok\ngrok.exe'
-$log = 'd:\Users\31557\Desktop\AI拟人系统\data\ngrok_tunnel.log'
-$err = 'd:\Users\31557\Desktop\AI拟人系统\data\ngrok_tunnel_err.log'
-$urlFile = 'd:\Users\31557\Desktop\AI拟人系统\data\tunnel_url.txt'
+if (-not (Test-Path -LiteralPath $ng)) { $ng = 'ngrok' }
+$log = Join-Path $root 'data\ngrok_tunnel.log'
+$urlFile = Join-Path $root 'data\tunnel_url.txt'
 
 # 已存在的 ngrok 进程先停（避免多隧道抢占）
 Get-CimInstance Win32_Process -Filter "Name='ngrok.exe'" -ErrorAction SilentlyContinue |
@@ -12,34 +14,33 @@ Get-CimInstance Win32_Process -Filter "Name='ngrok.exe'" -ErrorAction SilentlyCo
 Start-Sleep -Seconds 1
 
 $p = Start-Process -FilePath $ng -ArgumentList 'http', '8000', '--log=stdout' `
-    -RedirectStandardOutput $log -RedirectStandardError $err -WindowStyle Hidden -PassThru
+    -RedirectStandardOutput $log -WindowStyle Hidden -PassThru
 Write-Output "ngrok started PID=$($p.Id)"
 
-# 等待隧道就绪并抓取 URL（ngrok 3.x 日志: msg="started tunnel" ... url=https://xxx.ngrok-free.app）
+# 等待隧道就绪并抓取 URL：优先问 127.0.0.1:4040 API（最可靠），日志解析仅作兜底。
+# ngrok 免费版每次重启会换域名，拿到后必须单行写入 tunnel_url.txt。
 $url = ''
-for ($i = 0; $i -lt 30; $i++) {
+for ($i = 0; $i -lt 25; $i++) {
     Start-Sleep -Seconds 1
+    try {
+        $tunnels = (Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -TimeoutSec 3).tunnels
+        $https = $tunnels | Where-Object { $_.proto -eq 'https' } | Select-Object -First 1
+        if ($https -and $https.public_url) { $url = $https.public_url; break }
+    } catch {}
     if (Test-Path $log) {
         $line = Get-Content $log -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
         if ($line -match 'url=https://(\S+)') {
-            $url = 'https://' + $matches[1]
+            $url = 'https://' + ($matches[1].TrimEnd('"'))
             break
         }
     }
 }
 if ($url) {
-    $content = @"
-AI 拟人系统 - 手机远程访问地址（ngrok 隧道）
-=========================================================
-当前可用地址（$(Get-Date -Format 'yyyy-MM-dd HH:mm')）：
-1. $url   <- 最新启动
-手机使用方法：
-1. 打开 APK，点 ⚙ 填下面的地址 + 访问口令
-2. 保存并进入即可聊天
-"@
-    Set-Content -Path $urlFile -Value $content -Encoding UTF8
+    # 唯一真值保持单行 URL（读取方直接 Get-Content 即用；多行说明文字会破坏解析）
+    Set-Content -Path $urlFile -Value $url -Encoding UTF8
     Write-Output "TUNNEL_URL=$url"
+    Write-Output "手机用浏览器打开该地址，首次遇到 ngrok 警告页（ERR_NGROK_6024）要点 Visit Site 后再登录（口令见 config.json 的 access_token）。"
 } else {
     Write-Output 'TUNNEL_URL=FAILED'
-    if (Test-Path $err) { Get-Content $err -Tail 10 -Encoding UTF8 }
+    Write-Output '隧道未就绪：检查 ngrok 是否已登录（ngrok config check）、8000 端口服务是否在跑（curl http://127.0.0.1:8000/api/health）。'
 }

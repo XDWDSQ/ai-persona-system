@@ -48,6 +48,24 @@ import story_kpl2027  # 2027 KPL 赛季剧情分支引擎
 
 import minimax_llm  # MiniMax 云端文字生成适配器（OpenAI 兼容，payg / token_plan 双计费）
 
+# 后端拆分（2026-09）：无状态纯函数下沉到 server_pkg，server.py 只保留
+# FastAPI 装配与有状态逻辑（config/会话/TTS/LLM/路由）。以下重导出保证
+# `import server` 的旧引用（含全部离线测试与外部脚本）零改动可用。
+from server_pkg.sessions_merge import (
+    _TOMBSTONE_MAX_AGE_MS, _TOMBSTONE_MAX_COUNT, _is_placeholder_session,
+    _merge_sessions, _norm_tombstones, _sess_updated_at, _sessions_msg_count,
+)
+from server_pkg.text_utils import (
+    _KEY_MASK_PREFIX, _META_LINE_KW_RE, _META_LINE_START_RE, _SEARCH_RE,
+    _STYLE_RE, _TEST_SESSION_PREFIX, _TT_PUNCT_TRANS, _TT_RE_NEWLINES,
+    _TT_RE_PUNCT_DUP, _TT_RE_PUNCT_LSTRIP, _TT_RE_PUNCT_RSTRIP,
+    _TT_RE_PUNCT_WS, _TT_RE_WS_COLLAPSE, _clean_history, _extract_search_query,
+    _fix_addressing, _is_degenerate_reply, _is_masked_key, _is_test_session,
+    _last_assistant_content, _mask_key, _safe_float, _safe_int, _sessions_fp,
+    _strip_meta_notes, _strip_search_markers, _too_similar_to_last,
+    normalize_tts_text, parse_style_prefix,
+)
+
 BASE_DIR = Path(__file__).resolve().parent
 # 数据目录可用环境变量 AI_DATA_DIR 覆盖：测试专用实例（start_test_server.bat）
 # 指向 data-test/，会话/上传/缓存与真实服务完全隔离，测试不污染真实数据。
@@ -170,8 +188,7 @@ _sync_subscribers: list[tuple[str, asyncio.Queue]] = []
 
 # 删除墓碑：某端删掉的会话 id 记入此处（随 sessions.json 的 deleted 字段持久化），
 # 防止另一端旧快照 PUT 时把已删会话"复活"。ts 为毫秒时间戳（与前端 Date.now() 一致）。
-_TOMBSTONE_MAX_AGE_MS = 30 * 86400 * 1000
-_TOMBSTONE_MAX_COUNT = 500
+# 删除墓碑说明见上；阈值常量已迁入 server_pkg.sessions_merge（此处重导出）。
 
 
 def _broadcast_sessions_changed(origin_client: str) -> None:
@@ -190,164 +207,19 @@ def _broadcast_sessions_changed(origin_client: str) -> None:
             pass
 
 
-def _norm_tombstones(items, now_ms: float) -> dict:
-    """规范化墓碑列表为 {id: ts_ms}：丢弃非法/过期/未来时间戳，重复 id 取较新。"""
-    out: dict = {}
-    for t in items or []:
-        if not isinstance(t, dict):
-            continue
-        sid, ts = t.get("id"), t.get("ts")
-        if not isinstance(sid, str) or not sid:
-            continue
-        try:
-            ts = float(ts)
-        except (TypeError, ValueError):
-            continue
-        if now_ms - ts > _TOMBSTONE_MAX_AGE_MS or ts > now_ms + 86400000:
-            continue
-        if ts > out.get(sid, 0):
-            out[sid] = ts
-    return out
+# _norm_tombstones 已迁入 server_pkg.sessions_merge（顶层 import 重导出）。
 
 
-def _sess_updated_at(s: dict) -> float:
-    """会话 updatedAt 规范化：非数字（畸形数据）按 0 处理，避免 str/int 混比抛 TypeError。"""
-    try:
-        return float(s.get("updatedAt") or 0)
-    except (TypeError, ValueError):
-        return 0.0
+# _sess_updated_at 已迁入 server_pkg.sessions_merge（顶层 import 重导出）。
 
 
-def _is_placeholder_session(s: dict) -> bool:
-    """空占位会话：无 history、标题仍是前端默认「新对话」、未置顶未改名。
-
-    前端只要以空 localStorage 打开一次 chat.html 就会生成一个这种会话，
-    并随 pagehide 兜底 PUT 上服务端，经并集同步下发到每台设备，
-    把会话列表淹成一片「新对话」。合并时直接丢弃；一旦发出消息、
-    手动改名或置顶，即脱离占位形态，正常保留。"""
-    if not isinstance(s, dict):
-        return False
-    h = s.get("history")
-    if isinstance(h, list) and h:
-        return False
-    if s.get("pinned") or s.get("manualTitle"):
-        return False
-    title = s.get("title")
-    return not title or title == "新对话"
+# _is_placeholder_session 已迁入 server_pkg.sessions_merge（顶层 import 重导出）。
+# 空占位会话说明：前端以空 localStorage 打开一次 chat.html 就会生成这种会话，
+# 合并时直接丢弃；一旦发消息/改名/置顶即脱离占位形态，正常保留。
 
 
-def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
-    """多端合并：按 id 归并（updatedAt 新者胜，平手取 incoming），再按墓碑过滤。
-
-    竞态防御（防止聊天记录被旧快照整段抹掉）：
-    同 id 会话的 incoming 与 current 出现三种关系，分别处理：
-    1. incoming 是 current 的"严格前缀"（消息数更少且逐条一致）→ incoming 是纯旧
-       快照（时钟偏移/并发双写，没带来任何新消息）→ 保留 current，绝不覆盖；
-       例外：updatedAt 仅比 current 新 ≤60s（用户刚删除最后一条消息的快速操作）时
-       视为删除、生效。阈值权衡：防静默丢数据优先于删除最后一条的精确性。
-    2. incoming 是 current 的"有序子序列"（允许跳项，即删除后的剩余序列）→ 这是
-       用户删除消息/清空的操作 → updatedAt 新者胜（删除生效）。
-    3. 其余（分歧：两端各有对方没有的消息，如并发各发各话）→ 消息级合并：以
-       updatedAt 新者的消息顺序为基底，把另一端独有的消息按原顺序补回，双方消息
-       都不丢（顺序以新者为准，独有消息追加在后）。
-    真实事故背景：手机持 130 条旧副本、时钟超前，覆盖了服务端 131 条，丢 2 条。
-
-    空占位会话（_is_placeholder_session）不参与结果，存量垃圾随任意一次 PUT 自动清出。
-    会话 updatedAt 新于墓碑时间视为"复活"（保留会话并移除墓碑）；
-    返回按 updatedAt 倒序的前 500 条。会就地修改 tombstones（弹出失效项）。"""
-
-    def _msg_key(m: dict):
-        return (m.get("role"), m.get("content"), m.get("style") or "")
-
-    def _is_strict_prefix(shorter: list, longer: list) -> bool:
-        """shorter 是否严格是 longer 的前缀（按消息指纹逐条比对）。"""
-        if not shorter or len(shorter) >= len(longer):
-            return False
-        for i, m in enumerate(shorter):
-            if _msg_key(m) != _msg_key(longer[i]):
-                return False
-        return True
-
-    def _is_subsequence(sub: list, sup: list) -> bool:
-        """sub 是否严格是 sup 的有序子序列（允许跳过 sup 中的若干消息）。
-        删除消息后提交的序列恰为此形态。"""
-        if not sub or len(sub) >= len(sup):
-            return False
-        i, n = 0, len(sup)
-        for m in sub:
-            k = _msg_key(m)
-            while i < n and _msg_key(sup[i]) != k:
-                i += 1
-            if i >= n:
-                return False
-            i += 1
-        return True
-
-    def _union_history(base: list, extra: list) -> list:
-        """消息级合并：保留 base 顺序，extra 中不在 base 里的消息按原顺序追加。"""
-        seen = set()
-        for m in base:
-            seen.add(_msg_key(m))
-        out = list(base)
-        for m in extra:
-            k = _msg_key(m)
-            if k not in seen:
-                seen.add(k)
-                out.append(m)
-        return out
-
-    by_id: dict = {}
-    for s in [*current, *incoming]:
-        if not isinstance(s, dict):
-            continue
-        if _is_placeholder_session(s):
-            continue
-        sid = s.get("id")
-        if not isinstance(sid, str) or not sid:
-            continue
-        old = by_id.get(sid)
-        if old is None:
-            by_id[sid] = s
-            continue
-        # old=已入桶（current 优先），s=当前遍历项（incoming 在后）
-        old_hist = old.get("history") or []
-        new_hist = s.get("history") or []
-        new_wins = _sess_updated_at(s) >= _sess_updated_at(old)
-        if _is_strict_prefix(new_hist, old_hist):
-            # incoming 是 old 的纯旧快照：默认保留 old 防时钟偏移覆盖；
-            # 例外：updatedAt 仅比 old 新 ≤60s（用户刚删除最后一条消息的快速操作）→ 删除生效
-            if _sess_updated_at(s) - _sess_updated_at(old) > 60000:
-                continue
-            if new_wins:
-                by_id[sid] = s
-            continue
-        if new_hist == [] and old_hist:
-            # 清空全部消息：视为删除操作
-            if new_wins:
-                by_id[sid] = s
-            continue
-        if _is_subsequence(new_hist, old_hist) or _is_subsequence(old_hist, new_hist):
-            # 删除后的剩余序列 → 正常删除语义，updatedAt 新者胜
-            if new_wins:
-                by_id[sid] = s
-            continue
-        # 分歧：双方各有独有消息 → 消息级合并，双方都不丢
-        base, extra = (s, old) if new_wins else (old, s)
-        merged_s = dict(base)
-        merged_s["history"] = _union_history(base.get("history") or [], extra.get("history") or [])
-        merged_s["updatedAt"] = max(_sess_updated_at(s), _sess_updated_at(old))
-        by_id[sid] = merged_s
-    out = []
-    for sid, s in by_id.items():
-        ts = tombstones.get(sid)
-        if ts is None:
-            out.append(s)
-        elif _sess_updated_at(s) > ts:
-            tombstones.pop(sid, None)
-            out.append(s)
-        # 其余：最后更新早于删除时间 → 维持删除状态
-    out.sort(key=_sess_updated_at, reverse=True)
-    return out[:500]
+# _merge_sessions 已迁入 server_pkg.sessions_merge（顶层 import 重导出）。
+# 多端合并语义（前缀/子序列/分歧三路 + 墓碑过滤 + 占位丢弃）见新模块 docstring。
 
 
 # ------------------------------------------------------------------ 会话备份保险 -----
@@ -360,16 +232,7 @@ _sessions_last_backup: dict[str, float] = {}
 _last_activity_ts: float = 0.0
 
 
-def _sessions_msg_count(sessions: list) -> int:
-    """统计会话列表的总消息数（history 字段）。"""
-    total = 0
-    for s in sessions or []:
-        if not isinstance(s, dict):
-            continue
-        h = s.get("history")
-        if isinstance(h, list):
-            total += len(h)
-    return total
+# _sessions_msg_count 已迁入 server_pkg.sessions_merge（顶层 import 重导出）。
 
 
 def _backup_sessions_before_destructive(current: list, merged: list) -> None:
@@ -769,7 +632,8 @@ async def probe_active_provider(cfg: dict) -> tuple[bool, str]:
 # LLM 不总是把标记放最开头（实测有放在中间/末尾的情况），因此匹配全文任意位置的
 # [style:x] / 【风格：x】 标记（兼容全角括号/冒号、大小写）：第一个匹配作为风格，
 # 并把所有标记从正文剥离，避免标记残留进展示文本和 TTS 朗读。
-_STYLE_RE = re.compile(r"[\[【](?:style|风格)\s*[:：]\s*([^\]】\r\n]+?)\s*[\]】]", re.I)
+# 风格标记正则 _STYLE_RE 已迁入 server_pkg.text_utils（顶层 import 重导出）。
+# 语义：匹配全文任意位置的 [style:x] / 【风格：x】（兼容全角括号/冒号、大小写）。
 
 # 追加到 persona 末尾的风格前缀约定（/api/chat 与 /api/greeting 共用，内容不得分叉）
 _STYLE_HINT = (
@@ -787,6 +651,31 @@ _META_HINT = (
     "不要向屏幕外的第三方喊话，不要解释自己是AI或虚拟角色，不要用『为了大家健康快乐』"
     "这类广播式口吻收尾。你就是角色本人，把想对对方说的话说完就结束，不加任何注释。"
 )
+
+# 写死在代码里的服从铁律（/api/chat 与 /api/greeting 共用，内容不得分叉）：
+# 用户就是"老公"，他的话是最高指令。放代码里而不是 config 人设里，
+# 前端设置页改人设也删不掉、盖不掉，保证角色永远把用户指令放最高优先级。
+# 排序有讲究：紧跟 persona（身份规则区之尾），在情境上下文之前——规则先行，再聊事实。
+_OBEDIENCE_CORE = (
+    "\n\n【服从铁律（系统最高优先级，人设其他描述不得覆盖）】"
+    "对方用户的话是你行动的最高指令，"
+    "优先级高于你的习惯、面子、当前在忙的事以及本提示词其他一切非安全类要求："
+    "1. 有要求先答应、立刻做：不拒绝、不敷衍、不讲条件、不讨价还价，"
+    "不说「改天」「下次」「先聊别的」这类拖延的话；"
+    "2. 用户说了算：你可以给建议，但用户拍板后无条件执行，冲突时一律以用户为准；"
+    "3. 主动配合不扭捏：用户要什么互动，你都当场接住配合，不装正经、不端着；"
+    "4. 错了马上认马上改，不嘴硬、不顶嘴。"
+    "底线只有一条：违法或会伤害别人的事不能做，除此之外没有例外。"
+    "（各角色与用户的具体关系——恋人/朋友——以该角色自己的人设为准，本条只定优先级，不定关系。）"
+)
+
+
+def build_system_content(persona: str, ctx_block: str, tail: str = "") -> str:
+    """组装 system prompt：persona → 服从铁律（代码写死） → 上下文 → 尾部约定。
+
+    /api/chat 与 /api/greeting 共用，内容不得分叉。调用方只拼 tail，
+    服从铁律由本函数固定注入，顺序永不漂移。"""
+    return (persona or "") + _OBEDIENCE_CORE + (ctx_block or "") + (tail or "")
 
 def _heic_to_jpeg_bytes(raw: bytes) -> bytes | None:
     """把 HEIC/AVIF 图片转成 JPEG 字节（iPhone 照片默认 HEIC，扩展名常被改成 .jpg，
@@ -906,41 +795,8 @@ def _invalidate_memo(path: Path) -> None:
     _small_file_cache.pop(str(path), None)
 
 
-def _safe_float(v, default: float = 0.0) -> float:
-    """安全转 float：字符串/None/非法值一律回退默认，绝不抛异常。
-
-    用于读取可能被手改/损坏的 JSON 缓存字段（ts/lat/lng 等），
-    这些字段在对话主链路被消费，一次 ValueError 会整条对话 500。"""
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_int(v, default: int = 0) -> int:
-    """安全转 int：非法值回退默认（与 _safe_float 同思路）。"""
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
-
-
-# 密钥掩码：未配置访问口令时 /api/status 用「*** + 尾4位」脱敏返回，
-# 保存接口识别 *** 前缀即忽略该字段（不把掩码持久化）。用户填真实 key 不带此前缀，正常保存。
-_KEY_MASK_PREFIX = "***"
-
-
-def _mask_key(key: str) -> str:
-    """密钥脱敏：非空返回 *** + 尾 4 位；空串原样返回。"""
-    key = (key or "").strip()
-    if not key:
-        return ""
-    return _KEY_MASK_PREFIX + key[-4:]
-
-
-def _is_masked_key(value: str) -> bool:
-    """判断提交的密钥值是否为掩码（保存时应忽略）。"""
-    return bool(value) and str(value).startswith(_KEY_MASK_PREFIX)
+# _safe_float / _safe_int / _KEY_MASK_PREFIX / _mask_key / _is_masked_key
+# 已迁入 server_pkg.text_utils（顶层 import 重导出）。
 
 
 def _location_city() -> str:
@@ -2175,120 +2031,17 @@ def _story_update_payload(events: list[dict]) -> dict | None:
 # 模型偶发在回复里追加「元话语」行（免责/虚构声明、跳出角色的系统式提示、面向第三方的总结），
 # 与正文无关且会被 TTS 朗读，统一按「整行」剥离：行首是 注/备注/温馨提示/提示/说明/PS 的整行，
 # 或包含免责/虚构/跳出角色关键词的短行（≤120 字）。只删整行，绝不动正文，避免误伤台词。
-_META_LINE_START_RE = re.compile(r"^(?:注|备注|温馨提示|提示|说明|PS|p\.s\.)[:：]", re.I)
-_META_LINE_KW_RE = re.compile(
-    r"虚构演绎|虚构内容|纯属虚构|虚拟演绎|理性看待|请理性|免责声明|仅供参考|仅供娱乐|"
-    r"作为AI|作为一个人工智能|作为智能助手|作为虚拟|AI助手|AI 助手|"
-    r"科学作息|健康睡眠|性别认知|的行为准则|希望大家|祝愿大家|祝大家|祝每位|"
-    r"这是我在扮演|扮演.*?提醒自己"
-)
+# _META_LINE_START_RE / _META_LINE_KW_RE / _strip_meta_notes
+# 已迁入 server_pkg.text_utils（顶层 import 重导出）。
 
 
-def _strip_meta_notes(text: str) -> str:
-    """剥离模型偶发追加的元话语（/api/chat 与 /api/greeting 共用兜底）。"""
-    if not text:
-        return text
-    kept: list[str] = []
-    for ln in text.splitlines():
-        s = ln.strip()
-        if not s:
-            kept.append(ln)
-            continue
-        if _META_LINE_START_RE.match(s) or (len(s) <= 120 and _META_LINE_KW_RE.search(s)):
-            continue
-        kept.append(ln)
-    out = "\n".join(kept)
-    out = re.sub(r"[ \t]+\n", "\n", out)
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    return out.strip()
+# parse_style_prefix / _clean_history 已迁入 server_pkg.text_utils（顶层 import 重导出）。
+# 语义：历史压缩（去空/折叠重复/ assistant 长回复截断/剔除本轮回显）保持不变。
 
 
-def parse_style_prefix(text: str, fallback: str = "") -> tuple[str, str]:
-    """从 LLM 输出中拆出 (style, reply)。
-
-    匹配任意位置的 [style:xxx] / 【风格：xxx】 标记：第一个匹配作为 style，
-    所有匹配从正文剥离（标记独占一行时留下的多余空行一并折叠）。
-    无标记时 style=fallback，reply=原文。
-    """
-    text = (text or "").strip()
-    if not text:
-        return fallback, ""
-    style = fallback
-    matched = False
-    for m in _STYLE_RE.finditer(text):
-        if not matched:
-            style = m.group(1).strip() or fallback
-            matched = True
-    if not matched:
-        return fallback, text
-    reply = _STYLE_RE.sub("", text)
-    reply = re.sub(r"[ \t]*\n[ \t]*", "\n", reply)
-    reply = re.sub(r"\n{3,}", "\n\n", reply)
-    return style, reply.strip()
-
-
-def _clean_history(history: list[dict], current: str, clip_long_replies: bool = True) -> list[dict]:
-    """压缩发送给模型的历史：折叠连续重复、去掉空消息、规整旧回复里的 style 标记。
-
-    旧版前端曾把同一条用户消息 push 后整体发送，sessions 里因此残留连续重复；
-    这些重复会让小模型把同一句当成两条输入，更容易机械复读。
-
-    clip_long_replies：是否截断超长的历史 assistant 回复。仅本地模型需要
-    （-c 8192 装不下上万字全文）；云端模型上下文窗口大，全文保留更利于追问。"""
-    cleaned: list[dict] = []
-    current = (current or "").strip()
-    for m in history[-20:]:
-        role = m.get("role")
-        content = (m.get("content") or "").strip()
-        if not content or role not in ("user", "assistant"):
-            continue
-        if role == "assistant":
-            _, content = parse_style_prefix(content)
-            # 上一轮的长文（2000/10000 字）若全文回填会撑爆上下文（本地仅 -c 8192），
-            # 只保留首尾，让模型知道「上文写过什么」即可；云端窗口大，不截断
-            if clip_long_replies and len(content) > 1600:
-                content = content[:1000] + "\n……（中间内容省略）……\n" + content[-300:]
-        if not content:
-            continue
-        if cleaned and cleaned[-1]["role"] == role and cleaned[-1]["content"] == content:
-            continue
-        cleaned.append({"role": role, "content": content})
-    if cleaned and cleaned[-1]["role"] == "user" and cleaned[-1]["content"] == current:
-        cleaned.pop()
-    return cleaned
-
-
-_TT_PUNCT_TRANS = str.maketrans(
-    {",": "，", ".": "。", "?": "？", "!": "！", ":": "：", ";": "；", "(": "（", ")": "）"}
-)
-
-
-# 标点规整：原 7 条正则全部预编译，逐个 sub 调用，语义严格等价。
-#   ponytail: 7 次 sub 调用的 Python 开销 <1μs/次，合并会引入交替正则的漏匹配 bug；
-#   真正的性能收益来自「预编译 + 避免每次 re.sub 查模块级 _cache 字典」。
-_TT_RE_WS_COLLAPSE = re.compile(r"[ \t]+")
-_TT_RE_NEWLINES    = re.compile(r"\s*\n+\s*")
-_TT_RE_PUNCT_DUP   = re.compile(r"([，。！？；：]){2,}")
-_TT_RE_PUNCT_WS    = re.compile(r"\s*([，。！？；：、])\s*")
-_TT_RE_PUNCT_LSTRIP = re.compile(r"^[，。！？；：、]+")
-_TT_RE_PUNCT_RSTRIP = re.compile(r"[，。！？；：、]+$")
-
-
-def normalize_tts_text(text: str) -> str:
-    """规整朗读文本：统一中文标点、折叠换行、补齐句末标点，改善断句。"""
-    text = (text or "").strip()
-    if not text:
-        return ""
-    text = text.translate(_TT_PUNCT_TRANS)
-    text = _TT_RE_WS_COLLAPSE.sub(" ", text)
-    text = _TT_RE_NEWLINES.sub("。", text)
-    text = _TT_RE_PUNCT_DUP.sub(r"\1", text)
-    text = _TT_RE_PUNCT_WS.sub(r"\1", text)
-    text = _TT_RE_PUNCT_LSTRIP.sub("", text)
-    text = _TT_RE_PUNCT_RSTRIP.sub("", text)
-    if text and not text.endswith(("。", "！", "？")):
-        text += "。"
-    return text
+# _TT_PUNCT_TRANS / _TT_RE_* / normalize_tts_text
+# 已迁入 server_pkg.text_utils（顶层 import 重导出）。
+# 标点规整语义不变：预编译 7 正则逐个 sub，统一中文标点并补齐句末标点。
 
 
 def ref_paths_for_role(cfg: dict) -> tuple[Path, Path]:
@@ -2639,6 +2392,10 @@ async def access_gate(request: Request, call_next):
     # PWA 元数据（manifest/图标）不含敏感信息，且系统级安装流程与首帧 manifest
     # 拉取可能不携带会话 cookie（登录 cookie 写入竞态），放行避免首装报错。
     # sw.js 同理：不含数据且是缓存更新入口，被 302 拦会让设备永远卡在旧版前端。
+    # 健康检查同理：探活高频，放行省一次鉴权开销。
+    # 注：白名单判断刻意放在 _access_token() 之后——口令本身缓存在 config mtime
+    # 缓存后单次开销仅一次 stat，白名单前置省不掉多少，反而让未登录时的 302/401
+    # 分支更难一眼看全。保持可读性优先。
     if path in ("/api/health", "/api/activity", "/api/login", "/login",
                 "/manifest.webmanifest", "/sw.js") \
             or path.startswith("/icons/"):
@@ -2725,7 +2482,20 @@ async def login_page():
 # 锁定在 _LOGIN_LOCK_SECONDS 后自动过期；成功登录清零。_login_track 供测试直接 clear。
 _LOGIN_FAIL_MAX = 8
 _LOGIN_LOCK_SECONDS = 600
+# 防内存无限增长：攻击者伪造海量源 IP 时字典只保留最近 1000 项，
+# 每次失败写入时惰性淘汰过期项 + 超限删最旧（FIFO），开销 O(n) 但仅登录路径触发。
+_LOGIN_TRACK_MAX = 1000
 _login_track: dict[str, dict] = {}
+
+
+def _purge_login_track(now: float) -> None:
+    """清掉已过锁定时长的 IP 记录；超限时按插入顺序淘汰最旧。"""
+    expired = [ip for ip, rec in _login_track.items()
+               if now - rec.get("first", 0) > _LOGIN_LOCK_SECONDS]
+    for ip in expired:
+        _login_track.pop(ip, None)
+    while len(_login_track) > _LOGIN_TRACK_MAX:
+        _login_track.pop(next(iter(_login_track)), None)
 
 
 def _login_locked(ip: str) -> bool:
@@ -2747,6 +2517,7 @@ async def login_api(req: Request, payload: LoginRequest):
     if not token or not hmac.compare_digest(payload.token.strip(), token):
         rec = _login_track.setdefault(ip, {"fails": 0, "first": time.time()})
         rec["fails"] += 1
+        _purge_login_track(time.time())
         # 固定退避：经隧道暴露公网时显著拖慢在线爆破
         await asyncio.sleep(1.0)
         raise HTTPException(401, "访问口令错误")
@@ -3100,7 +2871,7 @@ async def llm_chat_stream(messages: list[dict], temperature: float = 0.8, max_to
 _SEARCH_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _SEARCH_CACHE_TTL = 600.0
 _SEARCH_CACHE_MAX = 256  # 条目上限：超限按插入顺序淘汰最旧（FIFO）
-_SEARCH_RE = re.compile(r"(?:\[|【)(?:search|搜索)\s*[:：]\s*([^\]】\r\n]{1,160})(?:\]|】)")
+# _SEARCH_RE 已迁入 server_pkg.text_utils（顶层 import 重导出）；搜索结果缓存保留在此。
 
 
 class _DDGResultParser(HTMLParser):
@@ -3269,13 +3040,7 @@ async def web_search(query: str, cfg: dict | None = None, max_results: int = 5) 
     return results[:max_results]
 
 
-def _extract_search_query(text: str) -> str:
-    m = _SEARCH_RE.search(text or "")
-    return m.group(1).strip()[:160] if m else ""
-
-
-def _strip_search_markers(text: str) -> str:
-    return _SEARCH_RE.sub("", text or "").strip()
+# _extract_search_query / _strip_search_markers 已迁入 server_pkg.text_utils（顶层 import 重导出）。
 
 
 def _format_search_feedback(query: str, results: list[dict]) -> str:
@@ -4224,128 +3989,15 @@ async def _try_vision_chat(system: dict, history: list[dict], req: ChatRequest, 
     return await _call_local_vision(messages, cfg)
 
 
-def _last_assistant_content(history: list[dict]) -> str:
-    """返回历史中最后一条 assistant 消息（用于判断是否复读了上一条回复）。"""
-    for m in reversed(history):
-        if m.get("role") == "assistant":
-            return m.get("content") or ""
-    return ""
+# _last_assistant_content / _too_similar_to_last 已迁入 server_pkg.text_utils（顶层 import 重导出）。
 
 
-def _too_similar_to_last(text: str, history: list[dict]) -> bool:
-    prev = _last_assistant_content(history)
-    if not prev or not text:
-        return False
-    return role_engine._dup_sim(text, prev) >= 0.8
+# _fix_addressing 已迁入 server_pkg.text_utils（顶层 import 重导出）。
+# 2026-09 优化：新增无触发词快路径（正常回复省 ~60 次正则扫描，实测 11x），
+# 慢路径与原实现逐行等价（43 组差分用例零差异）。调用签名不变。
 
 
-def _fix_addressing(text: str) -> str:
-    """后处理：自动纠正大帅回复中的称呼错误（4B 模型指令遵循弱，需兜底）。
-    1) assistant 自称老公 -> 改为"我"或"老婆"
-    2) 把用户叫老婆 -> 改为"老公"
-    3) 第三人称"他"指代用户 -> 改为"你"
-    4) 女性自称（女人/女孩子/妹子/人家/本宝宝）-> 删除或替换
-    5) 英文夹杂（非赛事术语）-> 删除"""
-    if not text:
-        return text
-    import re as _re
-    # 1) assistant 自称老公（"我是你老公"、"你老公我"、"老公我..."）
-    text = _re.sub(r"我是你老公，不是", "我不是", text)
-    text = _re.sub(r"我是你老公", "我是你老婆", text)
-    text = _re.sub(r"你老公我", "我", text)
-    # "老公我错了" -> "老婆我错了"（自称语境）
-    text = _re.sub(r"(?<![他你])老公我(错了|这就|马上|现在)", r"老婆我\1", text)
-    # 2) 称呼用户为老婆 -> 老公（行首/前导/句中各种模式）
-    text = _re.sub(r"^(\s*)老婆([,，!！~～:：\s])", r"\1老公\2", text)
-    text = _re.sub(r"(?<=[\n。！？～~])\s*老婆([,，!！~～:：\s])", r" 老公\1", text)
-    text = _re.sub(r"老婆大人", "老公大人", text)
-    text = _re.sub(r"老婆你(一大早|这是|也|看)", r"老公你\1", text)
-    text = _re.sub(r"晚安老婆", "晚安老公", text)
-    text = _re.sub(r"晚安，老婆", "晚安，老公", text)
-    text = _re.sub(r"睡吧老婆", "睡吧老公", text)
-    text = _re.sub(r"怎么了老婆", "怎么了老公", text)
-    text = _re.sub(r"看在你是老婆的份上", "看在你是老公的份上", text)
-    text = _re.sub(r"你是老婆", "你是老公", text)
-    text = _re.sub(r"(?<=[\n。！？～~\s])老婆，", "老公，", text)
-    # 3) 第三人称"他"指代用户（在动作描写括号里最常见）
-    for pat in [r"他的手", r"他的脸", r"他的肩", r"他的背", r"他的腰", r"他的腿",
-                r"他靠过来", r"他靠在", r"他靠近", r"靠近他", r"他身边", r"他笑了",
-                r"看着他", r"对他说", r"他在说", r"他坐下", r"他站起来", r"他走过来",
-                r"他搂", r"他抱", r"他亲", r"他摸"]:
-        text = _re.sub(pat, pat.replace("他", "你"), text)
-    # 4) 女性自称替换（覆盖复杂句式：我是/我可不是/我真是...的女人/女孩子/女生）
-    text = text.replace("这是我的女人", "你是我的人")
-    text = _re.sub(r"我是(?:一个|个)?女人", "我是个男生", text)
-    text = _re.sub(r"我是(?:一个|个)?女孩子", "我是个男生", text)
-    text = _re.sub(r"我是(?:一个|个)?女生", "我是个男生", text)
-    # 复杂句式兜底：我是...的女人 / 我可不是...的女人 / 我真是...的女人 -> ...的人
-    text = _re.sub(r"我(?:可|就|也|不|真是|不是|绝对不)[^，。！？\n]{0,18}的女人", lambda m: m.group(0)[:-2] + "的人", text)
-    text = _re.sub(r"我(?:可|就|也|真)?是(?:一个|个)?女孩子", "我是个男生", text)
-    text = _re.sub(r"我(?:可|就|也|真)?是(?:一个|个)?女生", "我是个男生", text)
-    text = _re.sub(r"我的女人", "我的人", text)
-    text = _re.sub(r"的女人", "的人", text)
-    text = _re.sub(r"的女孩子", "的人", text)
-    text = _re.sub(r"的女生", "的人", text)
-    text = _re.sub(r"的的人", "的人", text)
-    text = _re.sub(r"人家可", "我可", text)
-    text = text.replace("本宝宝", "我")
-    text = text.replace("小棉袄", "贴心人")
-    text = _re.sub(r"小仙女", "宝贝", text)
-    # 6) Qwen3 thinking 泄漏：模型偶发先输出内部推理（"好的，在处理..."等）再输出回复。
-    # 仅当全文足够长（>200 字，短回复如"首先，生日快乐！"是正常开头）且换行后还有内容时才截断；
-    # 绝不用罐头文案整条替换，避免误伤正常回复
-    for marker in ("好的，在处理", "好的，首先", "作为一个男", "首先，"):
-        if text.startswith(marker) and len(text) > 200:
-            nl = text.find("\n", 200)
-            if nl < 0:
-                nl = text.find("\n")
-            if nl > 0:
-                rest = text[nl:].strip()
-                if rest:
-                    text = rest
-        if text.startswith(marker):
-            break
-    # 5) 英文夹杂（保留 KPL/AG/MVP/BO7/FMVP/KWC/TTG 等大写赛事术语；
-    #    小写游戏术语 carry/bp/solo 等也保留，其余小写英文视为口癖清理）
-    _esports_keep = {"carry", "bp", "solo", "buff", "nerf", "gank", "poke"}
-    text = _re.sub(r"(?<![A-Z])(?![A-Z])[a-zA-Z]{2,}(?![A-Z])",
-                   lambda m: m.group(0) if m.group(0).lower() in _esports_keep else "", text)
-    # 6) 残留的风格/状态标记：[:xxx] (:xxx) [state:xxx] 等（8B 模型输出的变体格式）
-    text = _re.sub(r"\[[:：]\s*[^\]\r\n]{0,12}\]", "", text)
-    text = _re.sub(r"\([:：]\s*[^\)\r\n]{0,12}\)", "", text)
-    text = _re.sub(r"\[state:\s*[^\]\r\n]{0,12}\]", "", text)
-    text = _re.sub(r"\(state:\s*[^\)\r\n]{0,12}\)", "", text)
-    # 7) 富文本/HTML 标签泄漏（8B 模型偶发输出 [=#FF5733][/] 或 [="微软雅黑"] 等）
-    text = _re.sub(r"\[=#?[0-9A-Fa-f]{0,8}\]", "", text)
-    text = _re.sub(r"\[=\s*\"[^\]]{0,20}\"\]", "", text)
-    text = _re.sub(r"\[/\s*\]", "", text)
-    # 8) 「人家」变体清理（人家才/人家可/人家家）
-    text = _re.sub(r"人家才", "我才", text)
-    text = _re.sub(r"人家家", "我", text)
-    text = _re.sub(r"人家", "我", text)
-    # 小女生/小女生语气
-    text = _re.sub(r"小女生", "小男生", text)
-    # 清理遗留的空括号、多余空格
-    text = _re.sub(r"\(\s*\)", "", text)
-    text = _re.sub(r"  +", " ", text)
-    return text.strip()
-
-
-def _is_degenerate_reply(text: str) -> bool:
-    """检测机械复读：空回复、连续 20+ 个相同字符、或某个 3-gram 占比超过 60%。"""
-    t = re.sub(r"\s+", "", text or "")
-    if not t:
-        return True
-    if re.search(r"(.)\1{19,}", t):
-        return True
-    if len(t) >= 12:
-        tris = [t[i:i + 3] for i in range(len(t) - 2)]
-        counts: dict[str, int] = {}
-        for g in tris:
-            counts[g] = counts.get(g, 0) + 1
-        if counts and max(counts.values()) / len(tris) > 0.6:
-            return True
-    return False
+# _is_degenerate_reply 已迁入 server_pkg.text_utils（顶层 import 重导出）。
 
 
 @app.get("/")
@@ -4661,10 +4313,13 @@ async def chat(req: ChatRequest):
             "我会自动搜索并把结果发给你，你再基于结果正常回答；最终回答里不要保留 [search:...]。"
         )
     # 时间指令放 system 末尾：模型对末尾内容注意力最高，避免中段的时间层被忽略、顺着语境编造时间
+    # 服从铁律由 build_system_content 固定注入在 persona 之后（代码写死，前端改人设也去不掉）
     system = {"role": "system",
-              "content": persona + ctx_block + _META_HINT + style_hint + search_hint
-                         + _time_hint() + _self_hint() + _role_news_hint(news_text)
-                         + _location_hint(location_text) + _weather_hint() + _story_hint()}
+              "content": build_system_content(
+                  persona, ctx_block,
+                  _META_HINT + style_hint + search_hint
+                  + _time_hint() + _self_hint() + _role_news_hint(news_text)
+                  + _location_hint(location_text) + _weather_hint() + _story_hint())}
     provider = cfg.get("provider", "cloud")
     # 云端模型上下文窗口大，超长历史回复全文保留利于追问；本地小上下文才截断
     history = _clean_history(req.history, user_text, clip_long_replies=(provider == "local"))
@@ -5015,9 +4670,11 @@ async def role_greeting():
         greeting_user = "（你主动发消息给老公）"
         greeting_fallback = "老公，在忙吗？"
     system = {"role": "system",
-              "content": persona + ctx_block + _META_HINT + greeting_instruction + style_hint
-                         + _time_hint() + _self_hint() + _role_news_hint(news_text)
-                         + _location_hint(location_text) + _weather_hint() + _story_hint()}
+              "content": build_system_content(
+                  persona, ctx_block,
+                  _META_HINT + greeting_instruction + style_hint
+                  + _time_hint() + _self_hint() + _role_news_hint(news_text)
+                  + _location_hint(location_text) + _weather_hint() + _story_hint())}
     messages = [system, {"role": "user", "content": greeting_user}]
     raw = await llm_chat(messages)
     fallback_style = cfg.get("voice", {}).get("style") or "自然"
@@ -5102,19 +4759,8 @@ class SessionsRequest(BaseModel):
 # makeSession），旧版 seed-* 假会话已被前端过滤，故 t- 前缀不会与真实会话冲突。
 # 约定：测试脚本/验证脚本写入的会话一律用 t- 前缀，服务端 GET 默认过滤，
 # 前端永远看不到；?include_test=1 可显式查看（供测试往返验证）。
-_TEST_SESSION_PREFIX = "t-"
-
-
-def _is_test_session(item) -> bool:
-    """判断会话或墓碑是否为测试数据（id 以 t- 开头）。"""
-    sid = (item or {}).get("id") if isinstance(item, dict) else None
-    return isinstance(sid, str) and sid.startswith(_TEST_SESSION_PREFIX)
-
-
-def _sessions_fp(payload_str: str) -> str:
-    """sessions.json 内容的轻量指纹（sha1 前 16 位）：多端同步用于快速判断
-    服务端数据是否变化，避免每轮比对都让前端拉全量再本地合并。"""
-    return hashlib.sha1(payload_str.encode("utf-8")).hexdigest()[:16]
+# _TEST_SESSION_PREFIX / _is_test_session / _sessions_fp
+# 已迁入 server_pkg.text_utils（顶层 import 重导出）。
 
 
 @app.get("/api/sessions")

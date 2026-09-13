@@ -2,7 +2,7 @@
 <html lang="zh-CN" class="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
     <meta name="theme-color" content="#0F0D11">
     <meta name="description" content="小拟 · AI 拟人陪伴——用我的声音聊天">
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -36,6 +36,10 @@
             </button>
           </div>
           <div class="side-label">最近会话</div>
+          <div class="sess-search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            <input id="sess-search-input" type="search" placeholder="搜索会话…" autocomplete="off" aria-label="搜索会话">
+          </div>
           <!-- 会话列表完全由 JS 渲染（renderSessions）；不再写死示例会话，避免首帧闪现假内容 -->
           <div class="sessions"></div>
           <div class="side-label role-label" id="role-label" title="点击折叠/展开">
@@ -58,6 +62,7 @@
               <span class="p-detail">检测中…</span>
             </button>
             <!-- 引擎切换与角色管理收进「设置」：侧栏只保留状态与操作 -->
+            <div class="sync-status" id="sync-status" title="本地与服务端同步状态，点击重试同步">未同步</div>
           </div>
         </aside>
 
@@ -73,6 +78,10 @@
             <span class="c-sub">云端对话 · 串行引擎</span>
           </div>
             <div class="spacer"></div>
+            <span class="top-chip sync" id="sync-chip" title="本地与服务端同步状态，点击重试">
+              <span class="sync-dot" aria-hidden="true"></span>
+              <span class="hide-m" id="sync-chip-text">未同步</span>
+            </span>
             <span class="top-chip voice" title="语音合成">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
               <span class="hide-m">语音合成</span>
@@ -82,11 +91,27 @@
             <button class="top-btn install-btn" title="安装到主屏幕" id="btn-install">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             </button>
+            <button class="top-btn" title="搜索当前对话" id="btn-msg-search" type="button" aria-label="搜索当前对话">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            </button>
+            <button class="top-btn" title="切换浅色/深色主题" id="btn-theme" type="button" aria-label="切换主题">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+            </button>
             <button class="top-btn" title="设置" data-dom-id="btn-settings">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             </button>
           </div>
 
+          <div class="msg-search" id="msg-search" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            <input id="msg-search-input" type="search" placeholder="在当前对话中搜索…" autocomplete="off" aria-label="在当前对话中搜索">
+            <span class="msg-search-count" id="msg-search-count"></span>
+            <button type="button" id="msg-search-prev" title="上一个" aria-label="上一个">↑</button>
+            <button type="button" id="msg-search-next" title="下一个" aria-label="下一个">↓</button>
+            <button type="button" id="msg-search-close" title="关闭搜索" aria-label="关闭搜索">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+            </button>
+          </div>
           <div class="msgs" id="msgs">
             <div class="msgs-inner">
               <!-- Welcome：内容由 refreshStatus 按当前角色动态填充 -->
@@ -172,6 +197,14 @@
               <input type="checkbox" id="greeting_toggle" style="width:auto">
               <span>角色偶尔主动找你说话（每天最多 1 次）</span>
             </label>
+          </div>
+          <div class="set-row">
+            <span class="set-label">字号</span>
+            <div class="set-tabs" id="font-tabs" role="group" aria-label="消息字号">
+              <button type="button" class="set-tab" data-font="std">标准</button>
+              <button type="button" class="set-tab" data-font="lg">大</button>
+              <button type="button" class="set-tab" data-font="xl">特大</button>
+            </div>
           </div>
           <!-- ===== 角色：长期记忆（原角色管理页能力并入） ===== -->
           <div class="set-row" style="align-items:flex-start">
@@ -326,6 +359,10 @@
           <button type="button" class="cf-btn primary" id="cf-ok">确定</button>
         </div>
       </div>
+    </div>
+    <!-- ===== 图片灯箱：点击消息中的图片全屏查看，Esc/点击背景关闭 ===== -->
+    <div id="lightbox" role="dialog" aria-label="图片预览" hidden>
+      <img id="lightbox-img" alt="图片预览">
     </div>
     <!-- ===== 桌面宠物（大帅） ===== -->
     <script src="pet.js"></script>

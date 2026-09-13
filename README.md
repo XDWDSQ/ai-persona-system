@@ -240,7 +240,8 @@ python minimax_clone.py
 ## 目录
 
 ```
-server.py               FastAPI 后端主程序（端口 8000）
+server.py               FastAPI 后端主程序（端口 8000；纯函数已下沉 server_pkg，本文件保留装配与有状态逻辑）
+server_pkg/             后端纯函数包（text_utils 文本/标记/校验 + sessions_merge 多端合并；server.py 重导出，import server 引用不变）
 role_engine.py          角色运行引擎（记忆/状态/时间/位置/天气/后处理）
 story_kpl2027.py        2027 赛季剧情分支引擎（赛程生成/剧情时钟/情感状态机/剧情指引）
 minimax_llm.py          MiniMax 云端文字生成适配器（OpenAI 兼容，payg / token_plan 双计费）

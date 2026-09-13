@@ -171,12 +171,30 @@ def test_fix_addressing():
     check("本宝宝被替换", "本宝宝" not in fix("本宝宝想你了"))
 
 
+def test_obedience_core():
+    out = server.build_system_content("人设正文", "上下文块", "尾部约定")
+    check("服从铁律带显式标记", "【服从铁律" in out, out[:120])
+    check("铁律紧跟人设", out.index("【服从铁律") > out.index("人设正文")
+          and out.index("【服从铁律") < out.index("上下文块"), out[:160])
+    check("上下文与尾部保留", "上下文块" in out and "尾部约定" in out)
+    check("铁律声明最高优先级", "最高优先级" in out or "最高指令" in out)
+    check("铁律保留安全底线", "违法" in out)
+    check("空值容错", server.build_system_content("", "", "") == server._OBEDIENCE_CORE)
+    # 两处组装点必须走统一入口（防分叉）：chat 与 greeting 路由源码里不得再手写拼接
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parent.joinpath("server.py").read_text(encoding="utf-8")
+    check("chat走统一入口", "build_system_content(\n                  persona, ctx_block,\n"
+          "                  _META_HINT + style_hint + search_hint" in src)
+    check("greeting走统一入口", "_META_HINT + greeting_instruction + style_hint" in src
+          and src.count("build_system_content(") >= 3)  # 定义+两处调用
+
+
 def main():
     for t in (test_clean_history, test_degenerate_reply, test_too_similar_to_last,
               test_story_regex_detect, test_time_hint, test_retry_guard,
-              test_login_rate_limit, test_fix_addressing):
+              test_login_rate_limit, test_fix_addressing, test_obedience_core):
         t()
-    print(f"\n{'=' * 50}\n共 8 组，失败 {_FAIL} 组")
+    print(f"\n{'=' * 50}\n共 9 组，失败 {_FAIL} 组")
     sys.exit(1 if _FAIL else 0)
 
 
