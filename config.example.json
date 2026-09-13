@@ -109,9 +109,19 @@
       "model": "speech-02-hd",
       "voice": "male-qn-jingying",
       "speed": 1.0,
-      "vol": 2,
-      "pitch": 0,
-      "sample_rate": 32000
+      "vol": 2.0,
+      "pitch": 0.0,
+      "sample_rate": 32000,
+      "api_schema": "official"
+    },
+    "mimo": {
+      "base_url": "https://api.xiaomimimo.com/v1",
+      "model": "mimo-v2.5-tts-voiceclone",
+      "api_key": "",
+      "voice": "",
+      "ref_audio": "data/clone_ref/example_60s.wav",
+      "speed": 1.0,
+      "style": ""
     },
     "manual_provider": true
   },

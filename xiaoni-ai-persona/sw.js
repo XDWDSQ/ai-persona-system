@@ -1,7 +1,7 @@
 /* 小拟 PWA Service Worker —— 应用壳缓存，替代原 APK 的秒开体验。
    策略：导航请求网络优先（更新即时生效，离线回退缓存）；
    静态资源缓存优先 + 后台刷新；API 与上传目录一律不缓存。 */
-var CACHE = 'xiaoni-shell-v6';
+var CACHE = 'xiaoni-shell-v7';
 var SHELL = [
   '/pages/chat.html',
   '/pages/css/chat.css',
@@ -46,8 +46,11 @@ self.addEventListener('fetch', function (e) {
     /* 导航：网络优先，成功则回写缓存；离线时回退缓存副本 */
     e.respondWith(
       fetch(req).then(function (res) {
-        var copy = res.clone();
-        caches.open(CACHE).then(function (c) { c.put(req, copy); });
+        /* 只回写 2xx：Cache API 拒绝 5xx/4xx，裸 c.put 会产生未捕获的 reject */
+        if (res && res.status === 200) {
+          var copy = res.clone();
+          caches.open(CACHE).then(function (c) { c.put(req, copy); });
+        }
         return res;
       }).catch(function () {
         return caches.match(req).then(function (hit) {

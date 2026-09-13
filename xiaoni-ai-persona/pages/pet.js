@@ -70,7 +70,33 @@
   var _current = 'idle';
   var _manual  = false;   // 右键锁定后不被自动覆盖
   var _longPress = false; // 刚长按弹过菜单，单击不再弹气泡
+  var _suppressClickUntil = 0; // 刚结束拖拽的时间戳：拖拽松手的合成 click 不弹气泡
+  var _hasCustomPos = false;  // 恢复过自定义位置：resize/旋转屏幕时需重新钳制
   var _el, _img, _bubble, _stage;
+
+  /* 把桌宠钳制在当前视口内（旋转屏幕/缩小窗口后保存的坐标可能已在屏幕外，
+     不处理宠物会永久消失，只能清 localStorage 找回） */
+  function clampToViewport() {
+    if (!_el || !_hasCustomPos) return;
+    var w = _el.offsetWidth || SIZE, h = _el.offsetHeight || SIZE;
+    var maxX = Math.max(0, window.innerWidth - w);
+    var maxY = Math.max(0, window.innerHeight - h);
+    var r = _el.getBoundingClientRect();
+    var x = Math.max(0, Math.min(maxX, r.left));
+    var y = Math.max(0, Math.min(maxY, r.top));
+    if (Math.abs(x - r.left) > 0.5 || Math.abs(y - r.top) > 0.5) {
+      _el.style.left = x + 'px';
+      _el.style.top = y + 'px';
+      _el.style.right = 'auto';
+      _el.style.bottom = 'auto';
+      try { localStorage.setItem(POS_KEY, JSON.stringify({ x: x, y: y })); } catch (_) {}
+    }
+  }
+  var _clampTimer = 0;
+  function scheduleClamp() {
+    if (_clampTimer) clearTimeout(_clampTimer);
+    _clampTimer = setTimeout(clampToViewport, 120);
+  }
 
   /* ---------- 注入 CSS ---------- */
   function injectStyle() {
@@ -259,6 +285,7 @@
       clearPress();
       _el.classList.remove('dragging');
       if (moved) {
+        _suppressClickUntil = Date.now() + 300;  // 松手的合成 click 不弹气泡
         try {
           var r = _el.getBoundingClientRect();
           localStorage.setItem(POS_KEY, JSON.stringify({ x: r.left, y: r.top }));
@@ -357,6 +384,7 @@
     try {
       var pos = JSON.parse(localStorage.getItem(POS_KEY) || 'null');
       if (pos && typeof pos.x === 'number') {
+        _hasCustomPos = true;
         _el.style.left = pos.x + 'px'; _el.style.top = pos.y + 'px';
         _el.style.right = 'auto'; _el.style.bottom = 'auto';
       }
@@ -369,6 +397,7 @@
     _el.addEventListener('contextmenu', showCtx);
     _el.addEventListener('click', function (e) {
       if (e.button !== 0) return;
+      if (Date.now() < _suppressClickUntil) return;      // 拖拽松手的合成 click，不弹气泡
       if (_longPress) { _longPress = false; return; }   // 长按弹完菜单，不弹气泡
       if (_el.classList.contains('mini')) {             // 圆点：点击恢复
         setMini(false);
@@ -384,6 +413,11 @@
     _current = '';                // 初始状态强制加载（applyState 对相同状态去重）
     applyState(initial);
     preloadRest();
+    /* 恢复的保存位置按当前视口再钳制一次；旋转屏幕/窗口缩放时同样钳制，
+       防止横屏拖到边缘、切竖屏后宠物永久停在屏幕外 */
+    clampToViewport();
+    window.addEventListener('resize', scheduleClamp);
+    window.addEventListener('orientationchange', scheduleClamp);
   }
 
   /* ---------- 监听外部状态事件 ---------- */

@@ -34,9 +34,9 @@ powershell -NoProfile -Command "try { $r = Invoke-WebRequest -Uri 'http://127.0.
 echo.
 echo  ============================================================
 echo   Local test:  http://127.0.0.1:8000   (token: see config.json)
-echo   Phone access: run start_tunnel.bat to open a Cloudflare
-echo   tunnel, then open the shown https://xxx.trycloudflare.com
-echo   on your phone and enter the access token.
+echo   Phone access: run "ngrok http 8000" to open an ngrok tunnel,
+echo   then open the shown https://xxx.ngrok-free.app on your phone
+echo   (click "Visit Site" on the free-plan warning page) and enter the access token.
 echo  ============================================================
 echo.
 pause

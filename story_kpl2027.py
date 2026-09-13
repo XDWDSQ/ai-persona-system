@@ -385,8 +385,11 @@ class StoryManager:
         m = self.cal.match_on(d)
         if m is not None and m.get("status") == "pending":
             return d
-        for mm in self.cal.data["matches"]:
-            if mm["date"] <= _s(d) and mm.get("status") == "pending":
+        # 赛程按日期升序存储，反向取“最近一场”未记录比赛
+        # （正向 return 第一个会错误地记到最旧的一场，导致战绩/阶段错位）。
+        ds = _s(d)
+        for mm in reversed(self.cal.data["matches"]):
+            if mm["date"] <= ds and mm.get("status") == "pending":
                 return _d(mm["date"])
         return d
 
@@ -419,8 +422,10 @@ class StoryManager:
         m = self.cal.match_on(d)
         if m is None:
             return {"ok": False, "msg": f"{ds} 没有 AG 的比赛"}
-        if m.get("result") is not None and m.get("status") == "played":
+        if m.get("status") == "played":
             return {"ok": False, "msg": "该场比赛结果已记录"}
+        if m.get("status") == "skipped":
+            return {"ok": False, "msg": "该场比赛已标记取消（未晋级），不能补记结果"}
         m["result"] = {"win": bool(win), "score": score or ("3:1" if win else "1:3"),
                        "mvp": mvp, "note": note or ""}
         m["status"] = "played"

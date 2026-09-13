@@ -22,6 +22,8 @@ OUT = ROOT / "cloud_deploy.zip"
 TOP_FILES = [
     "server.py",
     "role_engine.py",
+    "minimax_llm.py",      # MiniMax 云端文字适配器（server.py 顶层 import）
+    "story_kpl2027.py",    # 2027 剧情引擎（server.py 顶层 import）
     "requirements.txt",
     "config.json",
     "config.example.json",
@@ -36,19 +38,19 @@ TOP_FILES = [
 # 顶层目录（白名单）
 TOP_DIRS = [
     "xiaoni-ai-persona",   # 前端
-    "adapters",            # ASR 适配（小，防意外引用）
+    "server_pkg",          # server.py 下沉的无状态模块（顶层 import，缺了启动即 ModuleNotFoundError）
     "docs-specs",          # 设计文档
     "deploy",              # 云电脑部署说明与安装脚本
-    "start_tunnel.bat",    # 隧道启动（文件，非目录）
-    "start_tunnel.ps1",
 ]
 
 # data/ 下需要带走的（白名单）
 DATA_KEEP = [
     "sessions.json",
     "weather.json",
+    "role_news.json",  # 角色现实动态缓存
     "memory",      # 角色长期记忆
     "state",       # 角色状态
+    "story",       # 2027 剧情状态
     "clone_ref",   # 音色参考音频
     "uploads",     # 历史附件（会话里引用）
 ]

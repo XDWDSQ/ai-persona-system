@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import copy
 import gzip
 import hashlib
@@ -32,10 +31,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 
-import socket as _socket
-
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, StreamingResponse)
@@ -290,7 +287,6 @@ def _backup_sessions_before_destructive(current: list, merged: list) -> None:
 
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     bak = SESSIONS_PATH.with_name(f"sessions.json.bak-{stamp}")
-    import shutil
     shutil.copy2(SESSIONS_PATH, bak)
     _log.warning("sessions backed up to %s before destructive merge", bak.name)
     # 备份轮换：只保留最近 10 份，避免异常复发时备份无限堆积（单份可达 32MB）
@@ -319,6 +315,17 @@ def _spawn_bg(coro) -> None:
     task = asyncio.create_task(coro)
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
+
+
+def _detach_bg(task: "asyncio.Task | None") -> None:
+    """把一个仍在运行、但持有者即将释放的任务交给 _bg_tasks 托管续跑，
+    避免 wait_for(shield, timeout) 超时后局部变量释放、任务失去强引用被 GC 中途回收。"""
+    if task is not None and not task.done() and task not in _bg_tasks:
+        if len(_bg_tasks) >= _BG_TASKS_MAX:
+            _log.warning("bg task backlog full (%d), detaching without tracking", len(_bg_tasks))
+            return
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
 
 
 # 角色引擎：按 active_role 懒创建 (MemoryStore, StateStore) 缓存，切角色即换存储
@@ -2384,9 +2391,17 @@ async def access_gate(request: Request, call_next):
         # 防止恶意网页经浏览器跨域驱动本机全部 API（烧配额/塞磁盘/读配置）。
         origin = request.headers.get("origin")
         if origin:
-            o_netloc = urlparse(origin).netloc
-            if o_netloc and o_netloc != request.headers.get("host", ""):
+            # 显式拒绝 "null" 源（sandbox iframe / file: 页面 / 本地重定向，
+            # urlparse("null").netloc 为空字符串会绕过下方的 netloc 比较）
+            if origin.strip().lower() == "null":
                 return JSONResponse({"detail": "未配置访问口令时禁止跨源访问"}, status_code=403)
+            o_netloc = urlparse(origin).netloc
+            if o_netloc != request.headers.get("host", ""):
+                return JSONResponse({"detail": "未配置访问口令时禁止跨源访问"}, status_code=403)
+        return await call_next(request)
+    # CORS 预检（OPTIONS）不带 cookie/Authorization 之外的凭据，统一交给内层
+    # CORSMiddleware 生成预检响应；否则带口令跨域客户端的非简单请求必 401。
+    if request.method == "OPTIONS":
         return await call_next(request)
     path = request.url.path
     # PWA 元数据（manifest/图标）不含敏感信息，且系统级安装流程与首帧 manifest
@@ -2978,17 +2993,22 @@ async def _search_bing_rss(query: str, timeout: float = 15.0) -> list[dict]:
     head = content[:4096].lower()
     if b"<!doctype" in head or b"<!entity" in head:
         raise ValueError("搜索响应包含 DTD/实体声明，已拒绝解析")
-    root = ET.fromstring(content)
-    out: list[dict] = []
-    for item in root.findall(".//item")[:10]:
-        title = (item.findtext("title") or "").strip()
-        if not title:
-            continue
-        link = (item.findtext("link") or "").strip()
-        desc = re.sub(r"<[^>]+>", "", item.findtext("description") or "")
-        desc = " ".join(desc.split())
-        out.append({"title": title, "snippet": desc, "url": link})
-    return out
+
+    def _parse_rss() -> list[dict]:
+        # XML 解析是纯 CPU（上限 2MB），丢线程池不卡事件循环（与 DDG HTML 解析一致）
+        root = ET.fromstring(content)
+        items: list[dict] = []
+        for item in root.findall(".//item")[:10]:
+            title = (item.findtext("title") or "").strip()
+            if not title:
+                continue
+            link = (item.findtext("link") or "").strip()
+            desc = re.sub(r"<[^>]+>", "", item.findtext("description") or "")
+            desc = " ".join(desc.split())
+            items.append({"title": title, "snippet": desc, "url": link})
+        return items
+
+    return await asyncio.to_thread(_parse_rss)
 
 
 async def web_search(query: str, cfg: dict | None = None, max_results: int = 5) -> list[dict]:
@@ -3699,7 +3719,10 @@ async def _gmi_tts_synthesize(text: str, model: str, voice: str, base: str,
     await asyncio.to_thread(mp3_path.write_bytes, mp3_bytes)
     out_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
     try:
-        subprocess.run(
+        # ffmpeg 转码是同步阻塞调用（最长 60s），必须放线程池，否则期间
+        # 整个事件循环卡死（SSE 心跳/其他请求/健康检查全部停摆）。
+        await asyncio.to_thread(
+            subprocess.run,
             [ffmpeg, "-y", "-i", str(mp3_path), "-ar", str(m.get("sample_rate", 32000)),
              "-ac", "1", str(out_path)],
             capture_output=True, timeout=60, check=True,
@@ -4117,6 +4140,8 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
         try:
             events = await asyncio.wait_for(asyncio.shield(story_task), timeout=4.0)
         except Exception:  # noqa: BLE001 超时/失败都不阻塞收尾
+            # 超时后任务仍在跑：交给后台托管，保证赛果识别照常入库
+            _detach_bg(story_task)
             return None
         return _story_update_payload(events or [])
 
@@ -4432,6 +4457,8 @@ async def chat(req: ChatRequest):
             events = await asyncio.wait_for(asyncio.shield(story_task), timeout=4.0)
             story_update = _story_update_payload(events or [])
         except Exception:  # noqa: BLE001
+            # 超时后任务仍在跑：交给后台托管，保证赛果识别照常入库
+            _detach_bg(story_task)
             story_update = None
     return {"reply": reply, "narration": narration, "style": style,
             "vision_used": vision_used, "searched": searched, "story_update": story_update}
@@ -5322,7 +5349,21 @@ async def role_news_update(req: dict):
     timeline = req.get("timeline")
     if timeline is not None and not isinstance(timeline, list):
         raise HTTPException(400, "timeline 必须是数组")
-    timeline = (timeline or [])[:30]
+    # 与 cards 同等级做白名单清洗：外部写入只保留约定字段，防脏数据直入缓存再回传前端
+    clean_timeline: list[dict] = []
+    for t in (timeline or [])[:30]:
+        if not isinstance(t, dict):
+            continue
+        content = str(t.get("content") or "")[:300]
+        if not content:
+            continue
+        clean_timeline.append({
+            "date": str(t.get("date") or "")[:10],
+            "category": str(t.get("category") or "")[:20],
+            "content": content,
+            "status": "confirmed" if t.get("status") == "confirmed" else "unconfirmed",
+        })
+    timeline = clean_timeline
     sources = req.get("sources")
     if sources is not None and not isinstance(sources, dict):
         raise HTTPException(400, "sources 必须是对象")

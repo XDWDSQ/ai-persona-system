@@ -3,7 +3,7 @@
 
 与 pack_cloud.py 的区别：
 - config.json 中所有云端 API 密钥（cloud.api_key / cloud_providers.*.api_key /
-  voice.aliyun.api_key / voice.minimax.api_key）置空，保留占位
+  voice.aliyun.api_key / voice.minimax.api_key / voice.mimo.api_key）置空，保留占位
 - 不打包 .env（真实密钥只在本地）；打包 .env.example 作为模板
 - 其余内容与 cloud_deploy.zip 一致
 
@@ -24,9 +24,11 @@ SENSITIVE_PATHS = [
     "cloud_providers.mimo.api_key",
     "cloud_providers.deepseek.api_key",
     "cloud_providers.ark.api_key",
+    "cloud_providers.minimax.api_key",
     "cloud_providers.custom.api_key",
     "voice.aliyun.api_key",
     "voice.minimax.api_key",
+    "voice.mimo.api_key",
 ]
 
 

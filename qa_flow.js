@@ -123,7 +123,9 @@ function check(name, cond, detail) {
   check('回复内容剥净样式标记', (await cdp.eval('document.querySelector(".msg.ai .bubble").textContent')) === '好，我在。今天训练刚结束，状态还行。', '实际=' + JSON.stringify(await cdp.eval('document.querySelector(".msg.ai .bubble").textContent')));
   const meta = await cdp.eval('({s: !!document.querySelector(".msg.ai .msg-meta .speak-btn"), r: !!document.querySelector(".msg.ai .msg-meta .resynth-btn"), g: !!document.querySelector(".msg.ai .msg-meta .regen-btn")})');
   check('回复挂 朗读/重新合成/重新生成 按钮', meta.s && meta.r && meta.g, JSON.stringify(meta));
-  check('首条消息自动命名会话', (await cdp.eval('document.querySelector(".chat-title-text").textContent')) === '今晚吃什么', '标题未自动命名');
+  /* 主对话设计（main_{role} 固定会话）：标题恒为「{角色}·主对话」且 manualTitle，
+     不被首条消息覆盖；这里断言标题保持主对话命名而非旧的"首条消息自动命名" */
+  check('主对话标题固定、不被首条消息覆盖', /·主对话$/.test(await cdp.eval('document.querySelector(".chat-title-text").textContent') || ''), '标题=' + await cdp.eval('document.querySelector(".chat-title-text").textContent'));
   check('会话已 PUT 持久化到服务端', apiLog.some(l => l.includes('/api/sessions?client=')), JSON.stringify(apiLog.slice(0, 8)));
   await shot('10-flow-sent'); await dumpMessages('发送后');
 
@@ -167,7 +169,7 @@ function check(name, cond, detail) {
 
   /* ===== 7) 服务端持久化核对 ===== */
   const sessDisk = await cdp.eval('fetch("/api/sessions").then(r => r.json()).then(d => ({n: d.sessions.length, msgs: d.sessions[0] ? d.sessions[0].history.length : 0, title: d.sessions[0] ? d.sessions[0].title : ""}))');
-  check('服务端会话已持久化（1 会话、标题正确、消息>3）', sessDisk.n === 1 && sessDisk.msgs >= 3 && sessDisk.title === '今晚吃什么', JSON.stringify(sessDisk));
+  check('服务端会话已持久化（1 会话、主对话标题、消息>3）', sessDisk.n === 1 && sessDisk.msgs >= 3 && /·主对话$/.test(sessDisk.title || ''), JSON.stringify(sessDisk));
 
   console.log('api log tail:', JSON.stringify(apiLog.slice(-8)));
   console.log('===== 流程验证结果: PASS ' + PASS + ' / FAIL ' + FAIL + ' =====');

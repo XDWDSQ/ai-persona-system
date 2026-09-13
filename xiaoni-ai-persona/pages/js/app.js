@@ -630,7 +630,8 @@
             pickVoiceProvider(s.voice_provider || 'minimax');
             var gt = document.getElementById('greeting_toggle');
             if (gt) {
-              var gv = localStorage.getItem('xiaoni_greeting_enabled');
+              var gv = null;
+              try { gv = localStorage.getItem('xiaoni_greeting_enabled'); } catch (e) {}
               gt.checked = (gv === null ? true : gv === '1');
             }
             /* 自动朗读开关与语速回填（持久化在 localStorage，与顶栏 chip 同源） */
@@ -717,13 +718,13 @@
             rolesAnimatedOnce = true;
           }
           function setDotsChecking() {
-            document.querySelectorAll('.p-dot, .m-dot, .c-dot').forEach(function(d){
+            document.querySelectorAll('.p-dot, .c-dot').forEach(function(d){
               d.classList.remove('online', 'offline');
               d.classList.add('checking');
             });
           }
           function applyOnlineState(online) {
-            document.querySelectorAll('.m-dot, .c-dot').forEach(function(d){
+            document.querySelectorAll('.c-dot').forEach(function(d){
               d.classList.remove('checking');
               d.classList.toggle('offline', !online);
             });
@@ -765,7 +766,6 @@
               state.aliyunConfigured = !!s.aliyun_configured;
               state.minimaxConfigured = !!s.minimax_configured;
               state.mimoConfigured = !!s.mimo_configured;
-              state.voiceRegistered = !!s.voice_registered;
               state.cloudProviders = s.cloud_providers || {};
               state.voiceManualProvider = !!s.voice_manual_provider;
               /* TTS 缓存维度：同句不同引擎/音色/模型不得复用同一份 blob，
@@ -1732,6 +1732,9 @@
             return b;
           }
           async function regenerate(div, btn) {
+            /* 与发送入口同一把门禁：生成中再点旧消息的"重新生成"会 splice 截断
+               正在使用的历史、覆盖唯一的 chatAborter，并产生两条错乱回复 */
+            if ((state.sendingCount || 0) > 0) { toast('正在生成中，请稍候'); return; }
             if (btn && btn.disabled) return;
             if (btn) btn.disabled = true;
             var s = currentSession();
@@ -1807,7 +1810,8 @@
              只剩用户消息没有任何回复，也没有重新生成入口。
              snap = { idx: 用户消息在历史中的下标, text: 用户消息原文, atts: 用户附件 } */
           /* 按会话记录进行中的生成请求数：渲染时末尾用户消息是"生成中"还是"失败"靠它区分。
-             用计数而非布尔，允许同一会话并发生成（发送 + 重新生成）互不干扰 */
+             注：发送/重新生成/重试三个入口统一由全局 sendingCount 门禁串行化，
+             并发生成会截断在途历史、覆盖 abort 句柄并产生错乱回复，故不允许 */
           function markAwaiting(sessionId, on) {
             if (!sessionId) return;
             state.awaiting[sessionId] = Math.max(0, (state.awaiting[sessionId] || 0) + (on ? 1 : -1));
@@ -1842,6 +1846,7 @@
             return div;
           }
           async function retryGeneration(sessionId, snap, btn) {
+            if ((state.sendingCount || 0) > 0) { toast('正在生成中，请稍候'); return; }
             if (btn && btn.disabled) return;
             if (btn) btn.disabled = true;
             var s = findSession(sessionId);
@@ -2331,7 +2336,8 @@
                   }),
                 });
                 var gt = document.getElementById('greeting_toggle');
-                if (gt) localStorage.setItem('xiaoni_greeting_enabled', gt.checked ? '1' : '0');
+                /* 存储被禁用时不应误报"设置保存失败"——服务端此时已保存成功 */
+                if (gt) { try { localStorage.setItem('xiaoni_greeting_enabled', gt.checked ? '1' : '0'); } catch (e) {} }
                 toast('设置已保存'); closeSettings(); refreshStatus();
               } catch (e) { toast(e.message); }
             });
@@ -3050,21 +3056,35 @@
           setInterval(function(){
             if (syncPending && !isSyncBusy()) { syncPending = false; syncSessionsFromServer(); }
           }, 3000);
+          var syncES = null;
           function startSyncStream() {
             if (!window.EventSource) return;
+            try { if (syncES) syncES.close(); } catch (e) {}
             try {
-              var es = new EventSource('/api/sync/stream?client=' + encodeURIComponent(CLIENT_ID));
-              es.onmessage = function(e){
+              syncES = new EventSource('/api/sync/stream?client=' + encodeURIComponent(CLIENT_ID));
+              syncES.onmessage = function(e){
                 var ev = null;
                 try { ev = JSON.parse(e.data); } catch (err) {}
                 if (ev && ev.type === 'sessions_updated') requestRemoteSync();
               };
+              syncES.onerror = function(){
+                /* readyState=CLOSED 表示被服务端终止（如 401/网关错误），浏览器不会再
+                   自动重连；不手动轮询重连（可见性 + 30s 定时轮询已兜底，避免未登录时刷请求） */
+                if (syncES && syncES.readyState === 2) syncES = null;
+              };
               /* 断线由 EventSource 自动重连（服务端 retry: 3000）；
                  重连失败期间的变更由下方可见性/定时轮询兜底补齐 */
-              /* 页面卸载/后台冻结时主动断开，避免服务端挂着死连接 */
-              window.addEventListener('pagehide', function(){ try { es.close(); } catch (e) {} });
             } catch (e) {}
           }
+          /* 页面卸载/后台冻结时主动断开，避免服务端挂着死连接 */
+          window.addEventListener('pagehide', function(){
+            try { if (syncES) syncES.close(); } catch (e) {}
+          });
+          /* bfcache 恢复（iOS/Android 前进后退）：JS 环境复活但原 EventSource 已在
+             pagehide 关闭且不会自动重建，实时推送会永久失效——persisted 恢复时重连 */
+          window.addEventListener('pageshow', function(e){
+            if (e.persisted) startSyncStream();
+          });
           startSyncStream();
           /* 兜底：切回前台立即补齐后台期间错过的变更；页面可见时每 30s 拉一次（服务端 mtime 缓存，代价极低） */
           document.addEventListener('visibilitychange', function(){
@@ -3444,7 +3464,7 @@
              重命名输入框(.renaming)除外，否则打字时抽屉会被关掉 */
           if (sideEl) sideEl.addEventListener('click', function(e){
             if (!isMobileLayout()) return;
-            var t = (e.target.closest) ? e.target.closest('.session, .role-item, [data-dom-id="btn-new"], .side-link, .provider-row') : null;
+            var t = (e.target.closest) ? e.target.closest('.session, .role-item, [data-dom-id="btn-new"], .provider-row') : null;
             if (!t || (t.closest && t.closest('.renaming'))) return;
             setTimeout(closeDrawer, 160);
           });
@@ -3699,7 +3719,10 @@
           var roleListEl = document.getElementById('role-list');
           var roleCaret = document.getElementById('role-caret');
           if (roleLabel && roleListEl) {
-            var initCollapsed = localStorage.getItem('role_collapsed') === '1';
+            /* 裸读 localStorage 在存储被禁用的 WebView 里会抛错并中断后续初始化
+               （refreshStatus/SW 注册都在它之后），统一防护 */
+            var initCollapsed = false;
+            try { initCollapsed = localStorage.getItem('role_collapsed') === '1'; } catch (e) {}
             if (initCollapsed) {
               roleLabel.classList.add('collapsed');
               roleListEl.classList.add('collapsed');
@@ -3712,7 +3735,7 @@
               if (collapsed) {
                 roleListEl.style.maxHeight = roleListEl.scrollHeight + 'px';
                 requestAnimationFrame(function(){ roleListEl.classList.add('collapsed'); });
-                localStorage.setItem('role_collapsed', '1');
+                try { localStorage.setItem('role_collapsed', '1'); } catch (e) {}
               } else {
                 roleListEl.classList.remove('collapsed');
                 roleListEl.style.maxHeight = roleListEl.scrollHeight + 'px';
@@ -3720,7 +3743,7 @@
                 setTimeout(function(){
                   if (!roleLabel.classList.contains('collapsed')) roleListEl.style.maxHeight = 'none';
                 }, 380);
-                localStorage.setItem('role_collapsed', '0');
+                try { localStorage.setItem('role_collapsed', '0'); } catch (e) {}
               }
             });
             // refresh maxHeight when role list changes (called implicitly below via setTimeout fallback)
@@ -3735,15 +3758,6 @@
               }, 0);
             };
           }
-
-          /* ---------- Prompt chips stagger ---------- */
-          (function(){
-            var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-            if (reduce) return;
-            document.querySelectorAll('.prompt-chip').forEach(function(c, i){
-              c.style.transitionDelay = (i * 60).toFixed(0) + 'ms';
-            });
-          })();
 
           /* ---------- 同步状态行：点击重试 + 初始渲染 + 存储自检 ---------- */
           (function(){
@@ -3808,10 +3822,16 @@
           (function(){
             var inp = document.getElementById('sess-search-input');
             if (!inp) return;
+            /* 每次按键都对所有会话的全部历史做正文扫描，防抖 180ms */
+            var sessSearchTimer = 0;
             inp.addEventListener('input', function(){
-              sessionSearchQuery = inp.value || '';
-              sessionsRenderKey = '';  /* query 已进 key，这里再清一次防旧 key 残留 */
-              renderSessions();
+              var v = inp.value || '';
+              clearTimeout(sessSearchTimer);
+              sessSearchTimer = setTimeout(function(){
+                sessionSearchQuery = v;
+                sessionsRenderKey = '';  /* query 已进 key，这里再清一次防旧 key 残留 */
+                renderSessions();
+              }, 180);
             });
           })();
 
@@ -3915,9 +3935,20 @@
             if (msgSearchPrev) msgSearchPrev.addEventListener('click', function(){ stepMsgSearch(-1); });
             if (msgSearchNext) msgSearchNext.addEventListener('click', function(){ stepMsgSearch(1); });
             if (msgSearchInput) {
-              msgSearchInput.addEventListener('input', runMsgSearch);
+              /* 防抖：每次按键都全量扫历史 + 可能补建几百条 DOM，
+                 长会话连续输入会明显掉帧；停顿 180ms 再跑 */
+              var msgSearchTimer = 0;
+              msgSearchInput.addEventListener('input', function(){
+                clearTimeout(msgSearchTimer);
+                msgSearchTimer = setTimeout(runMsgSearch, 180);
+              });
               msgSearchInput.addEventListener('keydown', function(e){
-                if (e.key === 'Enter') { e.preventDefault(); stepMsgSearch(e.shiftKey ? -1 : 1); }
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  clearTimeout(msgSearchTimer);
+                  runMsgSearch();   /* Enter 立即搜最新输入，不等防抖 */
+                  stepMsgSearch(e.shiftKey ? -1 : 1);
+                }
               });
             }
           })();
@@ -4028,6 +4059,9 @@
                 setTimeout(function() {
                   /* 等待期间用户可能已切会话：问候只进发起时的会话，不插错视图 */
                   if (currentSessionId !== sessionId) return;
+                  /* 用户恰在等待窗口里发了消息：放弃本次问候，避免顺序变成
+                     用户消息→问候→真实回复（问候不重试，明天的问候照常触发） */
+                  if ((state.sendingCount || 0) > 0 || state.awaiting[sessionId]) return;
                   var s = findSession(sessionId);
                   if (!s) return;
                   /* 问候入场：移除剧情引导卡，让位给真实对话 */
@@ -4087,6 +4121,19 @@
                updateViaCache:'none' —— sw.js 本体绝不走 HTTP 缓存，保证服务端一发新版
                （CACHE 版本号变更）本次加载就能检测到并激活，不让设备卡在旧壳上 */
             if ('serviceWorker' in navigator) {
+              /* 新 SW 接管（skipWaiting+claim）后自动刷新一次：否则当前标签仍持有旧
+                 HTML 文档，子资源却可能已是新缓存，出现「新 JS + 旧 HTML」错配白屏。
+                 仅在页面无生成中请求时刷新，避免打断对话；有请求则等下次加载 */
+              var swRefreshing = false;
+              /* 注册前已有 controller = 升级；首次安装（null）触发的 controllerchange
+                 不需要刷新（页面本就是网络最新版） */
+              var swHadController = !!navigator.serviceWorker.controller;
+              navigator.serviceWorker.addEventListener('controllerchange', function(){
+                if (!swHadController) { swHadController = true; return; }
+                if (swRefreshing || (state.sendingCount || 0) > 0) return;
+                swRefreshing = true;
+                try { window.location.reload(); } catch (e) {}
+              });
               window.addEventListener('load', function(){
                 navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
                   .catch(function(){ /* 注册失败不影响聊天 */ });

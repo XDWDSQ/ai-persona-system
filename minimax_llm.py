@@ -136,32 +136,56 @@ def _extract_base_resp(data: dict) -> dict:
 
 
 def _code_from_error(status_code: int, body: str, data: dict) -> Optional[int]:
-    """从响应体提取 MiniMax 错误码：优先 base_resp.status_code，其次 body 文本里查找。"""
+    """从响应体提取 MiniMax 错误码：优先 base_resp.status_code；
+    data 未解析出来时把 body 当 JSON 再取一次（不做裸子串匹配——
+    响应正文任意位置出现 "1008" 等数字会造成误判）。"""
     br = _extract_base_resp(data)
     code = br.get("status_code")
     if isinstance(code, int) and code:
         return code
-    for c in _MINIMAX_ERROR_CODES:
-        if f"{c}" in (body or ""):
-            return c
+    if body:
+        try:
+            parsed = json.loads(body)
+        except (ValueError, TypeError):
+            return None
+        br2 = _extract_base_resp(parsed if isinstance(parsed, dict) else {})
+        code2 = br2.get("status_code")
+        if isinstance(code2, int) and code2:
+            return code2
     return None
 
 
 def map_error(status_code: int, body: str, data: dict, billing_mode: str) -> HTTPException:
-    """把 MiniMax 错误响应映射为与现有供应商一致的 HTTPException(502)，中文提示。"""
+    """把 MiniMax 错误响应映射为与现有供应商一致的 HTTPException(502)，中文提示。
+
+    返回的异常带 ``retryable`` 属性：429/5xx 与错误码表中标注的临时错误
+    （1000/1001/1002/1024/1033）为 True，调用方据此指数退避重试。
+    """
     code = _code_from_error(status_code, body, data)
     if code is None:
         if status_code == 401:
-            return HTTPException(502, "MiniMax 鉴权失败：请检查 API Key；注意按量计费 Key 与 Token Plan 订阅 Key 不可混用")
+            exc = HTTPException(502, "MiniMax 鉴权失败：请检查 API Key；注意按量计费 Key 与 Token Plan 订阅 Key 不可混用")
+            exc.retryable = False  # type: ignore[attr-defined]
+            return exc
         if status_code == 402:
-            return HTTPException(502, "MiniMax 账户余额不足：请检查账户余额（按量付费）或 Token Plan 额度/积分")
+            exc = HTTPException(502, "MiniMax 账户余额不足：请检查账户余额（按量付费）或 Token Plan 额度/积分")
+            exc.retryable = False  # type: ignore[attr-defined]
+            return exc
         if status_code == 429:
-            return HTTPException(502, "MiniMax 请求频率超限（429）：请降低调用频率后重试")
+            exc = HTTPException(502, "MiniMax 请求频率超限（429）：请降低调用频率后重试")
+            exc.retryable = True  # type: ignore[attr-defined]
+            return exc
         if status_code >= 500:
-            return HTTPException(502, f"MiniMax 服务错误（HTTP {status_code}）：请稍后重试")
-        return HTTPException(502, f"MiniMax 调用失败（HTTP {status_code}）: {body[:300]}")
+            exc = HTTPException(502, f"MiniMax 服务错误（HTTP {status_code}）：请稍后重试")
+            exc.retryable = True  # type: ignore[attr-defined]
+            return exc
+        exc = HTTPException(502, f"MiniMax 调用失败（HTTP {status_code}）: {body[:300]}")
+        exc.retryable = False  # type: ignore[attr-defined]
+        return exc
     retryable, tmpl = _MINIMAX_ERROR_CODES.get(code, (False, f"MiniMax 错误 {code}"))
-    return HTTPException(502, tmpl + (f"（计费模式: {billing_mode}）" if code in (1008, 2056) else ""))
+    exc = HTTPException(502, tmpl + (f"（计费模式: {billing_mode}）" if code in (1008, 2056) else ""))
+    exc.retryable = retryable  # type: ignore[attr-defined]
+    return exc
 
 
 def build_payload(messages: list[dict], model: str, temperature: float, max_tokens: int,
@@ -366,7 +390,15 @@ async def chat(conf: MiniMaxConf, messages: list[dict], temperature: float = 0.8
                 usage = parse_usage(data)
                 _accumulate_usage(usage)
                 return content, usage
-            except HTTPException:
+            except HTTPException as exc:
+                # 429/5xx/临时错误码（1000/1001/1002/1024/1033）：退避重试；
+                # 鉴权/计费/参数类错误直接抛出。
+                if getattr(exc, "retryable", False) and attempt < 2:
+                    last_err = exc
+                    _log.info("minimax retry: attempt=%d retryable_err=%s",
+                              attempt + 1, getattr(exc, "detail", exc))
+                    await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
+                    continue
                 raise
             except httpx.HTTPStatusError as exc:
                 # raise_for_status 兜底（正常情况下 4xx 已走 map_error）
@@ -483,7 +515,14 @@ async def chat_stream(conf: MiniMaxConf, messages: list[dict], temperature: floa
                 if usage.total_tokens:
                     _accumulate_usage(usage)
                 return
-            except HTTPException:
+            except HTTPException as exc:
+                # 已向调用方 yield 过正文则无法撤回；未输出阶段遇临时错误退避重试。
+                if getattr(exc, "retryable", False) and not yielded and attempt < 2:
+                    last_err = exc
+                    _log.info("minimax_stream retry: attempt=%d retryable_err=%s",
+                              attempt + 1, getattr(exc, "detail", exc))
+                    await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
+                    continue
                 raise
             except httpx.TransportError as exc:
                 if yielded or attempt == 2:

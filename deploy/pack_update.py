@@ -31,9 +31,11 @@ SENSITIVE_PATHS = [
     "cloud_providers.mimo.api_key",
     "cloud_providers.deepseek.api_key",
     "cloud_providers.ark.api_key",
+    "cloud_providers.minimax.api_key",
     "cloud_providers.custom.api_key",
     "voice.aliyun.api_key",
     "voice.minimax.api_key",
+    "voice.mimo.api_key",
 ]
 
 
@@ -51,19 +53,19 @@ def _blank_keys(obj: dict, path: str = "") -> None:
 UPDATE_FILES = [
     "server.py",
     "role_engine.py",
+    "minimax_llm.py",
+    "story_kpl2027.py",
+    "server_pkg",
     "requirements.txt",
-    "config.json",        # 本地完整版（含密钥），覆盖云上脱敏版正好补上
+    "config.json",        # 密钥已统一走 .env；此文件只含非密钥配置
     "config.example.json",
     ".env.example",
     "README.md",
     "minimax_clone.py",
     "verify_chain.py",
     "xiaoni-ai-persona",
-    "adapters",
     "docs-specs",
     "deploy",
-    "start_tunnel.bat",
-    "start_tunnel.ps1",
 ]
 
 

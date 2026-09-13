@@ -2,9 +2,11 @@
 """通过任务计划程序分离式拉起 8000 服务（独立于当前会话/job，不会被回收）。
 用 Python subprocess 传参（CreateProcessW / UTF-16），中文路径不丢。"""
 import subprocess, sys, time, socket
+from pathlib import Path
 
-PROJ = r"D:\Users\31557\Desktop\AI拟人系统"
-LAUNCHER = PROJ + r"\_run_service_detached.bat"
+# 项目根 = 本脚本所在目录（旧版硬编码 D:\\Users\\31557\\Desktop 旧工作区，已失效）
+PROJ = str(Path(__file__).resolve().parent)
+LAUNCHER = str(Path(PROJ) / "_run_service_detached.bat")
 TASK = "AIRestart8000"
 
 

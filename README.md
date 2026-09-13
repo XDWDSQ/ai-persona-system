@@ -88,8 +88,8 @@ run_tests.bat          # 一键跑全部离线测试
 | `cloud` | 当前云端供应商的 `provider` / `base_url` / `api_key` / `model` / `thinking` / `billing_mode` |
 | `cloud_providers` | 各云端供应商（mimo / deepseek / ark / minimax / custom）的预设参数，切换供应商时自动套用 |
 | `roles` | 角色定义：名称、简介、人设提示词、角色专属语音参数 |
-| `voice` | 全局语音合成配置：`provider`（如 `aliyun`）、音色、风格与各供应商子配置；`minimax` 子配置含 `speed`（0.5~2）、`vol`（整数 0~10）、`pitch`（整数 0~10）、`sample_rate`（最高 32000） |
-| `tts_cache` | TTS 音频缓存清理策略：`max_files`（默认 500）、`max_bytes`（默认 8GB）、`clean_interval`（默认 3600 秒） |
+| `voice` | 全局语音合成配置：`provider`（如 `aliyun`）、音色、风格与各供应商子配置；`minimax` 子配置含 `speed`（0.5~2）、`vol`/`pitch`（官方 speech-02-hd 需整数 0~10，GMI 接口支持小数如 2.0/0.0）、`sample_rate`（最高 32000）、`api_schema`（`official` / `gmi`） |
+| `tts_cache` | TTS 音频缓存清理策略：`max_files`（代码默认 500，模板推荐 200）、`max_bytes`（代码默认 8GB，模板推荐 1GB）、`clean_interval`（默认 3600 秒） |
 
 ### MiniMax 云端文字模型（双计费模式）
 
@@ -110,14 +110,14 @@ MiniMax 作为云端文字生成供应商已接入统一 OpenAI 兼容调用链�
 "minimax": {
   "label": "MiniMax",
   "base_url": "https://api.minimaxi.com/v1",
-  "model": "MiniMax-M2.5",
+  "model": "MiniMax-M3",
   "api_key": "",
   "thinking": true,
   "billing_mode": "payg"
 }
 ```
 
-- 默认模型 `MiniMax-M2.5`，可在设置页「🔄 获取模型列表」拉取平台全量模型后选择
+- 默认模型 `MiniMax-M3`，可在设置页「🔄 获取模型列表」拉取平台全量模型后选择
 - **Token Plan 配额查询**：POST `/api/llm-quota`（或调用 `minimax_llm.query_quota`），用订阅 Key 查官方 `/v1/token_plan/remains` 套餐额度 / 积分余额；payg 模式返回按量计费提示。未配置密钥时给出明确 400 提示
 - 错误处理与其他云端供应商一致（HTTPException 502 + 中文提示）：鉴权失败（1004/2049，含按量 Key 与订阅 Key 混用提示）、余额不足（1008/402）、Token Plan 超限（2056）、限流（429/1002）与临时错误（1000/1001/1024/1033）指数退避自动重试；空回复自动重试并降级思考模式；MiniMax 不支持 `thinking` 字段时自动移除重试
 - 流式输出带 OpenAI 标准计费参数 `stream_options.include_usage`，流式用量从末尾 chunk 解析并累计
@@ -135,7 +135,7 @@ python minimax_clone.py
 - 参考音频建议：内容连贯的单人原声，避免背景音乐与多人叠声；过短（<10s）相似度低，过长（>3 分钟）会稀释音色特征
 - 试听合成与网页实际合成使用同一组采样参数（从 `voice.minimax` 读取）
 - 临时音色 **7 天内至少使用一次**，否则会被 MiniMax 删除
-- 参数约束（speech-02-hd 实测）：`vol` / `pitch` 必须是整数，`sample_rate` 最高 32000，超出会返回 2013
+- 参数约束（speech-02-hd 实测）：`vol` / `pitch` 必须是整数（GMI 接口无此限制，支持小数），`sample_rate` 最高 32000，超出会返回 2013
 
 角色引擎默认开启：
 
@@ -187,7 +187,9 @@ python minimax_clone.py
 | `ARK_API_KEY` | 火山方舟（LLM 对话） |
 | `ALIYUN_API_KEY` | 阿里云（TTS 语音合成） |
 | `DASHSCOPE_API_KEY` | 阿里云 DashScope（备用/兼容） |
-| `MINIMAX_API_KEY` | MiniMax 海螺（TTS 语音合成，voice.provider=minimax 时使用） |
+| `MINIMAX_API_KEY` | MiniMax（LLM 对话 + TTS 语音合成，voice.provider=minimax 时使用） |
+| `GMI_API_KEY` | GMI 云（MiniMax TTS 的 `api_schema=gmi` 模式专用，与官方 Key 互不混用） |
+| `MINIMAX_BILLING_MODE` | MiniMax 计费模式兜底（`payg` / `token_plan`，config 未配置时生效） |
 
 **优先级**：`config.json` 中对应 provider 条目里填写的 `api_key` 优先；未填写时回退读取 `.env` 中的同名变量。
 
@@ -216,7 +218,7 @@ python minimax_clone.py
 
 - **日志级别**：可用环境变量 `LOG_LEVEL` 控制（默认 `WARNING`，可设 `INFO` / `DEBUG`），例如 `set LOG_LEVEL=DEBUG` 后启动。
 - **健康检查**：`GET /api/health` 可用于探活与依赖状态检查。
-- **TTS 缓存**：合成音频缓存在 `data/tts_cache/`，清理阈值由 `config.json` 的 `tts_cache` 节配置（`max_files` 默认 500、`max_bytes` 默认 8GB、`clean_interval` 默认 3600 秒）。
+- **TTS 缓存**：合成音频缓存在 `data/tts_cache/`，清理阈值由 `config.json` 的 `tts_cache` 节配置（`max_files` 代码默认 500、`max_bytes` 默认 8GB、`clean_interval` 默认 3600 秒；`config.example.json` 给出同步盘友好的推荐值 200 / 1GB）。
 - **本地 TTS 依赖的 venv 路径**（硬编码默认值，换机器需按此布局准备，风险已知、暂不可配）：
   - 本地 TTS：`~/.trae-cn/skills/local-tts`
   - Python 虚拟环境：`~/.openvino/venv/*`（如 `~/.openvino/venv/t2i-tts`）
@@ -325,7 +327,7 @@ REM TTS 缓存清理策略
 
 - **模型**：`llm/models/Qwen3.5-4B-Q4_K_M.gguf`（Q4_K_M 量化约 2.6GB，8GB 显存可全层 GPU 推理）。旧 Qwen3-4B 已移除。
 - **思考模式**：Qwen3.5 系列默认开启思考模式，长人设下思考过程会吃光 `max_tokens` 导致空回复。`server.py` 已在 local 分支自动下发 `chat_template_kwargs.enable_thinking=false` 关闭思考，无需手动配置。
-- **模型缺失时**：`start.bat` 会自动调用 `llm/get_llm.py` 从多镜像（hf-mirror → HuggingFace → ModelScope）下载；也可手动下载同名 GGUF 放入 `llm/models/`。
+- **模型缺失时**：运行 `llm/start_llm.bat` 会调用 `llm/get_llm.py` 从多镜像（hf-mirror → HuggingFace → ModelScope）下载（模型缺失时脚本自动跳过，不会报错）；也可手动下载同名 GGUF 放入 `llm/models/`。
 - **采样参数**：`llm/start_llm.bat` 中已针对人设特调（temp 0.85、top-k 40、top-p 0.92、repeat-penalty 1.25 等）。
 
 ## 故障排查
