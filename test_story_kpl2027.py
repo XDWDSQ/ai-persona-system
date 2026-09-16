@@ -4,7 +4,7 @@ import os
 import shutil
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 
 from story_kpl2027 import KPL2027Calendar, StoryManager, _d
 
@@ -121,6 +121,30 @@ class TestStoryManager(unittest.TestCase):
             self.assertEqual(sm.state["stage"], 1)
             self.assertTrue(sm.state["flags"]["first_fight"])
 
+    def test_resolve_result_date_backfill(self):
+        """resolve_result_date 回溯补记：当天无比赛 → 补记最近一场未记录比赛，
+        不得记到最旧一场（历史 bug 回归防护）。"""
+        with TmpDir() as d:
+            sm = self._mk(d)
+            sm.jump("2027-01-16")
+            # 记录当天比赛后，跳到一个无比赛的日期（后天通常是休整日，保险起见找 pending 前后验证）
+            sm.record_result("2027-01-16", True, "3:1", "岚风")
+            pending = [mm["date"] for mm in sm.cal.data["matches"] if mm.get("status") == "pending"]
+            self.assertTrue(pending)
+            # 第一场 pending 之后的第二天（非比赛日）：应回溯补记第一场 pending，
+            # 而不是更靠后的某一场
+            first_pending = _d(pending[0])
+            non_match = first_pending + timedelta(days=1)
+            while sm.cal.match_on(non_match) is not None:
+                non_match += timedelta(days=1)
+            got = sm.resolve_result_date(non_match)
+            self.assertEqual(got, first_pending)
+            # 无任何未记录比赛时兜底返回当天
+            for mm in sm.cal.data["matches"]:
+                mm["status"] = "played"
+            got2 = sm.resolve_result_date(non_match)
+            self.assertEqual(got2, non_match)
+
     def test_stage_transitions(self):
         with TmpDir() as d:
             sm = self._mk(d)
@@ -233,6 +257,65 @@ class TestStoryManager(unittest.TestCase):
             sm.jump("2027-12-01")
             sm._update_stage()
             self.assertTrue(sm.state["flags"]["season_end"])
+
+
+class TestStateFileRepair(unittest.TestCase):
+    """手改/旧版/损坏状态文件的容错：缺字段补默认、stage 越界钳制，任何读路径不得 500。"""
+
+    def _write_state(self, tmp, state):
+        story_dir = os.path.join(tmp, "story")
+        os.makedirs(story_dir, exist_ok=True)
+        import json
+        with open(os.path.join(story_dir, "kpl2027.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+
+    def test_missing_fields_filled(self):
+        with TmpDir() as d:
+            self._write_state(d, {"version": 1})  # 除 version 外全缺
+            sm = StoryManager(d)
+            self.assertEqual(sm.state["record"], {"win": 0, "loss": 0, "streak": 0})
+            self.assertIn("confession", sm.state["flags"])
+            self.assertEqual(sm.state["stage"], 0)
+            self.assertIsInstance(sm.state["log"], list)
+            # 所有读路径均不得抛
+            sm.status_payload()
+            sm.calendar_payload()
+            sm.day_info()
+            sm.story_context()
+
+    def test_stage_out_of_range_clamped(self):
+        with TmpDir() as d:
+            self._write_state(d, {"version": 1, "stage": 9, "mode": "weird",
+                                   "record": {"win": "x"}, "flags": "bad"})
+            sm = StoryManager(d)
+            self.assertEqual(sm.state["stage"], 3)
+            self.assertEqual(sm.state["mode"], "follow")
+            self.assertEqual(sm.state["record"]["win"], 0)
+            # stage 已钳制：文案下标不再 IndexError
+            sm.jump("2027-02-10")
+            sm.story_context()
+
+    def test_record_persist_failure_rollback(self):
+        """落盘失败时返回 ok:False 且内存改动回滚（下一次同场可重新记录）。"""
+        with TmpDir() as d:
+            import story_kpl2027 as mod
+            sm = StoryManager(d)
+            target = sm.cal.data["matches"][0]
+            orig = mod._atomic_write
+            mod._atomic_write = lambda path, obj: False  # 强制 state 与日历两次落盘都失败
+            try:
+                r = sm.record_result(target["date"], True, "3:1")
+            finally:
+                mod._atomic_write = orig
+            self.assertFalse(r["ok"])
+            refreshed = sm.cal.match_on(_d(target["date"]))
+            self.assertEqual(refreshed["status"], "pending")
+            self.assertIsNone(refreshed["result"])
+            self.assertEqual(sm.state["record"]["win"], 0)
+            # 回滚后重新记录应成功
+            r2 = sm.record_result(target["date"], True, "3:1")
+            self.assertTrue(r2["ok"], r2.get("msg"))
+            self.assertEqual(refreshed["status"], "played")
 
 
 if __name__ == "__main__":

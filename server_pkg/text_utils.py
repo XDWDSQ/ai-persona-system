@@ -324,9 +324,19 @@ def _fix_addressing(text: str) -> str:
             break
     # 5) 英文夹杂（保留 KPL/AG/MVP/BO7/FMVP/KWC/TTG 等大写赛事术语；
     #    小写游戏术语 carry/bp/solo 等也保留，其余小写英文视为口癖清理）
+    # 先保护 URL/邮箱：否则 https://... 里的字母会被整段抹掉
+    _protected: list[str] = []
+
+    def _stash(m):
+        _protected.append(m.group(0))
+        return f"\x00{len(_protected) - 1}\x00"
+
+    text = re.sub(r"https?://[^\s，。！？、）】」』\]）]+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+",
+                  _stash, text)
     _esports_keep = {"carry", "bp", "solo", "buff", "nerf", "gank", "poke"}
     text = re.sub(r"(?<![A-Z])(?![A-Z])[a-zA-Z]{2,}(?![A-Z])",
                    lambda m: m.group(0) if m.group(0).lower() in _esports_keep else "", text)
+    text = re.sub(r"\x00(\d+)\x00", lambda m: _protected[int(m.group(1))], text)
     # 6) 残留的风格/状态标记：[:xxx] (:xxx) [state:xxx] 等（8B 模型输出的变体格式）
     text = re.sub(r"\[[:：]\s*[^\]\r\n]{0,12}\]", "", text)
     text = re.sub(r"\([:：]\s*[^\)\r\n]{0,12}\)", "", text)

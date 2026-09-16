@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """从 update.zip 生成公网可下载的脱敏更新包 update_public.zip。
 
-把 config.json 中所有云端 API 密钥置空（云上靠 .env 回退机制工作），
+把 config.json 中所有云端 API 密钥与访问口令置空（云上靠 .env 回退机制工作），
 其余文件原样保留。用于通过公网下载链接让云电脑 AI 自行下载更新。
 """
 import json
@@ -9,30 +9,10 @@ import sys
 import zipfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from pack_cloud import ROOT, blank_sensitive
+
 SRC = ROOT / "update.zip"
 DST = ROOT / "update_public.zip"
-
-SENSITIVE_PATHS = [
-    "cloud.api_key",
-    "cloud_providers.mimo.api_key",
-    "cloud_providers.deepseek.api_key",
-    "cloud_providers.ark.api_key",
-    "cloud_providers.custom.api_key",
-    "voice.aliyun.api_key",
-    "voice.minimax.api_key",
-]
-
-
-def _blank_keys(obj: dict, path: str = "") -> None:
-    if not isinstance(obj, dict):
-        return
-    for key, val in obj.items():
-        cur = f"{path}.{key}" if path else key
-        if cur in SENSITIVE_PATHS and isinstance(val, str):
-            obj[key] = ""
-        elif isinstance(val, dict):
-            _blank_keys(val, cur)
 
 
 def main() -> int:
@@ -46,11 +26,11 @@ def main() -> int:
             data = zin.read(info.filename)
             if info.filename == "config.json":
                 cfg = json.loads(data.decode("utf-8"))
-                _blank_keys(cfg)
+                blank_sensitive(cfg)
                 data = json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
             zout.writestr(info, data)
     print(f"脱敏更新包完成: {DST.name} ({DST.stat().st_size/1048576:.2f} MB)")
-    print("config.json 密钥已置空；云上靠 .env 回退，功能不受影响。")
+    print("config.json 密钥与访问口令已置空；云上靠 .env 回退，功能不受影响。")
     return 0
 
 

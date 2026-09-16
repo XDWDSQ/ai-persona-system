@@ -19,35 +19,11 @@ import json
 import sys
 import zipfile
 from pathlib import Path
-from pack_cloud import ROOT, should_skip
+from pack_cloud import ROOT, should_skip, blank_sensitive
 
-# 公网模式：--public 时 config.json 密钥脱敏（用于放到公网链接让云电脑下载）
+# 公网模式：--public 时 config.json 密钥/口令脱敏（用于放到公网链接让云电脑下载）
 PUBLIC = "--public" in sys.argv
 OUT = ROOT / ("update_public.zip" if PUBLIC else "update.zip")
-
-# config.json 中需要脱敏的路径（与 pack_public 一致）
-SENSITIVE_PATHS = [
-    "cloud.api_key",
-    "cloud_providers.mimo.api_key",
-    "cloud_providers.deepseek.api_key",
-    "cloud_providers.ark.api_key",
-    "cloud_providers.minimax.api_key",
-    "cloud_providers.custom.api_key",
-    "voice.aliyun.api_key",
-    "voice.minimax.api_key",
-    "voice.mimo.api_key",
-]
-
-
-def _blank_keys(obj: dict, path: str = "") -> None:
-    if not isinstance(obj, dict):
-        return
-    for key, val in obj.items():
-        cur = f"{path}.{key}" if path else key
-        if cur in SENSITIVE_PATHS and isinstance(val, str):
-            obj[key] = ""
-        elif isinstance(val, dict):
-            _blank_keys(val, cur)
 
 # 更新包内容：代码 + 前端 + 配置 + 脚本；不含 data/ .env .git
 UPDATE_FILES = [
@@ -57,7 +33,7 @@ UPDATE_FILES = [
     "story_kpl2027.py",
     "server_pkg",
     "requirements.txt",
-    "config.json",        # 密钥已统一走 .env；此文件只含非密钥配置
+    "config.json",        # 含访问口令；公网模式（--public）随密钥一并脱敏
     "config.example.json",
     ".env.example",
     "README.md",
@@ -85,7 +61,7 @@ def main() -> int:
             p = ROOT / name
             if name == "config.json" and PUBLIC:
                 cfg = json.loads(p.read_text(encoding="utf-8"))
-                _blank_keys(cfg)
+                blank_sensitive(cfg)
                 zf.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
                 count += 1
             elif p.is_dir():

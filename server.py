@@ -13,6 +13,7 @@ import copy
 import gzip
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -311,6 +312,8 @@ _BG_TASKS_MAX = 200
 def _spawn_bg(coro) -> None:
     if len(_bg_tasks) >= _BG_TASKS_MAX:
         _log.warning("bg task backlog full (%d), dropping task", len(_bg_tasks))
+        # 不 close 会产生 "coroutine was never awaited" 告警，且协程持有的资源不释放
+        coro.close()
         return
     task = asyncio.create_task(coro)
     _bg_tasks.add(task)
@@ -572,10 +575,16 @@ async def _save_config_locked(cfg: dict) -> None:
     """配置写盘实际动作：调用方必须已持有 _io_locks["config"]。
     原子 replace + 写后直接更新内存缓存，省一次 stat+read。"""
     data = json.dumps(cfg, ensure_ascii=False, indent=2)
-    tmp = CONFIG_PATH.with_suffix(".tmp")
-    # 阻塞 IO 丢进线程池，避免事件循环卡住
-    await asyncio.to_thread(tmp.write_text, data, encoding="utf-8")
-    await asyncio.to_thread(tmp.replace, CONFIG_PATH)
+    # tmp 名带 pid+uuid：测试服与正式服同机（仅数据目录不同）并发保存、
+    # 或杀软/同步盘短暂占用时，固定名 config.tmp 会互相覆盖
+    tmp = CONFIG_PATH.with_name(f"config.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        # 阻塞 IO 丢进线程池，避免事件循环卡住
+        await asyncio.to_thread(tmp.write_text, data, encoding="utf-8")
+        await asyncio.to_thread(tmp.replace, CONFIG_PATH)
+    except BaseException:
+        await asyncio.to_thread(lambda: tmp.unlink(missing_ok=True))
+        raise
     try:
         _cfg_cache["_mtime_ns"] = CONFIG_PATH.stat().st_mtime_ns
     except OSError:
@@ -926,7 +935,7 @@ def _load_weather_cache() -> dict:
 def _save_weather_cache(d: dict) -> None:
     try:
         _WEATHER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _WEATHER_FILE.with_suffix(".tmp")
+        tmp = _WEATHER_FILE.with_name(f"weather.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(_WEATHER_FILE)
     except OSError as exc:
@@ -1223,7 +1232,7 @@ async def _bg_weather_refresh(force: bool = False) -> str:
             if text:
                 d = {"text": text, "ts": time.time(), "city": city}
                 _weather_mem.update(d)
-                _save_weather_cache(d)
+                await asyncio.to_thread(_save_weather_cache, d)
             return text
         except Exception as exc:  # noqa: BLE001
             _log.debug("bg weather refresh skipped: %s", exc)
@@ -1369,7 +1378,8 @@ def _load_role_news() -> dict:
 def _save_role_news(d: dict) -> None:
     try:
         _ROLE_NEWS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _ROLE_NEWS_FILE.with_suffix(".tmp")
+        # 唯一 tmp 名：人工写入与后台自动刷新是两个写入方，固定名会互相覆盖
+        tmp = _ROLE_NEWS_FILE.with_name(f"role_news.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(_ROLE_NEWS_FILE)
         _invalidate_memo(_ROLE_NEWS_FILE)
@@ -1749,7 +1759,7 @@ async def _bg_role_news_refresh(force: bool = False) -> str:
                 },
                 "ts": time.time(),
             }
-            _save_role_news(d)
+            await asyncio.to_thread(_save_role_news, d)
             return summary
         except Exception as exc:  # noqa: BLE001
             _log.debug("bg role news refresh skipped: %s", exc)
@@ -2057,6 +2067,7 @@ def ref_paths_for_role(cfg: dict) -> tuple[Path, Path]:
     ponytail: 文件名约定 `voice_<role>.wav`/`voice_<role>.txt`，不在 config 里写路径，
     避免角色配置膨胀；切角色即换音色，全局 voice_ref.wav 作为未克隆角色时的回退。"""
     role = cfg.get("active_role", "")
+    role = _sanitize_role(role)  # 纵深防御：role 拼进文件路径，非法名直接走全局回退
     if role:
         wav = DATA_DIR / f"voice_{role}.wav"
         txt = DATA_DIR / f"voice_{role}.txt"
@@ -2067,7 +2078,7 @@ def ref_paths_for_role(cfg: dict) -> tuple[Path, Path]:
 
 def role_voice_registered(cfg: dict) -> bool:
     """当前角色是否有专属克隆音色，无角色音色时回退检查全局音色。"""
-    role = cfg.get("active_role", "")
+    role = _sanitize_role(cfg.get("active_role", ""))
     if role and (DATA_DIR / f"voice_{role}.wav").exists():
         return True
     return (DATA_DIR / "voice_ref.wav").exists()
@@ -2078,7 +2089,7 @@ def cloud_ref_paths_for_role(cfg: dict) -> tuple[Path, str]:
 
     返回 (音频路径, MIME)。云端克隆优先读取 mp3，mp3 样本的音高稳定度
     实测优于 wav，因此单独优先读取 voice_<role>_cloud.mp3。"""
-    role = cfg.get("active_role", "")
+    role = _sanitize_role(cfg.get("active_role", ""))
     candidates: list[Path] = []
     if role:
         candidates += [
@@ -2377,14 +2388,22 @@ async def access_gate(request: Request, call_next):
     """全局访问门禁：配置了口令时，除健康检查与登录页外均需通过校验。"""
     # 请求体提前限量：Starlette 会把 JSON body 全量读进内存再解析，
     # 在 Content-Length 层提前拒绝，防超大 body 耗尽内存。
-    # multipart 上传走流式落盘、自带单文件上限，不在此限（上限取 40MB > sessions 允许的 32MB）。
+    # multipart 走 spool 落盘（单文件 15MB、最多 8 个），给独立的 130MB 总量阈值；
+    # 无 Content-Length 的非 GET/HEAD（chunked）JSON 请求一律要求带 CL——
+    # 浏览器/httpx/fetch 都会带，缺 CL 的 chunked body 不受 40MB 门槛约束。
     cl = request.headers.get("content-length")
-    if cl and "multipart/form-data" not in (request.headers.get("content-type") or ""):
+    ctype = request.headers.get("content-type") or ""
+    is_multipart = "multipart/form-data" in ctype
+    if cl:
         try:
-            if int(cl) > 40 * 1024 * 1024:
-                return JSONResponse({"detail": "请求体过大（上限 40MB）"}, status_code=413)
+            cl_val = int(cl)
         except ValueError:
-            pass
+            return JSONResponse({"detail": "非法的 Content-Length"}, status_code=400)
+        body_limit = 130 * 1024 * 1024 if is_multipart else 40 * 1024 * 1024
+        if cl_val > body_limit:
+            return JSONResponse({"detail": "请求体过大"}, status_code=413)
+    elif request.method not in ("GET", "HEAD", "OPTIONS") and not is_multipart:
+        return JSONResponse({"detail": "请求必须携带 Content-Length"}, status_code=411)
     token = _access_token()
     if not token:
         # 无口令模式（纯本机直连）收紧跨域：拒绝 Origin 与 Host 不一致的请求，
@@ -2523,9 +2542,30 @@ def _login_locked(ip: str) -> bool:
     return rec["fails"] >= _LOGIN_FAIL_MAX
 
 
+def _client_ip(req: Request) -> str:
+    """限流用真实客户端 IP。
+
+    直连（对端是公网/局域网地址）时用 TCP 对端，忽略 X-Forwarded-For（可伪造）；
+    对端是本机回环/内网（即经过同机 ngrok 等反向代理回源，req.client.host 恒为
+    127.0.0.1）时才采信 XFF **末跳**——代理会在末尾追加它看到的真实地址，
+    攻击者只能在前面伪造，末跳无法伪造。否则一个攻击者发 8 次错误口令就能让
+    全用户共用的回环桶永远锁定（未认证 DoS）。"""
+    host = req.client.host if req.client else "?"
+    try:
+        peer = ipaddress.ip_address(host)
+        via_proxy = peer.is_loopback or peer.is_private
+    except ValueError:
+        via_proxy = False
+    if via_proxy:
+        hops = [p.strip() for p in (req.headers.get("x-forwarded-for") or "").split(",") if p.strip()]
+        if hops:
+            return hops[-1]
+    return host
+
+
 @app.post("/api/login")
 async def login_api(req: Request, payload: LoginRequest):
-    ip = req.client.host if req.client else "?"
+    ip = _client_ip(req)
     if _login_locked(ip):
         raise HTTPException(429, "失败次数过多，请 10 分钟后再试")
     token = _access_token()
@@ -2551,6 +2591,17 @@ async def logout_api():
 
 
 # ---------------------------------------------------------------- LLM --------
+def _as_bool(v, default: bool = False) -> bool:
+    """配置布尔解析：手改 JSON 写成 "false"/"0"/"off" 时，bool("false") 会误判为 True。"""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "false", "0", "no", "off")
+    return bool(v)
+
+
 # 重试间的指数退避（第 1 次重试前 0.5s，第 2 次前 1.5s），避免瞬时重试加重对端限流
 _LLM_RETRY_BACKOFF = (0.5, 1.5)
 
@@ -2660,7 +2711,7 @@ async def llm_chat(messages: list[dict], temperature: float = 0.8, max_tokens: i
     if not base_url or not model:
         raise HTTPException(400, f"provider 配置不完整: {provider}")
     provider_name = (conf.get("provider") or "") if provider == "cloud" else "local"
-    use_thinking = bool(conf.get("thinking", True)) if thinking is None else bool(thinking)
+    use_thinking = _as_bool(conf.get("thinking", True), True) if thinking is None else bool(thinking)
     if disable_thinking:
         use_thinking = False
     url = f"{base_url}/chat/completions"
@@ -2784,7 +2835,7 @@ async def llm_chat_stream(messages: list[dict], temperature: float = 0.8, max_to
     if not base_url or not model:
         raise HTTPException(400, f"provider 配置不完整: {provider}")
     provider_name = (conf.get("provider") or "") if provider == "cloud" else "local"
-    use_thinking = bool(conf.get("thinking", True)) if thinking is None else bool(thinking)
+    use_thinking = _as_bool(conf.get("thinking", True), True) if thinking is None else bool(thinking)
     if disable_thinking:
         use_thinking = False
     url = f"{base_url}/chat/completions"
@@ -2832,6 +2883,8 @@ async def llm_chat_stream(messages: list[dict], temperature: float = 0.8, max_to
                     retryable = r.status_code >= 500 or r.status_code == 429
                     if retryable and not yielded and attempt < 2:
                         last_err = HTTPException(502, f"LLM 调用失败: {r.status_code} {body}")
+                        # 与非流式一致的指数退避：毫秒级连打 3 次只会加重对端限流
+                        await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
                         continue  # 未输出内容时对 5xx/429 重试
                     raise HTTPException(502, f"LLM 调用失败: {r.status_code} {body}")
                 async for line in r.aiter_lines():
@@ -3347,7 +3400,12 @@ async def _tts_do_synthesize_maybe_segmented(text: str, style: str, cfg: dict,
     for i, seg in enumerate(segments, 1):
         seg_paths.append(await tts_synthesize(seg, style, force=force))
     out_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
-    await asyncio.to_thread(_concat_tts_segments, seg_paths, out_path)
+    try:
+        await asyncio.to_thread(_concat_tts_segments, seg_paths, out_path)
+    except BaseException:
+        # 段 wav 损坏等导致拼接中途失败时，删掉只写了一半的产物，避免残留垃圾
+        out_path.unlink(missing_ok=True)
+        raise
     return await asyncio.to_thread(_save_tts_cache, cache, out_path)
 
 
@@ -3977,21 +4035,20 @@ async def _try_vision_chat(system: dict, history: list[dict], req: ChatRequest, 
             continue
         mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
         try:
-            # 图片单张可达 15MB：读盘+base64 编码放线程池，避免事件循环被同步 IO 卡住
-            def _read_bytes() -> bytes:
-                return path.read_bytes()
-            raw = await asyncio.to_thread(_read_bytes)
-            if raw[:4] == b"\xff\xd8\xff":
-                b64 = base64.b64encode(raw).decode("ascii")
-            else:
+            # 读盘 + HEIC 转码 + base64 编码整体放线程池：
+            # 单张可达 15MB、最多 3 张，纯 CPU 的 b64encode 直接跑在事件循环上
+            # 会让 SSE 心跳/其他请求卡顿数十毫秒
+            def _read_and_encode() -> tuple[str, str]:
+                raw = path.read_bytes()
+                if raw[:4] == b"\xff\xd8\xff":
+                    return base64.b64encode(raw).decode("ascii"), mime
                 # 非标准 JPEG：尝试 HEIC/AVIF → JPEG 转码（iPhone 照片常见），
                 # 转码失败则按原字节送（交给模型 API 判断，多数会明确报格式错误）
-                jpeg = await asyncio.to_thread(_heic_to_jpeg_bytes, raw)
+                jpeg = _heic_to_jpeg_bytes(raw)
                 if jpeg:
-                    mime = "image/jpeg"
-                    b64 = base64.b64encode(jpeg).decode("ascii")
-                else:
-                    b64 = base64.b64encode(raw).decode("ascii")
+                    return base64.b64encode(jpeg).decode("ascii"), "image/jpeg"
+                return base64.b64encode(raw).decode("ascii"), mime
+            b64, mime = await asyncio.to_thread(_read_and_encode)
         except OSError:
             continue
         content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
@@ -4212,6 +4269,9 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
             if buf_d:  # 本轮自然结束，不足一帧的残余一并发出（搜索 break 场景除外，前端会 reset）
                 yield ev({"d": buf_d})
         except HTTPException as exc:
+            # 生成器提前返回：story_task 仍在并行跑，交给后台托管，
+            # 否则局部变量释放后任务被 GC 中途回收，赛果/表白识别静默丢失
+            _detach_bg(story_task)
             yield ev({"err": f"生成失败：{exc.detail}"})
             return
         if query is None:
@@ -4223,6 +4283,7 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
         try:
             results = await web_search(query, cfg)
         except HTTPException as exc:
+            _detach_bg(story_task)
             yield ev({"err": f"搜索失败：{exc.detail}"})
             return
         messages = messages + [
@@ -4379,89 +4440,94 @@ async def chat(req: ChatRequest):
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    raw = None
-    vision_used = False
-    searched = False
-    if req.attachments:
-        raw = await _try_vision_chat(system, history, req, cfg)
-        vision_used = raw is not None
-        if raw is not None:
-            raw = _strip_search_markers(raw)
-        elif any(a.get("kind") == "image" for a in req.attachments):
-            # 视觉全不可用：注入「看不到图片内容」指令，防止文本模型编造（如"图片已生效"）
-            user_content = user_content + _VISION_FALLBACK_HINT
-    if raw is None:
-        raw, searched = await _chat_with_search(
-            system, history, user_content, cfg,
-            max_tokens=out_tokens, thinking=chat_thinking,
-        )
-    # 长文续写：单次生成很难一次写满上万字（模型会自己收尾），离要求字数还远就接着写
-    if out_tokens > _DEFAULT_MAX_TOKENS:
-        raw = await _extend_long_form(
-            raw, system, history, user_content,
-            _requested_char_count(user_text), out_tokens, cfg,
-        )
-    fallback_style = cfg.get("voice", {}).get("style") or "自然"
-    style, reply = parse_style_prefix(raw, fallback=fallback_style)
-    if _is_degenerate_reply(reply) or _too_similar_to_last(reply, history):
-        # 小模型偶发把上一条回复原样复读或陷入单字循环；用更强的采样惩罚 + 明确指令重试一次。
-        retry_system = dict(system)
-        retry_system["content"] = system["content"] + (
-            "\n\n【注意】用户已经换话题或指出你重复了。请完全重新组织语言，"
-            "不要复读你上一条回复，不要重复同一句话或同一个字，直接针对这条新消息回答。"
-        )
-        raw2 = None
-        if vision_used:
-            raw2 = await _try_vision_chat(retry_system, history, req, cfg)
-            if raw2 is not None:
-                raw2 = _strip_search_markers(raw2)
-        if raw2 is None:
-            raw2, _ = await _chat_with_search(
-                retry_system,
-                history,
-                user_content,
-                cfg,
-                temperature=1.0,
-                anti_repeat=True,
-                max_tokens=out_tokens,
-                thinking=chat_thinking,
+    try:
+        raw = None
+        vision_used = False
+        searched = False
+        if req.attachments:
+            raw = await _try_vision_chat(system, history, req, cfg)
+            vision_used = raw is not None
+            if raw is not None:
+                raw = _strip_search_markers(raw)
+            elif any(a.get("kind") == "image" for a in req.attachments):
+                # 视觉全不可用：注入「看不到图片内容」指令，防止文本模型编造（如"图片已生效"）
+                user_content = user_content + _VISION_FALLBACK_HINT
+        if raw is None:
+            raw, searched = await _chat_with_search(
+                system, history, user_content, cfg,
+                max_tokens=out_tokens, thinking=chat_thinking,
             )
-        style2, reply2 = parse_style_prefix(raw2, fallback=fallback_style)
-        if not _is_degenerate_reply(reply2) and (
-            _is_degenerate_reply(reply) or not _too_similar_to_last(reply2, history)
-        ):
-            style, reply = style2, reply2
-    post_text = user_text or (
-        "用户发送了附件：" + "、".join((a.get("name") or "附件") for a in req.attachments[:8])
-    )
-    # 剥离模型偶发追加的元话语（免责/虚构声明、跳出角色的提示），拿到干净文本再入库与展示
-    reply = _strip_meta_notes(reply)
-    # 旁白双声部拆分：dashuai2027 角色的回复拆成（旁白, 大帅台词）两段，前端分泡渲染
-    narration = ""
-    if active_role == _NARRATION_TAG:
-        narration, reply = _split_narration(reply)
-        if narration:
-            narration = _strip_meta_notes(narration)
-    # 对话后处理（异步，不阻塞）：更新情绪状态 + 抽取长期记忆写回
-    if engine_on and mem is not None and st is not None and reply:
-        _spawn_bg(_post_process_chat(active_role, post_text, reply))
-    # 称呼纠错兜底：仅大帅角色适用（4B 模型偶发自称老公/称用户老婆/用第三人称）。
-    # 该替换规则是给大帅（用户是老公、大帅自称老婆）专门定制的，对小拟/老铁/妹儿
-    # 等其他角色是无条件执行的，会把「我是女孩子」这类正常表述误改成「我是男生」。
-    if active_role == "dashuai":
-        reply = _fix_addressing(reply)
-    # 剧情分支：收尾时短等剧情识别结果（超时不阻塞，识别继续后台跑完照常入库）
-    story_update = None
-    if story_task is not None:
-        try:
-            events = await asyncio.wait_for(asyncio.shield(story_task), timeout=4.0)
-            story_update = _story_update_payload(events or [])
-        except Exception:  # noqa: BLE001
-            # 超时后任务仍在跑：交给后台托管，保证赛果识别照常入库
-            _detach_bg(story_task)
-            story_update = None
-    return {"reply": reply, "narration": narration, "style": style,
-            "vision_used": vision_used, "searched": searched, "story_update": story_update}
+        # 长文续写：单次生成很难一次写满上万字（模型会自己收尾），离要求字数还远就接着写
+        if out_tokens > _DEFAULT_MAX_TOKENS:
+            raw = await _extend_long_form(
+                raw, system, history, user_content,
+                _requested_char_count(user_text), out_tokens, cfg,
+            )
+        fallback_style = cfg.get("voice", {}).get("style") or "自然"
+        style, reply = parse_style_prefix(raw, fallback=fallback_style)
+        if _is_degenerate_reply(reply) or _too_similar_to_last(reply, history):
+            # 小模型偶发把上一条回复原样复读或陷入单字循环；用更强的采样惩罚 + 明确指令重试一次。
+            retry_system = dict(system)
+            retry_system["content"] = system["content"] + (
+                "\n\n【注意】用户已经换话题或指出你重复了。请完全重新组织语言，"
+                "不要复读你上一条回复，不要重复同一句话或同一个字，直接针对这条新消息回答。"
+            )
+            raw2 = None
+            if vision_used:
+                raw2 = await _try_vision_chat(retry_system, history, req, cfg)
+                if raw2 is not None:
+                    raw2 = _strip_search_markers(raw2)
+            if raw2 is None:
+                raw2, _ = await _chat_with_search(
+                    retry_system,
+                    history,
+                    user_content,
+                    cfg,
+                    temperature=1.0,
+                    anti_repeat=True,
+                    max_tokens=out_tokens,
+                    thinking=chat_thinking,
+                )
+            style2, reply2 = parse_style_prefix(raw2, fallback=fallback_style)
+            if not _is_degenerate_reply(reply2) and (
+                _is_degenerate_reply(reply) or not _too_similar_to_last(reply2, history)
+            ):
+                style, reply = style2, reply2
+        post_text = user_text or (
+            "用户发送了附件：" + "、".join((a.get("name") or "附件") for a in req.attachments[:8])
+        )
+        # 剥离模型偶发追加的元话语（免责/虚构声明、跳出角色的提示），拿到干净文本再入库与展示
+        reply = _strip_meta_notes(reply)
+        # 旁白双声部拆分：dashuai2027 角色的回复拆成（旁白, 大帅台词）两段，前端分泡渲染
+        narration = ""
+        if active_role == _NARRATION_TAG:
+            narration, reply = _split_narration(reply)
+            if narration:
+                narration = _strip_meta_notes(narration)
+        # 对话后处理（异步，不阻塞）：更新情绪状态 + 抽取长期记忆写回
+        if engine_on and mem is not None and st is not None and reply:
+            _spawn_bg(_post_process_chat(active_role, post_text, reply))
+        # 称呼纠错兜底：仅大帅角色适用（4B 模型偶发自称老公/称用户老婆/用第三人称）。
+        # 该替换规则是给大帅（用户是老公、大帅自称老婆）专门定制的，对小拟/老铁/妹儿
+        # 等其他角色是无条件执行的，会把「我是女孩子」这类正常表述误改成「我是男生」。
+        if active_role == "dashuai":
+            reply = _fix_addressing(reply)
+        # 剧情分支：收尾时短等剧情识别结果（超时不阻塞，识别继续后台跑完照常入库）
+        story_update = None
+        if story_task is not None:
+            try:
+                events = await asyncio.wait_for(asyncio.shield(story_task), timeout=4.0)
+                story_update = _story_update_payload(events or [])
+            except Exception:  # noqa: BLE001
+                # 超时后任务仍在跑：交给后台托管，保证赛果识别照常入库
+                _detach_bg(story_task)
+                story_update = None
+        return {"reply": reply, "narration": narration, "style": style,
+                "vision_used": vision_used, "searched": searched, "story_update": story_update}
+    finally:
+        # 视觉/搜索/续写任一 await 抛错时，局部变量随即释放：仍在跑的 story_task
+        # 会因失去强引用被 GC 中途回收。成功路径任务已 done，detach 为 no-op。
+        _detach_bg(story_task)
 
 
 async def _post_process_chat(role: str, user_msg: str, reply: str) -> None:
@@ -5052,7 +5118,9 @@ def _merge_config_update(cfg: dict, upd: ConfigUpdate) -> None:
     if upd.voice_language:
         cfg.setdefault("voice", {})["language"] = upd.voice_language
     # 声音克隆引擎（与对话 API 完全独立的另一套配置）
-    if upd.voice_provider in ("local", "aliyun", "minimax"):
+    # mimo 必须在白名单内：config.json 已配 provider=mimo 时，保存任意设置
+    # 会把语音引擎静默切走（前端无 mimo tab 时默认 tab 会冒名提交）
+    if upd.voice_provider in ("local", "aliyun", "minimax", "mimo"):
         voice_cfg = cfg.setdefault("voice", {})
         voice_cfg["provider"] = upd.voice_provider
         voice_cfg["manual_provider"] = True
@@ -5121,7 +5189,9 @@ async def roles_list():
 @app.post("/api/roles/apply")
 async def roles_apply(req: dict):
     """切换内置角色：应用其人设与音色设置（voice.provider / preset / style）。"""
-    key = (req.get("key") or "").strip()
+    key = _sanitize_role((req.get("key") or "").strip())
+    if not key:
+        raise HTTPException(400, "非法的角色名")
     # 同 update_config：读-改-写全程持锁，磁盘原值副本上改，不把 env 密钥持久化
     async with _io_locks["config"]:
         cfg = copy.deepcopy(load_config(with_env=False))
@@ -5167,6 +5237,22 @@ def _story_date_valid(ds: str) -> bool:
         return False
 
 
+def _coerce_story_win(win) -> bool:
+    """剧情赛果入参严格解析：只认 JSON bool 与可判定字符串。
+
+    null/数字/其他类型一律 400——bool(None)=False 会把缺字段调用静默记成败局，
+    污染战绩与情感阶段。"""
+    if isinstance(win, bool):
+        return win
+    if isinstance(win, str):
+        w = win.strip().lower()
+        if w in ("true", "1", "yes", "win", "胜"):
+            return True
+        if w in ("false", "0", "no", "lose", "loss", "负", "败"):
+            return False
+    raise HTTPException(400, "win 必须是布尔值（true/false）")
+
+
 @app.get("/api/story/calendar")
 async def story_calendar():
     """2027 赛程表：赛段 + AG 全年比赛 + 事件（团综/铺垫期节点）。"""
@@ -5186,7 +5272,8 @@ async def story_jump(req: dict):
     """跳转到赛程任意日期（2026-08-08 ~ 2027-12-31），剧情暂停在该日。"""
     sm = _story_api_manager()
     ds = (req.get("date") or "").strip()
-    if not sm.jump(ds):
+    # jump/记录/撤销/flag 均含同步原子写盘，放线程池执行避免阻塞事件循环
+    if not await asyncio.to_thread(sm.jump, ds):
         raise HTTPException(400, "无效日期（范围 2026-08-08 ~ 2027-12-31）")
     return sm.status_payload()
 
@@ -5195,7 +5282,7 @@ async def story_jump(req: dict):
 async def story_resume():
     """回到「跟随现实」模式：虚拟日期恢复与现实同步推进。"""
     sm = _story_api_manager()
-    sm.resume()
+    await asyncio.to_thread(sm.resume)
     return sm.status_payload()
 
 
@@ -5204,21 +5291,16 @@ async def story_result(req: dict):
     """记录比赛结果（对话识别失败时的兜底入口）。date 缺省 = 当天或最近一场未记录比赛。"""
     sm = _story_api_manager()
     ds = (req.get("date") or "").strip()
-    win = req.get("win")
-    # 严格解析 win：只认 JSON bool；字符串按字面解析，避免 bool("false")=True 错记成胜
-    if isinstance(win, str):
-        win = win.strip().lower() in ("true", "1", "yes", "win", "胜")
-    else:
-        win = bool(win)
+    win = _coerce_story_win(req.get("win"))
     score = str(req.get("score") or "")
     mvp = str(req.get("mvp") or "")
     if ds:
         if not _story_date_valid(ds):
             raise HTTPException(400, "无效日期格式（应为 YYYY-MM-DD）")
-        r = sm.record_result(ds, win, score, mvp)
+        r = await asyncio.to_thread(sm.record_result, ds, win, score, mvp)
     else:
         d = sm.resolve_result_date(sm.current_date())
-        r = sm.record_result(story_kpl2027._s(d), win, score, mvp)
+        r = await asyncio.to_thread(sm.record_result, story_kpl2027._s(d), win, score, mvp)
     if not r.get("ok"):
         raise HTTPException(400, r.get("msg", "记录失败"))
     return {"ok": True, "stage": r.get("stage"), **sm.status_payload()}
@@ -5239,7 +5321,7 @@ async def story_result_undo(req: dict):
         if not played:
             raise HTTPException(400, "还没有已记录的比赛结果")
         ds = played[-1]["date"]
-    r = sm.undo_result(ds)
+    r = await asyncio.to_thread(sm.undo_result, ds)
     if not r.get("ok"):
         raise HTTPException(400, r.get("msg", "撤销失败"))
     return {"ok": True, **sm.status_payload()}
@@ -5251,7 +5333,7 @@ async def story_flag(req: dict):
     sm = _story_api_manager()
     flag = (req.get("flag") or "").strip()
     detail = str(req.get("detail") or "")
-    if not sm.set_flag(flag, True, detail):
+    if not await asyncio.to_thread(sm.set_flag, flag, True, detail):
         raise HTTPException(400, f"未知剧情 flag: {flag}")
     return {"ok": True, **sm.status_payload()}
 
@@ -5378,7 +5460,7 @@ async def role_news_update(req: dict):
     }
     if not summary and clean_cards:
         d["summary"] = _cards_to_summary(clean_cards)
-    _save_role_news(d)
+    await asyncio.to_thread(_save_role_news, d)
     return {"ok": True, "role": role, "keyword": keyword,
             "cards": len(clean_cards), "summary": d["summary"]}
 

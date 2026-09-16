@@ -235,6 +235,65 @@ def test_context_block():
 
 
 # ---------------------------------------------------------------- main --------
+def test_search_topk_zero():
+    mem, _ = fresh_stores()
+    mem.add("任意一条记忆内容用于检索", 0.6)
+    top = mem.search("任意", top_k=0)
+    check("search(top_k=0) 返回空列表（旧实现会返回 1 条）", top == [], str(top))
+
+
+def test_add_bad_importance():
+    mem, _ = fresh_stores()
+    try:
+        ok = mem.add("重要度为 null 的记忆", importance=None)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        ok = False
+        check("add(importance=None) 不抛异常", False, str(exc))
+        return
+    check("add(importance=None) 不抛异常且写入成功", ok is True, str(ok))
+
+
+def test_parse_iso_naive():
+    # 旧文件/手改值无时区后缀：不得返回 naive，否则与 _now() 相减抛 TypeError，
+    # get_decayed/update 整链静默坏死
+    dt = role_engine._parse_iso("2026-09-01T10:00:00")
+    check("naive ISO 串被补成本地时区（aware）", dt is not None and dt.tzinfo is not None, str(dt))
+    _, st = fresh_stores()
+    st._save({
+        "version": 1,
+        "emotion": {"valence": -0.5, "arousal": 0.2},
+        "energy": 0.4, "intimacy": 0.3,
+        "last_update": "2020-01-01T00:00:00",  # 很久以前的 naive 时间
+    })
+    try:
+        decayed = st.get_decayed()
+    except TypeError as exc:
+        check("naive last_update 下 get_decayed 不抛 TypeError", False, str(exc))
+        return
+    check("naive last_update 下衰减正常计算", abs(decayed["emotion"]["valence"]) < 0.5,
+          str(decayed["emotion"]))
+
+
+def test_postprocessor_string_braces():
+    # memories 文本值含不成对 } 时，花括号扫描器必须跳过字符串字面量，
+    # 仍能识别外层 JSON（旧实现整轮标注全部丢弃）
+    raw = (
+        "好的，下面是标注结果：\n"
+        '{"emotion": {"valence": 0.6, "arousal": 0.3}, "energy_delta": 0.1, '
+        '"memories": ["用户喜欢}足球", "用户爱用{颜文字"], "story_result": null}'
+    )
+    objs = list(PostProcessor._iter_json_objects_reverse(raw))
+    check("字符串内不成对括号：仍扫描出外层对象", len(objs) == 1, str(objs))
+    parsed = PostProcessor._parse(raw)
+    check("字符串内不成对括号：标注解析成功", parsed is not None and len(parsed.get("memories") or []) == 2,
+          str(parsed))
+    # 转义引号场景不被误判
+    raw2 = '{"memories": ["他说\\"开心}哈哈\\""], "emotion": {"valence": 0.1, "arousal": 0.1}, "energy_delta": 0}'
+    parsed2 = PostProcessor._parse(raw2)
+    check("字符串内含转义引号与括号：标注解析成功", parsed2 is not None and parsed2.get("memories"),
+          str(parsed2))
+
+
 def main():
     tests = [
         test_memory_dedup,
@@ -243,12 +302,15 @@ def main():
         test_memory_cap,
         test_memory_corrupt_reset,
         test_memory_concurrent_add,
+        test_search_topk_zero,
+        test_add_bad_importance,
         test_emotion_smooth,
         test_emotion_decay,
-        test_energy_intimacy_clamp,
+        test_parse_iso_naive,
         test_time_context,
         test_postprocessor_parse,
         test_postprocessor_story_parse,
+        test_postprocessor_string_braces,
         test_context_block,
     ]
     for t in tests:

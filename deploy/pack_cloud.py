@@ -58,6 +58,33 @@ DATA_KEEP = [
 # data/ 下排除的
 DATA_SKIP = {"tts_cache", "outputs"}
 
+# config.json 脱敏路径唯一真值（公网包共用；三份打包脚本不得各自复制维护，以免再漂移）。
+# access_token 是系统访问口令，和各 LLM/TTS 密钥一样必须从公网包剥离。
+SENSITIVE_PATHS = [
+    "access_token",
+    "cloud.api_key",
+    "cloud_providers.mimo.api_key",
+    "cloud_providers.deepseek.api_key",
+    "cloud_providers.ark.api_key",
+    "cloud_providers.minimax.api_key",
+    "cloud_providers.custom.api_key",
+    "voice.aliyun.api_key",
+    "voice.minimax.api_key",
+    "voice.mimo.api_key",
+]
+
+
+def blank_sensitive(obj: dict, path: str = "") -> None:
+    """递归把 SENSITIVE_PATHS 对应的字符串值置空（公网脱敏包用，原地修改）。"""
+    if not isinstance(obj, dict):
+        return
+    for key, val in list(obj.items()):
+        cur = f"{path}.{key}" if path else key
+        if cur in SENSITIVE_PATHS and isinstance(val, str):
+            obj[key] = ""
+        elif isinstance(val, dict):
+            blank_sensitive(val, cur)
+
 def rel_parts(p: Path) -> list:
     return p.relative_to(ROOT).parts
 

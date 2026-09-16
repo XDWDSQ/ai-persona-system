@@ -244,12 +244,16 @@
   /* ---------- 拖拽 + 长按弹菜单 ---------- */
   function makeDraggable() {
     var drag = false, ox = 0, oy = 0, moved = false;
-    var pressTimer = null, startX = 0, startY = 0;
+    var pressTimer = null, startX = 0, startY = 0, activePointerId = null;
     function clearPress() {
       if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
     }
     _el.addEventListener('pointerdown', function (e) {
       if (e.button !== 0 && e.pointerType === 'mouse') return;  // 右键交给 contextmenu
+      // 双指/多指：只有第一指接管拖拽，第二指落下直接忽略，
+      // 否则两指坐标互相覆盖会让宠物跳动、第二指还可能误弹长按菜单
+      if (activePointerId !== null) return;
+      activePointerId = e.pointerId;
       drag = true; moved = false;
       startX = e.clientX; startY = e.clientY;
       var r = _el.getBoundingClientRect();
@@ -264,6 +268,7 @@
       }, LONG_PRESS_MS);
     });
     _el.addEventListener('pointermove', function (e) {
+      if (e.pointerId !== activePointerId) return;  // 非活动手指的事件一律忽略
       if (!drag) return;
       if (!moved && (Math.abs(e.clientX - startX) > DRAG_THRESHOLD ||
                      Math.abs(e.clientY - startY) > DRAG_THRESHOLD)) {
@@ -279,9 +284,11 @@
       _el.style.top  = y + 'px';
       _el.style.right = 'auto'; _el.style.bottom = 'auto';
     });
-    function endDrag() {
+    function endDrag(e) {
+      if (e && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
       if (!drag) return;
       drag = false;
+      activePointerId = null;
       clearPress();
       _el.classList.remove('dragging');
       if (moved) {

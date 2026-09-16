@@ -318,6 +318,11 @@ def main():
         print('--defringe 必须在 0..4'); sys.exit(1)
     if args.shrink < 0:
         print('--shrink 必须 >= 0'); sys.exit(1)
+    if not (0.0 <= args.alpha_lo <= 1.0 and 0.0 <= args.alpha_hi <= 1.0):
+        print('--alpha-lo / --alpha-hi 必须在 0..1'); sys.exit(1)
+    if args.alpha_lo >= args.alpha_hi:
+        print('--alpha-lo 必须小于 --alpha-hi（否则 alpha 曲线归零，会报"全程没抠到人"）')
+        sys.exit(1)
 
     tasks = []
     if args.all:

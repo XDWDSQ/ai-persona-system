@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import minimax_llm
 from minimax_llm import (LLMUsage, MiniMaxConf, build_payload, chat, chat_stream,
-                         map_error, parse_usage, query_quota, usage_total)
+                         map_error, parse_usage, query_quota, strip_think, usage_total)
 
 _FAIL = 0
 
@@ -404,16 +404,69 @@ def test_chat_stream_reasoning_fallback():
     asyncio.run(run())
 
 
+def test_stream_split_think_cross_chunk():
+    # 标签被 SSE 分片拆碎（如 "</thi"+"nk>"、"<thi"+"nk>"）不得漏进正文/吞正文
+    from minimax_llm import _stream_split_think
+    think: list[str] = []
+    tail: list[str] = []
+    body: list[str] = []
+    it = False
+    for piece in ("前缀<thi", "nk>思考</thi", "nk>后缀"):
+        it = _stream_split_think(piece, it, think, body.append, tail)
+    _stream_split_think("", it, think, body.append, tail, final=True)
+    check("跨 chunk 开标签正确进入思考", "".join(think) == "思考", "".join(think))
+    check("跨 chunk 正文完整", "".join(body) == "前缀后缀", "".join(body))
+    check("尾部缓冲已清空", tail == [], str(tail))
+
+    # 思考状态跨 chunk 且流末尾无闭合：剩余内容归思考
+    think2: list[str] = []
+    tail2: list[str] = []
+    body2: list[str] = []
+    it2 = _stream_split_think("<think>abc", False, think2, body2.append, tail2)
+    it2 = _stream_split_think("def", it2, think2, body2.append, tail2)
+    _stream_split_think("", it2, think2, body2.append, tail2, final=True)
+    check("未闭合思考流末尾归思考", "".join(think2) == "abcdef", "".join(think2))
+    check("未闭合思考正文为空", body2 == [], str(body2))
+
+
+def test_strip_think_unclosed_mid_text():
+    check("正文中间未闭合 think 归思考",
+          strip_think("开场<think>偷偷想") == ("开场", "偷偷想"),
+          repr(strip_think("开场<think>偷偷想")))
+    check("闭合块在前未闭合在后",
+          strip_think("<think>a</think>正文<think>b") == ("正文", "a b"),
+          repr(strip_think("<think>a</think>正文<think>b")))
+
+
+def test_chat_stream_think_tag_split_across_sse():
+    async def run():
+        # 端到端：think 闭合标签跨 SSE chunk，正文两侧完整保留
+        lines = _sse_chunks([
+            '{"choices":[{"delta":{"content":"前缀<think>思"}}]}',
+            '{"choices":[{"delta":{"content":"考</th"}}]}',
+            '{"choices":[{"delta":{"content":"ink>后缀"}}]}',
+            "[DONE]",
+        ])
+        fake = FakeClient(stream_lines=lines)
+        got = [p async for p in chat_stream(_default_conf(model="MiniMax-M2.5"),
+                                            [{"role": "user", "content": "hi"}], client=fake)]
+        check("跨 SSE chunk think 剥离", "".join(got) == "前缀后缀", str(got))
+    import asyncio
+    asyncio.run(run())
+
+
 def main():
     for t in (test_conf_from_cfg, test_build_payload, test_strip_think, test_parse_usage, test_map_error,
               test_chat_ok, test_chat_insufficient_balance_no_retry, test_chat_empty_retry_then_ok,
               test_chat_thinking_downgrade_on_2013, test_chat_strip_think_fallback,
+              test_stream_split_think_cross_chunk, test_strip_think_unclosed_mid_text,
               test_chat_stream_ok_with_usage, test_chat_stream_think_tags,
+              test_chat_stream_think_tag_split_across_sse,
               test_chat_stream_reasoning_fallback, test_chat_stream_error_midway,
               test_query_quota_payg, test_query_quota_token_plan, test_query_quota_no_key,
               test_server_merge_billing_mode, test_status_includes_minimax):
         t()
-    print(f"\n{'=' * 50}\n共 19 组，失败 {_FAIL} 组")
+    print(f"\n{'=' * 50}\n共 22 组，失败 {_FAIL} 组")
     sys.exit(1 if _FAIL else 0)
 
 

@@ -18,10 +18,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import random
 import threading
+import time
+import uuid
 from datetime import date, datetime, timedelta
 
 SEASON = "2027"
@@ -120,14 +123,30 @@ def _s(d: date) -> str:
     return d.strftime("%Y-%m-%d")
 
 
-def _atomic_write(path: str, obj) -> bool:
-    """原子写 JSON（tmp + replace）。"""
+def _safe_int(v, default: int) -> int:
     try:
-        tmp = path + ".tmp"
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _atomic_write(path: str, obj) -> bool:
+    """原子写 JSON（唯一 tmp + replace）。
+
+    Windows 上同步盘/杀软会短暂占用目标文件，os.replace 撞 PermissionError，
+    与 role_engine 一致做 3 次短退避；最终失败返回 False，由调用方决定回滚。"""
+    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, path)
-        return True
+        for attempt in range(3):
+            try:
+                os.replace(tmp, path)
+                return True
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05)
     except OSError:
         try:
             if os.path.exists(tmp):
@@ -312,18 +331,11 @@ class StoryManager:
         self.cal = KPL2027Calendar.load_or_generate(data_dir)
         self.path = os.path.join(data_dir, "story", "kpl2027.json")
         self.cal_path = os.path.join(data_dir, "story", "kpl2027_calendar.json")
-        self._lock = threading.Lock()
+        # RLock：record/jump 等变更段整体持锁，内部 save() 同线程可重入
+        self._lock = threading.RLock()
         self.state = self._load()
 
-    def _load(self) -> dict:
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    st = json.load(f)
-                if isinstance(st, dict) and st.get("version") == 1:
-                    return st
-            except (OSError, json.JSONDecodeError):
-                pass
+    def _default_state(self) -> dict:
         return {
             "version": 1,
             "role": ROLE,
@@ -338,6 +350,53 @@ class StoryManager:
                       "confession": False, "season_end": False},
             "log": [],
         }
+
+    def _load(self) -> dict:
+        # 字段级合并：旧版/手改文件可能缺键或 stage 越界，直接下标访问会让所有
+        # /api/story/* 与剧情注入 500。缺失字段按默认补齐，非法值归一。
+        base = self._default_state()
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                if isinstance(st, dict) and st.get("version") == 1:
+                    for k, v in st.items():
+                        base[k] = v
+                else:
+                    return base
+            except (OSError, json.JSONDecodeError):
+                return base
+        # record 子结构补齐/纠错
+        rec = base.get("record")
+        if not isinstance(rec, dict):
+            rec = {}
+        base["record"] = {
+            "win": _safe_int(rec.get("win"), 0),
+            "loss": _safe_int(rec.get("loss"), 0),
+            "streak": _safe_int(rec.get("streak"), 0),
+        }
+        flags = base.get("flags")
+        if not isinstance(flags, dict):
+            flags = {}
+        merged_flags = self._default_state()["flags"]
+        merged_flags.update({k: bool(v) for k, v in flags.items() if k in merged_flags})
+        base["flags"] = merged_flags
+        if not isinstance(base.get("log"), list):
+            base["log"] = []
+        if base.get("mode") not in ("follow", "override"):
+            base["mode"] = "follow"
+        if not isinstance(base.get("override_date"), str):
+            base["override_date"] = None
+        try:
+            stage = int(base.get("stage", 0))
+        except (TypeError, ValueError):
+            stage = 0
+        base["stage"] = max(0, min(3, stage))
+        try:
+            base["stage_progress"] = max(0.0, min(1.0, float(base.get("stage_progress", 0.0))))
+        except (TypeError, ValueError):
+            base["stage_progress"] = 0.0
+        return base
 
     def save(self) -> bool:
         with self._lock:
@@ -364,21 +423,16 @@ class StoryManager:
             return False
         if not (ANCHOR_VIRTUAL <= d <= date(2027, 12, 31)):
             return False
-        self.state["mode"] = "override"
-        self.state["override_date"] = _s(d)
-        self._mark_skipped(d)
-        self.save()
-        return True
+        with self._lock:
+            self.state["mode"] = "override"
+            self.state["override_date"] = _s(d)
+            return self.save()
 
-    def resume(self) -> None:
-        self.state["mode"] = "follow"
-        self.state["override_date"] = None
-        self.save()
-
-    def _mark_skipped(self, d: date) -> None:
-        """跳转后：如果某场季后赛失败导致后续淘汰，标记 skipped。简化策略：
-        记录一场 playoff 失利后，同 stage 后续 pending 场次与 final 标 skipped。
-        在 record_result 中实现；这里仅清理过期 pending 的标注（暂不处理）。"""
+    def resume(self) -> bool:
+        with self._lock:
+            self.state["mode"] = "follow"
+            self.state["override_date"] = None
+            return self.save()
 
     def resolve_result_date(self, d: date) -> date:
         """确定记录结果的日期：当天有未记录比赛用当天，否则回溯最近一场未记录的比赛（支持补记）。"""
@@ -419,38 +473,45 @@ class StoryManager:
             d = _d(ds)
         except (ValueError, TypeError):
             return {"ok": False, "msg": f"无效日期格式：{ds}"}
-        m = self.cal.match_on(d)
-        if m is None:
-            return {"ok": False, "msg": f"{ds} 没有 AG 的比赛"}
-        if m.get("status") == "played":
-            return {"ok": False, "msg": "该场比赛结果已记录"}
-        if m.get("status") == "skipped":
-            return {"ok": False, "msg": "该场比赛已标记取消（未晋级），不能补记结果"}
-        m["result"] = {"win": bool(win), "score": score or ("3:1" if win else "1:3"),
-                       "mvp": mvp, "note": note or ""}
-        m["status"] = "played"
-        rec = self.state["record"]
-        rec["win" if win else "loss"] += 1
-        rec["streak"] = rec["streak"] + 1 if win else 0
-        self.state["log"].append({
-            "date": ds, "event": "match_win" if win else "match_loss",
-            "detail": f"{score} {'胜' if win else '负'} {m['opponent']}"
-                      + (f"（MVP:{mvp}）" if mvp else ""),
-        })
-        # 季后赛失利 → 同一大赛段后续 pending 场次跳过（擂台赛除外）
-        self._apply_playoff_skips()
-        # 首次失利 → 阶段 0 → 1（相爱相杀：首次大吵）
-        if not win and not self.state["flags"]["first_loss"]:
-            self.state["flags"]["first_loss"] = True
-            self.state["flags"]["first_fight"] = True
+        with self._lock:
+            m = self.cal.match_on(d)
+            if m is None:
+                return {"ok": False, "msg": f"{ds} 没有 AG 的比赛"}
+            if m.get("status") == "played":
+                return {"ok": False, "msg": "该场比赛结果已记录"}
+            if m.get("status") == "skipped":
+                return {"ok": False, "msg": "该场比赛已标记取消（未晋级），不能补记结果"}
+            # 落盘失败要回滚内存中的改动，否则"假成功"后同一场再记录会报已记录、
+            # 重启后战绩却丢失（移动云盘同步盘可能短暂占住文件）
+            cal_backup = copy.deepcopy(self.cal.data)
+            state_backup = copy.deepcopy(self.state)
+            m["result"] = {"win": bool(win), "score": score or ("3:1" if win else "1:3"),
+                           "mvp": mvp, "note": note or ""}
+            m["status"] = "played"
+            rec = self.state["record"]
+            rec["win" if win else "loss"] += 1
+            rec["streak"] = rec["streak"] + 1 if win else 0
             self.state["log"].append({
-                "date": ds, "event": "first_fight",
-                "detail": "首败后的复盘，你和大帅因为指挥权与游戏理解大吵一架。",
+                "date": ds, "event": "match_win" if win else "match_loss",
+                "detail": f"{score} {'胜' if win else '负'} {m['opponent']}"
+                          + (f"（MVP:{mvp}）" if mvp else ""),
             })
-        self._update_stage()
-        self.save()
-        self._save_calendar()
-        return {"ok": True, "msg": "已记录", "stage": self.state["stage"]}
+            # 季后赛失利 → 同一大赛段后续 pending 场次跳过（擂台赛除外）
+            self._apply_playoff_skips()
+            # 首次失利 → 阶段 0 → 1（相爱相杀：首次大吵）
+            if not win and not self.state["flags"]["first_loss"]:
+                self.state["flags"]["first_loss"] = True
+                self.state["flags"]["first_fight"] = True
+                self.state["log"].append({
+                    "date": ds, "event": "first_fight",
+                    "detail": "首败后的复盘，你和大帅因为指挥权与游戏理解大吵一架。",
+                })
+            self._update_stage()
+            if not self.save() or not self._save_calendar():
+                self.cal.data = cal_backup
+                self.state = state_backup
+                return {"ok": False, "msg": "战绩保存失败（磁盘可能被占用），请重试"}
+            return {"ok": True, "msg": "已记录", "stage": self.state["stage"]}
 
     def undo_result(self, ds: str) -> dict:
         """撤销已记录的比赛结果（用户口误/记错兜底）：场次回到待宣布，
@@ -460,56 +521,61 @@ class StoryManager:
             d = _d(ds)
         except (ValueError, TypeError):
             return {"ok": False, "msg": f"无效日期格式：{ds}"}
-        m = self.cal.match_on(d)
-        if m is None:
-            return {"ok": False, "msg": f"{ds} 没有 AG 的比赛"}
-        if m.get("status") != "played" or not m.get("result"):
-            return {"ok": False, "msg": "该场比赛结果未记录，无需撤销"}
-        if (m["result"].get("note") or "") == "（未晋级，场次取消）":
-            return {"ok": False, "msg": "该场次因淘汰取消，没有可撤销的实际结果"}
-        opp = m["opponent"]
-        m["result"] = None
-        m["status"] = "pending"
-        # 1) 清空所有「未晋级取消」的派生跳过，恢复为 pending
-        for mm in self.cal.data["matches"]:
-            if mm.get("status") == "skipped" and isinstance(mm.get("result"), dict) \
-                    and mm["result"].get("note") == "（未晋级，场次取消）":
-                mm["status"] = "pending"
-                mm["result"] = None
-        # 2) 按剩余已赛场次重算战绩/连胜（按日期顺序回放）
-        rec = {"win": 0, "loss": 0, "streak": 0}
-        for mm in sorted(self.cal.data["matches"], key=lambda x: x["date"]):
-            r = mm.get("result")
-            if mm.get("status") == "played" and r and r.get("score") != "-":
-                if r.get("win"):
-                    rec["win"] += 1
-                    rec["streak"] += 1
-                else:
-                    rec["loss"] += 1
-                    rec["streak"] = 0
-        self.state["record"] = rec
-        # 3) 剩余季后赛败局重新推导跳过
-        self._apply_playoff_skips()
-        self.state["log"].append({
-            "date": _s(self.current_date()), "event": "result_undo",
-            "detail": f"撤销了 {ds} vs {opp} 的比赛结果，战绩已重算。",
-        })
-        self.save()
-        self._save_calendar()
-        return {"ok": True, "msg": "已撤销并重算战绩"}
+        with self._lock:
+            m = self.cal.match_on(d)
+            if m is None:
+                return {"ok": False, "msg": f"{ds} 没有 AG 的比赛"}
+            if m.get("status") != "played" or not m.get("result"):
+                return {"ok": False, "msg": "该场比赛结果未记录，无需撤销"}
+            if (m["result"].get("note") or "") == "（未晋级，场次取消）":
+                return {"ok": False, "msg": "该场次因淘汰取消，没有可撤销的实际结果"}
+            cal_backup = copy.deepcopy(self.cal.data)
+            state_backup = copy.deepcopy(self.state)
+            opp = m["opponent"]
+            m["result"] = None
+            m["status"] = "pending"
+            # 1) 清空所有「未晋级取消」的派生跳过，恢复为 pending
+            for mm in self.cal.data["matches"]:
+                if mm.get("status") == "skipped" and isinstance(mm.get("result"), dict) \
+                        and mm["result"].get("note") == "（未晋级，场次取消）":
+                    mm["status"] = "pending"
+                    mm["result"] = None
+            # 2) 按剩余已赛场次重算战绩/连胜（按日期顺序回放）
+            rec = {"win": 0, "loss": 0, "streak": 0}
+            for mm in sorted(self.cal.data["matches"], key=lambda x: x["date"]):
+                r = mm.get("result")
+                if mm.get("status") == "played" and r and r.get("score") != "-":
+                    if r.get("win"):
+                        rec["win"] += 1
+                        rec["streak"] += 1
+                    else:
+                        rec["loss"] += 1
+                        rec["streak"] = 0
+            self.state["record"] = rec
+            # 3) 剩余季后赛败局重新推导跳过
+            self._apply_playoff_skips()
+            self.state["log"].append({
+                "date": _s(self.current_date()), "event": "result_undo",
+                "detail": f"撤销了 {ds} vs {opp} 的比赛结果，战绩已重算。",
+            })
+            if not self.save() or not self._save_calendar():
+                self.cal.data = cal_backup
+                self.state = state_backup
+                return {"ok": False, "msg": "撤销保存失败（磁盘可能被占用），请重试"}
+            return {"ok": True, "msg": "已撤销并重算战绩"}
 
     def set_flag(self, flag: str, value: bool = True, detail: str = "") -> bool:
-        if flag not in self.state["flags"]:
-            return False
-        changed = bool(value) and not self.state["flags"][flag]
-        self.state["flags"][flag] = value
-        # 幂等：同步识别与后台标注可能重复触发同一 flag，只在首次置位时落日志
-        if changed and detail:
-            self.state["log"].append({"date": _s(self.current_date()),
-                                      "event": flag, "detail": detail})
-        self._update_stage()
-        self.save()
-        return True
+        with self._lock:
+            if flag not in self.state["flags"]:
+                return False
+            changed = bool(value) and not self.state["flags"][flag]
+            self.state["flags"][flag] = value
+            # 幂等：同步识别与后台标注可能重复触发同一 flag，只在首次置位时落日志
+            if changed and detail:
+                self.state["log"].append({"date": _s(self.current_date()),
+                                          "event": flag, "detail": detail})
+            self._update_stage()
+            return self.save()
 
     # ---- 情感阶段推进 ----
     def _update_stage(self) -> None:
@@ -555,7 +621,7 @@ class StoryManager:
                 if r.get("score") == "-":
                     title += "｜已取消（未晋级）"
                 else:
-                    title += f"｜已赛：{r['score']} {'胜' if r['win'] else '负'}"
+                    title += f"｜已赛：{r.get('score')} {'胜' if r.get('win') else '负'}"
             else:
                 title += "｜结果待岚风宣布"
         elif e:

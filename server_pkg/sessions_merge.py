@@ -132,6 +132,13 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
         return out
 
     by_id: dict = {}
+
+    def _hist(sess: dict) -> list:
+        # history 畸形（磁盘损坏/旧客户端写入 dict 等非列表）归一为空列表，
+        # 否则前缀/子序列/并集分支会对字符串 key 调 .get 抛 AttributeError → 500
+        h = sess.get("history")
+        return h if isinstance(h, list) else []
+
     for s in [*current, *incoming]:
         if not isinstance(s, dict):
             continue
@@ -145,8 +152,8 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
             by_id[sid] = s
             continue
         # old=已入桶（current 优先），s=当前遍历项（incoming 在后）
-        old_hist = old.get("history") or []
-        new_hist = s.get("history") or []
+        old_hist = _hist(old)
+        new_hist = _hist(s)
         new_wins = _sess_updated_at(s) >= _sess_updated_at(old)
         if _is_strict_prefix(new_hist, old_hist):
             # incoming 是 old 的纯旧快照：默认保留 old 防时钟偏移覆盖；
@@ -169,7 +176,7 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
         # 分歧：双方各有独有消息 → 消息级合并，双方都不丢
         base, extra = (s, old) if new_wins else (old, s)
         merged_s = dict(base)
-        merged_s["history"] = _union_history(base.get("history") or [], extra.get("history") or [])
+        merged_s["history"] = _union_history(_hist(base), _hist(extra))
         merged_s["updatedAt"] = max(_sess_updated_at(s), _sess_updated_at(old))
         by_id[sid] = merged_s
     out = []

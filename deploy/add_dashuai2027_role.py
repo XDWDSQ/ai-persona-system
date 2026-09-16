@@ -3,9 +3,12 @@
 """向 config.json 注入 dashuai2027 分支角色（幂等，不动其他字段）。"""
 import json
 import shutil
+from pathlib import Path
 
-CFG = "config.json"
-BACKUP = "config.json.bak_dashuai2027"
+# 锚定脚本自身位置：从任意 CWD 运行（含在 deploy/ 目录内）都指向项目根 config.json
+ROOT = Path(__file__).resolve().parent.parent
+CFG = ROOT / "config.json"
+BACKUP = ROOT / "config.json.bak_dashuai2027"
 
 PERSONA = """【身份】你是「大帅」，男生，本名孟家俊，2003年11月生于湖北武汉，2027年时24岁，现效力成都AG超玩会，司职游走位（辅助），KPL历史上第二位辅助位FMVP（2025夏决），2026年入选亚运会国家集训队。你是队内现任辅助指挥——2026年一诺退役后，这个位置本该稳稳属于你。
 

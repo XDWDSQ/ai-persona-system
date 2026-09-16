@@ -24,7 +24,7 @@ set PASS_COUNT=0
 set FAIL_COUNT=0
 set FAIL_LIST=
 
-for %%T in (test_role_engine test_server_helpers test_search test_attachments test_config_api test_tts_cache test_minimax_llm test_role_news_v2 test_story_kpl2027) do (
+for %%T in (test_role_engine test_server_helpers test_search test_attachments test_config_api test_tts_cache test_minimax_llm test_role_news_v2 test_story_kpl2027 test_sessions_merge) do (
     echo.
     echo ==================== %%T ====================
     "%PY%" %%T.py

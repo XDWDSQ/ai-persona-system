@@ -68,16 +68,21 @@ def _parse_iso(s: str | None) -> datetime | None:
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except (ValueError, TypeError):
         return None
+    # 旧文件/手改值可能不带时区后缀（naive）：与 aware 的 _now() 相减会抛
+    # TypeError，导致状态衰减/更新整链静默坏死。naive 一律按本地时区解释。
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt
 
 
 def _atomic_write(path: Path, data) -> bool:
-    """原子写：tmp + replace。失败返回 False，不抛异常。"""
+    """原子写：唯一 tmp + replace。失败返回 False，不抛异常。"""
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         # Windows 上无锁读（search/load）持有的文件句柄不带 FILE_SHARE_DELETE，
         # replace 会撞 PermissionError；读窗口仅毫秒级，短退避重试即可
@@ -91,6 +96,10 @@ def _atomic_write(path: Path, data) -> bool:
                 time.sleep(0.05)
     except OSError as exc:
         _log.warning("role_engine atomic write failed %s: %s", path, exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         return False
 
 
@@ -194,6 +203,10 @@ class MemoryStore:
         last_hit/hit_count（一次写盘），保证高频回忆的记忆不因时间衰减被淘汰。"""
         if not query or not query.strip():
             return []
+        if top_k <= 0:
+            # 边界：取 0 条就是 0 条（旧实现先 append 再判 >=top_k，top_k=0 仍返回 1 条
+            # 且触发无谓的 touch 写盘）
+            return []
         q_sh = _shingles(query)
         q_tokens = set(re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+", query.lower()))
         now = time.time()
@@ -260,7 +273,7 @@ class MemoryStore:
         text = (text or "").strip()
         if not text:
             return False
-        importance = max(0.0, min(1.0, float(importance)))
+        importance = max(0.0, min(1.0, _fnum(importance, 0.5)))
         # 读改写全程持锁：防止并发 add/touch 互相覆盖丢失写入
         with self._lock:
             mems = self.load()
@@ -684,11 +697,32 @@ class PostProcessor:
     def _iter_json_objects_reverse(raw: str):
         """从右往左做花括号配平扫描，依次产出文本中每个完整 JSON 对象子串
         （最后一个对象最先产出）。比正则可靠：嵌套 JSON 用 [^{}] 匹配不到，
-        贪婪 \\{.*\\} 又会在输出含多组花括号时抓错范围。"""
+        贪婪 \\{.*\\} 又会在输出含多组花括号时抓错范围。
+
+        字符串字面量整体跳过：memories 等文本值里出现不成对的 { }（如
+        "用户喜欢}足球"）时不能计入配平深度，否则真正的外层对象永远不闭合、
+        整轮情绪/记忆标注被静默丢弃。"""
         depth = 0
         end = -1
-        for i in range(len(raw) - 1, -1, -1):
+        i = len(raw) - 1
+        while i >= 0:
             ch = raw[i]
+            if ch == '"':
+                # 反向定位与该闭引号配对的开引号：遇 \" 时按前导反斜杠奇偶判转义
+                j = i - 1
+                while j >= 0:
+                    if raw[j] == '"':
+                        k, bs = j - 1, 0
+                        while k >= 0 and raw[k] == "\\":
+                            bs += 1
+                            k -= 1
+                        if bs % 2 == 0:
+                            i = j - 1  # 整段字符串跳过
+                            break
+                    j -= 1
+                else:
+                    i -= 1  # 残缺引号：降级当普通字符
+                continue
             if ch == "}":
                 if depth == 0:
                     end = i
@@ -699,6 +733,7 @@ class PostProcessor:
                     if depth == 0 and end >= 0:
                         yield raw[i:end + 1]
                         end = -1
+            i -= 1
 
     @staticmethod
     def _parse(raw: str) -> dict | None:

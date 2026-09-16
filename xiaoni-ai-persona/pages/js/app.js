@@ -352,6 +352,9 @@
             try {
               var res = await chatStreamRequest(payload, function(fullText){
                 fullRaw = fullText;
+                /* 切走会话后只继续消费流（保证收尾入库完整），绝不操作当前视图，
+                   流式气泡不能插进别的会话 */
+                if (currentSessionId !== sessionId) return;
                 if (!started) {
                   started = true;
                   hideTyping();
@@ -435,17 +438,26 @@
               if (kept && kept.trim()) {
                 var f2 = findSession(sessionId);
                 if (f2) {
-                  f2.history.push({ role: 'assistant', content: kept, style: style || '' });
+                  var keptMsg = { role: 'assistant', content: kept, style: style || '' };
+                  f2.history.push(keptMsg);
                   markSessionActivity(sessionId);
-                  if (div && div.querySelector('.bubble')) {
+                  if (currentSessionId === sessionId && div && div.querySelector('.bubble')) {
                     setBubbleContent(div.querySelector('.bubble'), kept);
                     applyClamp(div, kept);
                     div.classList.remove('no-text');
+                    /* 与正常收尾保持同一形态：补挂朗读/重新合成/重新生成，
+                       否则刷新前这条已入库消息没有任何操作入口 */
+                    var keptMeta = div.querySelector('.msg-meta');
+                    if (keptMeta && !keptMeta.querySelector('.speak-btn')) {
+                      keptMeta.appendChild(makeSpeakBtn(kept, style || '', keptMsg, sessionId));
+                      keptMeta.appendChild(makeResynthBtn(kept, style || '', keptMsg, sessionId));
+                      keptMeta.appendChild(makeRegenBtn(div));
+                    }
                   }
                   toast(aborted
                     ? (timedOut ? '响应超时，已保留已生成的内容' : '已停止生成，已保留已生成的内容')
                     : '网络中断，已保留已生成的内容');
-                } else if (div && div.parentNode) {
+                } else if (currentSessionId === sessionId && div && div.parentNode) {
                   div.remove();
                   addFailureMsg(sessionId, '会话已被删除', snap);
                 }
@@ -1640,11 +1652,12 @@
                       });
                       if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
                       if (!r.ok) throw new Error('TTS 失败');
-                      // 把稳定可回放/下载的音频 URL 持久化进消息，随对话一起保存
+                      // 把稳定可回放/下载的音频 URL 持久化进消息，随对话一起保存；
+                      // silent：听语音不是对话活动，不能刷新会话排序（markSessionActivity 内部已 save）
                       var cacheHash = r.headers.get('X-TTS-Cache');
-                      if (cacheHash && msg) {
+                      if (cacheHash && msg && sid) {
                         msg.audio = '/api/tts/file?h=' + cacheHash;
-                        try { if (sid) markSessionActivity(sid); saveSessions(); } catch (e) {}
+                        try { markSessionActivity(sid, null, true); } catch (e) {}
                       }
                       // 释放旧 URL 避免内存泄漏
                       if (state.audioCache[key]) URL.revokeObjectURL(state.audioCache[key]);
@@ -2055,6 +2068,14 @@
                 atts = await uploadPendingAttachments();
                 if (!atts.length) throw new Error('附件上传失败，请重试');
               }
+              /* 弱网下上传可能耗时数秒~数十秒，期间用户可在侧栏切换/新建/删除会话。
+                 复检会话归属：不再是当前会话就停止全部 UI 操作，否则用户气泡、typing、
+                 流式气泡会插进新会话视图（数据仍按 sessionId 入库，视图不能串台）。
+                 文本恢复为原会话草稿，切回去还能原样重发。 */
+              if (currentSessionId !== sessionId || !findSession(sessionId)) {
+                try { if (text) localStorage.setItem(draftKey(sessionId), text); } catch (e2) {}
+                return;
+              }
               var userDiv = addMsg('user', text, { attachments: atts });
               s.history.push({ role: 'user', content: text, attachments: atts });
               userDiv.dataset.hidx = String(s.history.length - 1);
@@ -2087,9 +2108,13 @@
                 addFailureMsg(sessionId, friendlySendError(e), snap);
               } else {
                 toast('发送失败：' + friendlySendError(e));
-                /* 消息还没进会话（如附件上传失败）：还原输入文本，方便原样重发 */
+                /* 消息还没进会话（如附件上传失败）：文本恢复为原会话草稿；
+                   仍停留在该会话时直接回填输入框，已切走则只存草稿不灌进新会话 */
+                try { if (text) localStorage.setItem(draftKey(sessionId), text); } catch (e2) {}
                 var t2 = document.getElementById('text');
-                if (t2 && text && !t2.value) { t2.value = text; t2.dispatchEvent(new Event('input')); }
+                if (t2 && text && currentSessionId === sessionId && !t2.value) {
+                  t2.value = text; t2.dispatchEvent(new Event('input'));
+                }
               }
             } finally {
               /* 流式阶段的按钮态由 streamReplyInto 的 syncSendBtn 接管；
@@ -2742,6 +2767,7 @@
              中文多 3 倍体积，超限直接 "Failed to fetch" 且不发包），日常保存绝不能带它 */
           function saveSessions(immediate, keepalive) {
             state.dirty = true;
+            state.saveSeq = (state.saveSeq || 0) + 1;
             var localOk = persistLocal();
             if (!localOk && (!saveSessions._lastLocalErrAt || Date.now() - saveSessions._lastLocalErrAt > 10000)) {
               saveSessions._lastLocalErrAt = Date.now();
@@ -2752,14 +2778,17 @@
             }
             clearTimeout(saveTimer);
             var doSave = function(){
-              if (!isOnlineNow()) { state.saving = false; setSyncState('offline'); return; }
+              /* 在途守卫：已有 PUT 在飞时不并发第二个（旧快照 PUT 会与新快照互相覆盖、
+                 加大服务端合并压力）；本次变更留在 dirty，由下方响应回调/15s 轮询补推 */
+              if (state.saving) { return; }
+              if (!isOnlineNow()) { setSyncState('offline'); return; }
+              var seq = state.saveSeq;
               var body;
               try {
                 body = JSON.stringify({ sessions: sessions, deleted: loadTombstones() });
               } catch (e) {
                 /* 序列化失败必须可见：旧实现在这里被外层 catch 静默吞掉，
                    localStorage 与服务端同时写不进、又没有任何提示 */
-                state.saving = false;
                 setSyncState('error', '序列化失败：' + ((e && e.message) || '未知错误'));
                 try {
                   console.error('[xiaoni] 会话序列化失败：', e);
@@ -2768,6 +2797,7 @@
                 return;
               }
               state.saving = true;
+              state.dirty = false;
               setSyncState('saving');
               try {
                 fetch('/api/sessions?client=' + encodeURIComponent(CLIENT_ID), {
@@ -2778,20 +2808,23 @@
                     state.saving = false;
                     if (r && r.status === 401) { location.href = '/login'; return; }
                     if (r && !r.ok) throw new Error('HTTP ' + r.status);
-                    state.dirty = false;
+                    /* 飞行期间又产生了新变更（saveSeq 已自增）：本次 PUT 带的是旧快照，
+                       不能清 dirty，立即补推一次最新数据 */
+                    if (state.saveSeq !== seq) { state.dirty = true; saveSessions(); }
                     setSyncState('ok');
                     writeBackup();
                 }).catch(function(e){
                     /* 保存失败必须可见：服务挂了/网络断时若静默吞错，用户会误以为
                        已保存，重开页面/换设备后聊天记录就"消失"了。限频提示避免刷屏。 */
                     state.saving = false;
+                    state.dirty = true;  /* 发送前清过 dirty：失败必须恢复，15s 轮询才会补推 */
                     setSyncState('error', (e && e.message) || '网络异常');
                     if (!saveSessions._lastErrAt || Date.now() - saveSessions._lastErrAt > 10000) {
                       saveSessions._lastErrAt = Date.now();
                       try { toast('记录保存失败，仅存本机：' + ((e && e.message) || '网络异常')); } catch (_) {}
                     }
                 });
-              } catch (e) { state.saving = false; }
+              } catch (e) { state.saving = false; state.dirty = true; }
             };
             if (immediate) doSave();
             else saveTimer = setTimeout(doSave, 300);
@@ -2849,16 +2882,22 @@
             var el = document.querySelector('.chat-title-text');
             if (el && s) el.textContent = s.title;
           }
-          function markSessionActivity(id, firstUserText) {
+          function markSessionActivity(id, firstUserText, silent) {
             var s = findSession(id);
             if (!s) return;
             if (firstUserText && s.history.length === 1 && !s.manualTitle) {
               s.title = firstUserText.length > 12 ? firstUserText.slice(0, 12) + '…' : firstUserText;
             }
-            s.updatedAt = Date.now();
+            if (!silent) {
+              /* silent：仅持久化附属数据（如 TTS 音频 URL），不刷新活跃时间、
+                 不重排列表——否则在旧会话里点一次朗读就把它顶到侧栏最前 */
+              s.updatedAt = Date.now();
+            }
             saveSessions(); /* 防抖：连续收发消息时不要每条都 PUT 服务端 */
-            renderSessions();
-            if (id === currentSessionId) updateChatTitle();
+            if (!silent) {
+              renderSessions();
+              if (id === currentSessionId) updateChatTitle();
+            }
           }
           /* 轻量指纹：同步合并的变更检测用，避免每次同步全量深比较（会话可能有数万字） */
           function sessionFingerprint(s) {
@@ -2956,8 +2995,16 @@
                      60s 内的前缀变更视为「删除最后一条消息」的快速操作，删除生效 */
                   var localStale = rh.length > lh.length && isPrefixSeq(lh, rh)
                                    && localNewer && ((l.updatedAt || 0) - (r.updatedAt || 0)) > 60000;
-                  /* 分歧：两端各有对方没有的消息（并发各发各话）→ 消息级合并双方都不丢 */
-                  var diverge = !localStale && lh.length !== rh.length
+                  /* 等长全等 = 同一版本正常演进；必须先于分叉判定排除，
+                     否则两端各发一条（前缀相同、长度相同、末尾不同）这种最常见的
+                     并发形态会落到"时间新者胜"，一端的消息+回复被整段抹掉 */
+                  var sameSeq = lh.length === rh.length && lh.every(function(m, i){
+                    var x = rh[i];
+                    return m && x && msgSig(m) === msgSig(x);
+                  });
+                  /* 分歧：两端各有对方没有的消息（并发各发各话，含等长分叉）→ 消息级合并 */
+                  var diverge = !localStale && !sameSeq
+                                && !isPrefixSeq(lh, rh) && !isPrefixSeq(rh, lh)
                                 && !isSubsequenceSeq(lh, rh) && !isSubsequenceSeq(rh, lh);
                   if (localStale) {
                     mergedObj = r;
@@ -3510,6 +3557,9 @@
                 stopAudio();
                 state.playSeq++; /* 删除会话：作废所有在飞/挂起的朗读请求 */
                 addTombstone(sess.id); /* 墓碑：其他设备同步时不得复活该会话 */
+                /* 同步清掉该会话的输入草稿，否则 xiaoni_draft_<id> 孤儿键无界累积，
+                   长期挤占 localStorage 配额 */
+                try { localStorage.removeItem(draftKey(sess.id)); } catch (e) {}
                 sessions = sessions.filter(function(x){ return x.id !== sess.id; });
                 if (wasActive) {
                   /* 删的是当前会话：优先回主对话（必可见），保证总有有效 currentSessionId；

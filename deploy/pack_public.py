@@ -14,34 +14,9 @@ import json
 import sys
 import zipfile
 from pathlib import Path
-from pack_cloud import ROOT, TOP_FILES, TOP_DIRS, DATA_KEEP, DATA_SKIP, should_skip
+from pack_cloud import ROOT, TOP_FILES, TOP_DIRS, DATA_KEEP, DATA_SKIP, SENSITIVE_PATHS, blank_sensitive, should_skip
 
 OUT = ROOT / "cloud_deploy_public.zip"
-
-# config.json 中需要脱敏的路径（点分路径）
-SENSITIVE_PATHS = [
-    "cloud.api_key",
-    "cloud_providers.mimo.api_key",
-    "cloud_providers.deepseek.api_key",
-    "cloud_providers.ark.api_key",
-    "cloud_providers.minimax.api_key",
-    "cloud_providers.custom.api_key",
-    "voice.aliyun.api_key",
-    "voice.minimax.api_key",
-    "voice.mimo.api_key",
-]
-
-
-def _blank_keys(obj: dict, path: str = "") -> None:
-    """递归把 SENSITIVE_PATHS 对应的值置空。"""
-    if not isinstance(obj, dict):
-        return
-    for key, val in obj.items():
-        cur = f"{path}.{key}" if path else key
-        if cur in SENSITIVE_PATHS and isinstance(val, str):
-            obj[key] = ""
-        elif isinstance(val, dict):
-            _blank_keys(val, cur)
 
 
 def main() -> int:
@@ -66,7 +41,7 @@ def main() -> int:
         cfg_path = ROOT / "config.json"
         if cfg_path.exists():
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            _blank_keys(cfg)
+            blank_sensitive(cfg)
             zf.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
             count += 1
 

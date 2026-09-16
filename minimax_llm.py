@@ -84,6 +84,17 @@ class LLMUsage:
         return f"prompt={self.prompt_tokens} completion={self.completion_tokens} total={self.total_tokens}"
 
 
+def _as_bool(v, default: bool = False) -> bool:
+    """配置布尔解析：手改 JSON 的 "false"/"0"/"off" 字符串不应被 bool() 当真。"""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "false", "0", "no", "off")
+    return bool(v)
+
+
 @dataclass
 class MiniMaxConf:
     """从 config.cloud_providers.minimax / config.cloud 提取的 MiniMax 连接配置。
@@ -111,7 +122,7 @@ class MiniMaxConf:
             api_key=conf.get("api_key") or "",
             model=conf.get("model") or MINIMAX_DEFAULT_MODEL,
             billing_mode=billing,
-            thinking=bool(conf.get("thinking", True)),
+            thinking=_as_bool(conf.get("thinking", True), True),
             quota_url=(conf.get("quota_url") or MINIMAX_DEFAULT_QUOTA_URL).rstrip("/"),
         )
 
@@ -217,41 +228,68 @@ def build_payload(messages: list[dict], model: str, temperature: float, max_toke
 
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
-_THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 
 
 def strip_think(text: str) -> tuple[str, str]:
     """剥离 content 里的 <think>...</think> 块（M2.x 未拆分时思考内嵌在此），
-    返回 (正文, 思考内容)。带标签但标签不闭合时整体视作思考（保险处理）。"""
+    返回 (正文, 思考内容)。末尾未闭合的 <think>（任意位置）之后内容整体视作思考。"""
     if not text:
         return "", ""
     if "<think" not in text.lower():
         return text.strip(), ""
     parts: list[str] = []
     think_parts: list[str] = []
+    lowered = text.lower()
     pos = 0
-    for m in _THINK_RE.finditer(text):
-        parts.append(text[pos:m.start()])
-        think_parts.append(m.group(0)[len(_THINK_OPEN):-len(_THINK_CLOSE)].strip())
-        pos = m.end()
-    parts.append(text[pos:])
+    while pos < len(text):
+        o = lowered.find(_THINK_OPEN, pos)
+        if o < 0:
+            parts.append(text[pos:])
+            break
+        c = lowered.find(_THINK_CLOSE, o + len(_THINK_OPEN))
+        if c < 0:
+            # 未闭合：开标签之后全部视为思考（异常响应兜底）
+            parts.append(text[pos:o])
+            think_parts.append(text[o + len(_THINK_OPEN):])
+            break
+        parts.append(text[pos:o])
+        think_parts.append(text[o + len(_THINK_OPEN):c])
+        pos = c + len(_THINK_CLOSE)
     content = "".join(parts).strip()
-    if not think_parts and content.lower().startswith(_THINK_OPEN):
-        # 只有开标签没有闭标签：整段视为思考（异常响应兜底）
-        return "", text[len(_THINK_OPEN):].strip()
     return content, " ".join(t for t in think_parts if t).strip()
 
 
+def _partial_tag_len(piece: str, tag: str) -> int:
+    """piece 末尾最长能构成 tag 前缀的长度（不含完整 tag），无则 0。忽略大小写。"""
+    lowered = piece.lower()
+    for n in range(min(len(tag) - 1, len(piece)), 0, -1):
+        if tag.lower().startswith(lowered[-n:]):
+            return n
+    return 0
+
+
 def _stream_split_think(piece: str, in_think: bool, think_buf: list[str],
-                        on_text) -> bool:
+                        on_text, tail_buf: list[str], final: bool = False) -> bool:
     """流式处理单个 content delta：维护 <think> 跨 chunk 状态。
 
+    tail_buf 跨 chunk 保留可能是半截标签的尾部字符，避免 "</thi"+"nk>" 这类
+    标签被 SSE 分片后漏进正文或吞掉正文；final=True 表示流已结束，
+    剩余尾部不再保留（按当前状态直接输出）。
+
     返回新的 in_think；正文部分回调 on_text；think 内容累计到 think_buf。"""
+    if tail_buf:
+        piece = "".join(tail_buf) + piece
+        tail_buf.clear()
     while piece:
         if in_think:
             idx = piece.lower().find(_THINK_CLOSE)
             if idx < 0:
-                think_buf.append(piece)
+                keep = 0 if final else _partial_tag_len(piece, _THINK_CLOSE)
+                if keep:
+                    think_buf.append(piece[:-keep])
+                    tail_buf.extend(piece[-keep:])
+                else:
+                    think_buf.append(piece)
                 return True
             think_buf.append(piece[:idx])
             piece = piece[idx + len(_THINK_CLOSE):]
@@ -259,7 +297,12 @@ def _stream_split_think(piece: str, in_think: bool, think_buf: list[str],
             continue
         idx = piece.lower().find(_THINK_OPEN)
         if idx < 0:
-            on_text(piece)
+            keep = 0 if final else _partial_tag_len(piece, _THINK_OPEN)
+            if keep:
+                on_text(piece[:-keep])
+                tail_buf.extend(piece[-keep:])
+            else:
+                on_text(piece)
             return False
         before = piece[:idx]
         if before:
@@ -350,17 +393,35 @@ async def chat(conf: MiniMaxConf, messages: list[dict], temperature: float = 0.8
                                       headers={"Authorization": f"Bearer {conf.api_key}",
                                                "Content-Type": "application/json"},
                                       timeout=timeout)
-                data = r.json()
+                # 先判 HTTP 状态再解析 body：网关 502/503/429 常返回 HTML 错误页，
+                # 先 r.json() 会抛 ValueError 落入「响应解析失败」，5xx/限流退避重试承诺失效
+                if r.status_code >= 400:
+                    body_txt = r.text or ""
+                    try:
+                        err_data = r.json()
+                    except ValueError:
+                        err_data = None
+                    # 2013 业务码可能伴随 4xx 返回：保持原优先级，先去掉 thinking 重试一次
+                    if (isinstance(err_data, dict)
+                            and _extract_base_resp(err_data).get("status_code") == 2013
+                            and "thinking" in payload and attempt < 2):
+                        payload.pop("thinking", None)
+                        _log.info("minimax retry: attempt=%d reason=unsupported_thinking", attempt + 1)
+                        await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
+                        continue
+                    raise map_error(r.status_code, body_txt, err_data or {}, conf.billing_mode)
+                try:
+                    data = r.json()
+                except ValueError:
+                    # 200 但 body 非 JSON（网关劫持/中间页）：按临时故障退避重试
+                    if attempt < 2:
+                        last_err = HTTPException(502, "MiniMax 返回了非 JSON 响应")
+                        _log.info("minimax retry: attempt=%d reason=invalid_json", attempt + 1)
+                        await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
+                        continue
+                    raise HTTPException(502, "MiniMax 响应解析失败：返回了非 JSON 内容")
                 br = _extract_base_resp(data)
                 br_code = br.get("status_code")
-                # 2013 参数错误可能是 MiniMax 不支持 thinking 字段：去掉后重试一次
-                if br_code == 2013 and "thinking" in payload and attempt < 2:
-                    payload.pop("thinking", None)
-                    _log.info("minimax retry: attempt=%d reason=unsupported_thinking", attempt + 1)
-                    await asyncio.sleep(_LLM_RETRY_BACKOFF[min(attempt, len(_LLM_RETRY_BACKOFF) - 1)])
-                    continue
-                if r.status_code >= 400:
-                    raise map_error(r.status_code, r.text or "", data, conf.billing_mode)
                 if br_code:
                     raise map_error(r.status_code, r.text or "", data, conf.billing_mode)
                 choices = data.get("choices") or []
@@ -447,6 +508,7 @@ async def chat_stream(conf: MiniMaxConf, messages: list[dict], temperature: floa
             reasoning_parts: list[str] = []
             think_parts: list[str] = []
             in_think = False  # 流式 <think> 标签跨 chunk 状态（M2.x 未按 reasoning_split 拆分时）
+            think_tail: list[str] = []  # 跨 chunk 半截标签尾部缓冲（如 "</thi"+"nk>"）
             usage = LLMUsage()
             try:
                 async with client.stream(
@@ -500,7 +562,7 @@ async def chat_stream(conf: MiniMaxConf, messages: list[dict], temperature: floa
                             def _emit(t):
                                 body_parts.append(t)
 
-                            in_think = _stream_split_think(piece, in_think, think_parts, _emit)
+                            in_think = _stream_split_think(piece, in_think, think_parts, _emit, think_tail)
                             for t in body_parts:
                                 content_parts.append(t)
                                 yielded = True
@@ -508,6 +570,12 @@ async def chat_stream(conf: MiniMaxConf, messages: list[dict], temperature: floa
                         rp = delta.get("reasoning_content")
                         if rp:
                             reasoning_parts.append(rp)
+                    # 流结束：冲刷尾部缓冲（半截标签按当前状态归入正文/思考）
+                    flush_parts: list[str] = []
+                    _stream_split_think("", in_think, think_parts, flush_parts.append, think_tail, final=True)
+                    for t in flush_parts:
+                        content_parts.append(t)
+                        yield t
                 content = "".join(content_parts).strip()
                 if not content and (reasoning_parts or think_parts):
                     # thinking 模型只输出了思考没出正文：兜底输出一次

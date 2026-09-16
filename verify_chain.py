@@ -2,9 +2,9 @@
 """全链路验证（对齐当前 API 契约）:
   /api/status 现有字段校验 + /api/chat 对话 + /api/tts（按当前 voice.provider 走验证路径）
 
-注意：MiMo TTS 已下线（server 对 voice.provider=mimo 显式返回 400），
-因此 TTS 验证按 status.voice_provider 决定路径：
-  aliyun → 需 aliyun_configured 后合成；local → 直接合成；mimo → 跳过并说明。
+TTS 验证按 status.voice_provider 决定路径：
+  aliyun/minimax → 需对应 configured 后合成；local → 直接合成；
+  mimo → 未配置 key 时服务端返回 400，跳过并说明（MiMo TTS 链路仍在，非"已下线"）。
 """
 import json
 import os
@@ -42,14 +42,22 @@ def _http_error(e: urllib.error.HTTPError) -> str:
     return f"HTTP {e.code} {body[:300]}"
 
 
-def post(path, payload=None, binary=False):
-    url = BASE + path
+def _assert_target_allowed(url: str) -> None:
+    """SSRF 防护：默认目标是本机环回（README 的标准用法，必须放行）；
+    其余私网/链路本地地址拒绝，公网地址放行。"""
     p = urllib.parse.urlparse(url)
     if p.scheme not in ("http", "https") or not p.hostname:
         raise RuntimeError(f"非法地址: {url}")
     ip = ipaddress.ip_address(socket.gethostbyname(p.hostname))
-    if ip.is_private or ip.is_loopback or ip.is_link_local:
+    if ip.is_loopback:
+        return
+    if ip.is_private or ip.is_link_local:
         raise RuntimeError(f"禁止访问内网地址: {url}")
+
+
+def post(path, payload=None, binary=False):
+    url = BASE + path
+    _assert_target_allowed(url)
     data = json.dumps(payload).encode() if payload is not None else b""
     req = urllib.request.Request(url, data=data, headers=_headers())
     try:
@@ -66,12 +74,7 @@ def post(path, payload=None, binary=False):
 
 def get(path):
     url = BASE + path
-    p = urllib.parse.urlparse(url)
-    if p.scheme not in ("http", "https") or not p.hostname:
-        raise RuntimeError(f"非法地址: {url}")
-    ip = ipaddress.ip_address(socket.gethostbyname(p.hostname))
-    if ip.is_private or ip.is_loopback or ip.is_link_local:
-        raise RuntimeError(f"禁止访问内网地址: {url}")
+    _assert_target_allowed(url)
     req = urllib.request.Request(url, headers=_headers())
     try:
         r = urllib.request.urlopen(req, timeout=30)

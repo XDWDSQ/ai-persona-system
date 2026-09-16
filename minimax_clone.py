@@ -19,6 +19,7 @@ status_code=2038（voice clone user forbidden），请在 platform.minimaxi.com
 import base64
 import ipaddress
 import json
+import os
 import socket
 import sys
 import urllib.error
@@ -115,9 +116,17 @@ def update_config_voice_id(voice_id: str) -> None:
         print(f"读取 config.json 失败（{e}），请检查文件是否被占用或损坏")
         return
     cfg.setdefault("voice", {}).setdefault("minimax", {})["voice"] = voice_id
+    # 原子写（tmp+replace）：服务运行时会热加载 config.json，直写中途异常/云盘占用
+    # 会留下截断的配置文件导致服务读到坏 JSON
+    tmp = CONFIG_PATH.with_name(f"config.clone.{os.getpid()}.tmp")
     try:
-        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(CONFIG_PATH)
     except OSError as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         print(f"写入 config.json 失败（{e}），请手动把 voice.minimax.voice 设为 {voice_id}")
         return
     print(f"已写入 config.json: voice.minimax.voice = {voice_id}")
