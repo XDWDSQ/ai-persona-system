@@ -64,7 +64,7 @@
   --popover-foreground: #2d2318;
   --primary-foreground: #fbf6ec;
   --secondary-foreground: #2d2318;
-  --muted-foreground: #8a7a66;
+  --muted-foreground: #776853;  /* 原 #8a7a66 对比度 3.76 不达 WCAG AA，加深到 4.88 */
   --accent-foreground: #2d2318;
   --destructive-foreground: #fff5f0;
 
@@ -454,7 +454,7 @@
           radial-gradient(900px 480px at 82% -10%,color-mix(in srgb,var(--chart-2) 9%,transparent),transparent 68%),
           radial-gradient(760px 420px at 4% 110%,color-mix(in srgb,var(--chart-3) 7%,transparent),transparent 72%),
           linear-gradient(180deg,color-mix(in srgb,var(--background) 62%,transparent),color-mix(in srgb,var(--background) 88%,transparent) 46%,var(--background)),
-          url('../bg-ambient.webp');background-size:auto,auto,auto,cover;background-position:center;background-repeat:no-repeat}
+          url('../bg_ambient_v2.webp');background-size:auto,auto,auto,cover;background-position:center;background-repeat:no-repeat}
         .main > *{position:relative;z-index:1}
         /* 顶栏改不透明：原先 82% 半透明 + backdrop-filter(12px) 在消息滚动时每帧重采样，
            是桌面/移动端滚动掉帧的主要来源之一；不透明后视觉几乎一致，滚动开销归零 */
@@ -664,6 +664,8 @@
         .jump-bottom.show{opacity:1;transform:none;pointer-events:auto}
         .jump-bottom:hover{color:var(--foreground);background:var(--accent)}
         .jump-bottom svg{width:16px;height:16px}
+        /* 未读角标：上翻浏览时 AI 回复到达的计数（回到底部自动清零） */
+        .jump-badge{position:absolute;top:-5px;right:-5px;min-width:17px;height:17px;padding:0 4px;border-radius:9px;background:var(--destructive);color:#fff;font-size:11px;font-weight:700;font-style:normal;line-height:17px;text-align:center;box-shadow:0 2px 8px -2px rgba(0,0,0,.45)}
         /* 历史窗口化：顶部「加载更早」按钮（长会话首屏只渲染最近 60 条） */
         .load-earlier{display:block;margin:4px auto 14px;padding:6px 16px;border-radius:999px;border:1px dashed color-mix(in srgb,var(--chart-2) 45%,transparent);background:color-mix(in srgb,var(--chart-2) 6%,transparent);color:var(--muted-foreground);font-size:12px;line-height:1.5;cursor:pointer;transition:color .15s ease,background-color .15s ease,border-color .15s ease}
         .load-earlier:hover{color:var(--chart-2);background:color-mix(in srgb,var(--chart-2) 12%,transparent);border-color:color-mix(in srgb,var(--chart-2) 65%,transparent)}
@@ -1023,3 +1025,88 @@
         .msg.anim > *,.msg.anim .avatar,.msg.anim .msg-body,.session.side-in,.role-item.side-in,.msg.ai.speaking .avatar,.typing i,.mini-wave i,.send-btn .spinner{animation:none !important}
         .jump-bottom,.ctx-menu,.attach-menu,.toast,.prompt-chip,.send-btn{transition:none !important}
       }
+
+/* ===== 7. 欢迎区 Hero（v2 重构：seedance 动态视频背景 + seedream 角色肖像） ===== */
+/* 结构：.welcome-bg（绝对定位的视频卡）→ .welcome-hero（头像+光环）→ 文字层（eyebrow/h1/p/chips）。
+   原 .welcome 规则保持不动，此处只叠加层级与 Hero 专属样式。 */
+.welcome{position:relative;padding:34px 0 32px}
+/* 视频背景卡：静态图 poster 兜底 → 视频铺满 → 琥珀辉光 → 底部渐变压回页面底色 */
+.welcome-bg{position:absolute;inset:14px 0 6px;border-radius:26px;overflow:hidden;z-index:0;
+  background:url('../bg_ambient_v2.webp') center/cover no-repeat;
+  box-shadow:0 24px 64px -32px rgba(0,0,0,.75),inset 0 1px 0 rgba(255,255,255,.04)}
+.welcome-bg video{width:100%;height:100%;object-fit:cover;display:block;opacity:.92}
+.welcome-bg::before{content:"";position:absolute;inset:0;
+  background:radial-gradient(560px 300px at 78% -12%,color-mix(in srgb,var(--chart-2) 16%,transparent),transparent 66%),
+             radial-gradient(480px 280px at 6% 116%,color-mix(in srgb,var(--chart-3) 12%,transparent),transparent 70%)}
+.welcome-bg::after{content:"";position:absolute;inset:0;
+  background:linear-gradient(180deg,color-mix(in srgb,var(--background) 46%,transparent),
+             color-mix(in srgb,var(--background) 76%,transparent) 58%,var(--background))}
+/* 文字层抬到视频之上，保证正文对比度 */
+.welcome .eyebrow,.welcome h1,.welcome p,.chips{position:relative;z-index:1}
+.welcome .eyebrow{margin-top:22px}
+/* 角色肖像：居中圆片 + 旋转光环 + 轻微悬浮（触屏/减少动态时关闭） */
+.welcome-hero{position:relative;z-index:1;width:104px;height:104px;margin:30px auto 4px}
+.welcome-ring{position:absolute;inset:-11px;border-radius:50%;opacity:.55;filter:blur(1px);
+  background:conic-gradient(from 210deg,color-mix(in srgb,var(--chart-1) 75%,transparent),
+             color-mix(in srgb,var(--chart-3) 55%,transparent),
+             color-mix(in srgb,var(--chart-1) 75%,transparent));animation:heroSpin 9s linear infinite}
+.welcome-ring::after{content:"";position:absolute;inset:6px;border-radius:50%;
+  background:radial-gradient(circle,color-mix(in srgb,var(--chart-2) 24%,transparent),transparent 70%);filter:blur(6px)}
+.welcome-avatar{position:absolute;inset:0;width:100%;height:100%;border-radius:50%;object-fit:cover;display:block;
+  border:2px solid color-mix(in srgb,var(--chart-1) 60%,transparent);
+  box-shadow:0 12px 34px -14px color-mix(in srgb,var(--chart-2) 65%,transparent),0 0 0 1px rgba(255,255,255,.05);
+  animation:heroFloat 4.6s ease-in-out infinite}
+.welcome-avatar:not([src]){display:none}
+@keyframes heroSpin{to{transform:rotate(360deg)}}
+@keyframes heroFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+@media (max-width:900px){
+  .welcome{padding:16px 0 20px}
+  .welcome-bg{inset:8px 0 4px;border-radius:20px}
+  .welcome-hero{width:88px;height:88px;margin-top:22px}
+  .welcome .eyebrow{margin-top:18px}
+}
+@media (prefers-reduced-motion:reduce){
+  .welcome-ring,.welcome-avatar{animation:none !important}
+  .welcome-avatar{animation-name:none}
+}
+
+/* ===== 陪伴足迹（设置面板）：近 7 天迷你柱状图 ===== */
+.stat-bar{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:4px;min-width:0;height:100%}
+.stat-bar i{display:block;width:100%;max-width:26px;border-radius:5px 5px 2px 2px;
+  background:color-mix(in srgb,var(--chart-1) 78%,transparent)}
+.stat-bar small{font-size:10px;color:var(--muted-foreground);white-space:nowrap}
+
+/* ===== 8. 拖拽发送提示层（z-index 高于一切弹窗） ===== */
+.drop-over{position:fixed;inset:0;z-index:1300;display:flex;align-items:center;justify-content:center;
+  background:color-mix(in srgb,var(--background) 72%,transparent);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
+  opacity:0;pointer-events:none;transition:opacity .18s ease}
+body.drag-over .drop-over{opacity:1;pointer-events:auto}
+.drop-card{display:flex;flex-direction:column;align-items:center;gap:10px;padding:34px 52px;
+  border-radius:20px;border:2px dashed color-mix(in srgb,var(--chart-2) 60%,transparent);
+  background:var(--card);box-shadow:0 24px 60px -20px rgba(0,0,0,.5)}
+.drop-card svg{width:38px;height:38px;color:var(--chart-2)}
+.drop-card span{font-size:16px;font-weight:700;color:var(--foreground)}
+.drop-card small{font-size:12px;color:var(--muted-foreground)}
+
+/* ===== 9. 灯箱：上一张/下一张/下载 ===== */
+.lb-nav{position:absolute;top:50%;width:44px;height:44px;border-radius:50%;
+  border:1px solid var(--border);background:color-mix(in srgb,var(--card) 80%,transparent);
+  color:var(--foreground);display:flex;align-items:center;justify-content:center;z-index:1;
+  transition:background-color .16s ease}
+.lb-nav:hover{background:var(--card)}
+.lb-nav[disabled]{opacity:.3;pointer-events:none}
+.lb-nav svg{width:20px;height:20px}
+.lb-prev{left:24px;transform:translateY(-50%)}
+.lb-next{right:24px;transform:translateY(-50%)}
+.lb-prev:not([disabled]):hover{transform:translateY(-50%) translateX(-2px)}
+.lb-next:not([disabled]):hover{transform:translateY(-50%) translateX(2px)}
+.lb-download{position:absolute;top:24px;right:24px;width:40px;height:40px;border-radius:10px;
+  border:1px solid var(--border);background:color-mix(in srgb,var(--card) 80%,transparent);
+  color:var(--foreground);display:flex;align-items:center;justify-content:center;z-index:1;
+  transition:background-color .16s ease}
+.lb-download:hover{background:var(--card)}
+.lb-download svg{width:18px;height:18px}
+@media (max-width:640px){
+  .lb-prev{left:10px}.lb-next{right:10px}
+  .lb-nav{width:38px;height:38px}
+}

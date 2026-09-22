@@ -31,6 +31,39 @@ def _is_masked_key(value: str) -> bool:
     return bool(value) and str(value).startswith(_KEY_MASK_PREFIX)
 
 
+# 凭据类字段的叶子名。**按名字兜住，不按已知路径枚举** ——
+# /api/status 曾逐个字段手写脱敏，结果漏了 local.api_key 与 voice.mimo.api_key：
+# 用户在设置页新增任意 provider、或填了本地模型的 key，就会随每次状态查询明文
+# 流过公网隧道。deploy/pack_cloud.py 的公网包脱敏与本常量同源。
+# 匹配是全等（忽略大小写/空格），所以 news.keyword 这类不会被误伤。
+SENSITIVE_LEAVES = {
+    "api_key", "apikey", "access_key", "secret_key", "app_secret",
+    "access_token", "refresh_token", "token", "token_plan_api_key",
+    "password", "passwd", "secret", "webhook_secret",
+}
+
+
+def _is_sensitive_leaf(key) -> bool:
+    return isinstance(key, str) and key.strip().lower() in SENSITIVE_LEAVES
+
+
+def mask_credentials(obj):
+    """就地递归脱敏一切凭据字段（***+尾4），非字符串/空值原样保留。
+
+    用于所有把 config.json 内容回传给前端的响应体。"""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if _is_sensitive_leaf(k):
+                if isinstance(v, str) and v:
+                    obj[k] = _mask_key(v)
+            elif isinstance(v, (dict, list)):
+                mask_credentials(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            mask_credentials(item)
+    return obj
+
+
 def _safe_float(v, default: float = 0.0) -> float:
     """安全转 float：字符串/None/非法值一律回退默认，绝不抛异常。
 
@@ -93,26 +126,52 @@ def parse_style_prefix(text: str, fallback: str = "") -> tuple[str, str]:
     return style, reply.strip()
 
 
-def _clean_history(history: list[dict], current: str, clip_long_replies: bool = True) -> list[dict]:
+def _clean_history(history: list[dict], current: str, clip_long_replies: bool = True,
+                   keep_last_full: bool = False) -> list[dict]:
     """压缩发送给模型的历史：折叠连续重复、去掉空消息、规整旧回复里的 style 标记。
 
     旧版前端曾把同一条用户消息 push 后整体发送，sessions 里因此残留连续重复；
     这些重复会让小模型把同一句当成两条输入，更容易机械复读。
 
-    clip_long_replies：是否截断超长的历史 assistant 回复。仅本地模型需要
-    （-c 8192 装不下上万字全文）；云端模型上下文窗口大，全文保留更利于追问。"""
+    clip_long_replies：是否截断超长的历史 assistant 回复。本地模型必须截断
+    （-c 8192 装不下上万字全文）。
+    keep_last_full：云端模型配套使用 —— 只截断**更早**的长回复，窗口内最近一条
+    assistant 回复保留全文（紧接的追问最需要上一条完整内容）。旧版云端对全部 20
+    条历史都不截断：一篇一万字长文写完后，之后 20 轮对话每轮都白带上万字旧文
+    （约 1.6 万 token/轮），是云端最大的一笔固定浪费。本地小窗口传 True 也没有
+    意义（最近一条若上万字照样装不下），因此本地仍全部截断。"""
     cleaned: list[dict] = []
     current = (current or "").strip()
-    for m in history[-20:]:
+    window = history[-20:]
+    # 窗口内最后一条 assistant 的位置：keep_last_full 时只豁免它
+    last_assistant_idx = -1
+    if clip_long_replies and keep_last_full:
+        for i in range(len(window) - 1, -1, -1):
+            m = window[i]
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                last_assistant_idx = i
+                break
+    for idx, m in enumerate(window):
+        # /api/chat 的 history 是客户端入参，且会经 sessions.json 多端同步回来：
+        # 条目不是 dict、或 content 是数字/列表/字典时，原来的 m.get(...).strip()
+        # 直接 AttributeError -> 主对话 500。这种条目跳过即可，不该拖垮整轮对话。
+        if not isinstance(m, dict):
+            continue
         role = m.get("role")
-        content = (m.get("content") or "").strip()
+        raw = m.get("content")
+        if raw is None:
+            continue
+        if not isinstance(raw, str):
+            raw = raw if isinstance(raw, (int, float)) else ""
+        content = str(raw).strip()
         if not content or role not in ("user", "assistant"):
             continue
         if role == "assistant":
             _, content = parse_style_prefix(content)
-            # 上一轮的长文（2000/10000 字）若全文回填会撑爆上下文（本地仅 -c 8192），
-            # 只保留首尾，让模型知道「上文写过什么」即可；云端窗口大，不截断
-            if clip_long_replies and len(content) > 1600:
+            # 超长历史回复只保留首尾，让模型知道「上文写过什么」即可；
+            # 最近一条（紧接追问的那一条）在云端大窗口下保留全文
+            if (clip_long_replies and len(content) > 1600
+                    and not (keep_last_full and idx == last_assistant_idx)):
                 content = content[:1000] + "\n……（中间内容省略）……\n" + content[-300:]
         if not content:
             continue

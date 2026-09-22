@@ -23,6 +23,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -50,7 +51,7 @@ import minimax_llm  # MiniMax 云端文字生成适配器（OpenAI 兼容，payg
 # FastAPI 装配与有状态逻辑（config/会话/TTS/LLM/路由）。以下重导出保证
 # `import server` 的旧引用（含全部离线测试与外部脚本）零改动可用。
 from server_pkg.sessions_merge import (
-    _TOMBSTONE_MAX_AGE_MS, _TOMBSTONE_MAX_COUNT, _is_placeholder_session,
+    _TOMBSTONE_MAX_COUNT, _is_placeholder_session,
     _merge_sessions, _norm_tombstones, _sess_updated_at, _sessions_msg_count,
 )
 from server_pkg.text_utils import (
@@ -61,7 +62,7 @@ from server_pkg.text_utils import (
     _fix_addressing, _is_degenerate_reply, _is_masked_key, _is_test_session,
     _last_assistant_content, _mask_key, _safe_float, _safe_int, _sessions_fp,
     _strip_meta_notes, _strip_search_markers, _too_similar_to_last,
-    normalize_tts_text, parse_style_prefix,
+    mask_credentials, normalize_tts_text, parse_style_prefix,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -141,6 +142,30 @@ _HTTP_LIMITS = httpx.Limits(max_connections=50, max_keepalive_connections=20)
 # ponytail: 分阶段超时（connect 5s 防止 TLS 握手指纹打满，read 按场景在调用处覆盖）
 _HTTP_TIMEOUT = httpx.Timeout(5.0, read=180.0, write=30.0, pool=10.0)
 httpx_client = httpx.AsyncClient(limits=_HTTP_LIMITS, timeout=_HTTP_TIMEOUT)
+
+# LLM token 用量累计（进程内）：流式/非流式每次成功响应都计入并打日志，
+# /api/health 可查累计值 —— 用来量化每轮成本优化到底省了多少真金白银。
+# 仅最终成功的响应计入（重试的失败尝试不重复计）。
+_llm_usage_total: dict = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def _record_llm_usage(provider_name: str, model: str, usage, stream: bool = False) -> None:
+    """记录一次成功 LLM 响应的 token 用量。usage 缺字段/非 dict 时静默忽略。"""
+    if not isinstance(usage, dict):
+        return
+    try:
+        p = int(usage.get("prompt_tokens") or 0)
+        c = int(usage.get("completion_tokens") or 0)
+        t = int(usage.get("total_tokens") or (p + c))
+    except (TypeError, ValueError):
+        return
+    _llm_usage_total["calls"] += 1
+    _llm_usage_total["prompt_tokens"] += p
+    _llm_usage_total["completion_tokens"] += c
+    _llm_usage_total["total_tokens"] += t
+    _log.info("llm usage%s: provider=%s model=%s prompt=%d completion=%d total=%d",
+              "(stream)" if stream else "", provider_name, model, p, c, t)
+
 
 # config 内存缓存 + 写时直接更新缓存，省一次 stat+read
 _cfg_cache: dict = {"_mtime_ns": 0, "_value": {}}
@@ -333,20 +358,28 @@ def _detach_bg(task: "asyncio.Task | None") -> None:
 
 # 角色引擎：按 active_role 懒创建 (MemoryStore, StateStore) 缓存，切角色即换存储
 _role_stores: dict[str, tuple[MemoryStore, StateStore]] = {}
+_ROLE_STORES_MAX = 64  # 角色数量级远小于此，上限只为兜住用户可控的 role 入参
 _post_processor: PostProcessor | None = None
 
 # 2027 赛季剧情分支：懒加载 StoryManager（首启生成日历/状态，失败不阻塞主链路）
 _story_manager: story_kpl2027.StoryManager | None = None
+_story_manager_lock = threading.Lock()
 
 
 def _get_story_manager() -> story_kpl2027.StoryManager | None:
     global _story_manager
-    if _story_manager is None:
-        try:
-            _story_manager = story_kpl2027.StoryManager(str(DATA_DIR))
-        except Exception as exc:  # noqa: BLE001
-            _log.warning("story manager init failed: %s", exc)
-            return None
+    if _story_manager is not None:
+        return _story_manager
+    # 双检锁：StoryManager 自带的是实例级 RLock，两个实例之间零互斥。
+    # lifespan 的 to_thread 预热与首个聊天请求可能同时看到 None，各建一个实例
+    # -> 各自持有独立 state，后写盘的覆盖前者，剧情进度（flag/log）静默丢失。
+    with _story_manager_lock:
+        if _story_manager is None:
+            try:
+                _story_manager = story_kpl2027.StoryManager(str(DATA_DIR))
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("story manager init failed: %s", exc)
+                return None
     return _story_manager
 
 
@@ -394,6 +427,11 @@ def _get_role_stores(role: str) -> tuple[MemoryStore, StateStore]:
         st = StateStore(DATA_DIR, role)
         pair = (mem, st)
         _role_stores[role] = pair
+        # 条目上限：/api/roles/memories?role=... 是用户可控入参，任何合法格式的
+        # 字符串都能新建一对 store（含 RLock）并永久留在字典里。存储是写穿式、
+        # 淘汰后按需重建即可，所以这里按插入顺序淘汰最旧，和文件里其它缓存一致。
+        while len(_role_stores) > _ROLE_STORES_MAX:
+            _role_stores.pop(next(iter(_role_stores)), None)
     else:
         pair[0].limit = limit
     return pair
@@ -686,12 +724,21 @@ _OBEDIENCE_CORE = (
 )
 
 
-def build_system_content(persona: str, ctx_block: str, tail: str = "") -> str:
-    """组装 system prompt：persona → 服从铁律（代码写死） → 上下文 → 尾部约定。
+def build_system_content(persona: str, stable_block: str = "", dynamic_block: str = "") -> str:
+    """组装 system prompt：persona → 服从铁律 → 稳定约定 → 动态上下文/指令。
 
-    /api/chat 与 /api/greeting 共用，内容不得分叉。调用方只拼 tail，
-    服从铁律由本函数固定注入，顺序永不漂移。"""
-    return (persona or "") + _OBEDIENCE_CORE + (ctx_block or "") + (tail or "")
+    /api/chat 与 /api/greeting 共用，内容不得分叉。服从铁律由本函数固定注入。
+
+    分段顺序是有意的成本优化（前缀缓存友好）：云端供应商（DeepSeek/MiMo 等）
+    对请求间不变的前缀自动做上下文缓存打折计费；把每条消息都变的内容
+    （时间、天气、记忆、现实动态）集中到最后，persona+铁律+格式约定这段
+    每轮完全相同的长前缀（数千 token）才能整段命中缓存折扣。
+    dynamic_block 内部顺序由调用方保证「事实在前、指令在后、时间收尾」。"""
+    return (persona or "") + _OBEDIENCE_CORE + (stable_block or "") + (dynamic_block or "")
+
+
+_MAX_TRANSCODE_PIXELS = 80_000_000  # 覆盖 48MP iPhone HEIC，挡住解压炸弹
+
 
 def _heic_to_jpeg_bytes(raw: bytes) -> bytes | None:
     """把 HEIC/AVIF 图片转成 JPEG 字节（iPhone 照片默认 HEIC，扩展名常被改成 .jpg，
@@ -714,6 +761,10 @@ def _heic_to_jpeg_bytes(raw: bytes) -> bytes | None:
         pillow_heif.options.DISABLE_SECURITY_LIMITS = True  # iPhone HEIC 元数据多，默认安全限制会误杀
         pillow_heif.register_heif_opener()
         img = Image.open(io.BytesIO(raw))
+        # 关安全限制只为放行 iPhone HEIC 的庞大元数据，像素上限必须自己兜住：
+        # 公网几 MB 的构造文件即可声明数亿像素，load() 会一次吃满内存打死进程
+        if img.width * img.height > _MAX_TRANSCODE_PIXELS:
+            return None
         img.load()
         buf = io.BytesIO()
         # HEIC 可能是 RGBA：转 RGB 再存 JPEG；按最长边等比缩到 1600px，控制 base64 体积
@@ -739,13 +790,25 @@ _VISION_FALLBACK_HINT = (
 )
 
 
-def _time_hint() -> str:
-    """生成「当前真实时间」显式指令，追加到 system prompt 末尾（/api/chat 与 /api/greeting 共用）。
+def _time_hint(in_context: bool = False) -> str:
+    """生成「当前真实时间」显式指令，追加到 system prompt 动态段末尾（/api/chat 与 /api/greeting 共用）。
 
-    角色引擎时间层文案埋在 persona 中段的「此刻上下文」里，模型经常视而不见、
-    顺着对话语境编造时间（如用户提过"九点后有时间"，它就猜"现在九点二十"）。
-    在 system 末尾（注意力最高的位置）显式声明唯一可信时间，并要求时间类问题以此为准。
-    """
+    角色引擎时间层文案埋在「此刻上下文」块里，模型经常视而不见、顺着对话语境
+    编造时间（如用户提过"九点后有时间"，它就猜"现在九点二十"）。在注意力最高
+    的末尾显式声明唯一可信时间并要求时间类问题以此为准。
+
+    in_context=True 时【此刻上下文】块已携带同一行时间事实，尾部不再重复时间
+    全文（每条消息省一遍重复 token），只保留「以上文时钟为准」的引用式指令；
+    角色引擎关闭/降级（无上下文块）时仍由尾部指令自带事实。"""
+    if in_context:
+        return (
+            "\n\n【当前真实时间】以上文【此刻上下文】里的系统实时时钟为唯一可信时间来源。"
+            "当用户问任何时间/日期问题——「现在几点」「今天几号」「星期几」"
+            "「现在是白天还是晚上」等——必须严格按那个时间回答（口语可四舍五入到分钟），"
+            "禁止根据聊天内容、自己的安排或主观猜测去推断、编造时间；"
+            "聊到「待会儿」「晚上X点」之类的约定时，也以那个真实时间为参照，"
+            "判断是还没到还是已经到了。"
+        )
     try:
         line = role_engine.build_time_context().splitlines()[0]
     except Exception:  # noqa: BLE001
@@ -830,15 +893,22 @@ def _location_city() -> str:
         return ""
 
 
-def _location_hint(loc: str = "") -> str:
-    """生成「用户当前所在位置」显式指令，追加到 system prompt 末尾。
+def _location_hint(loc: str = "", in_context: bool = False) -> str:
+    """生成「用户当前所在位置」显式指令，追加到 system prompt 动态段。
 
-    与 _time_hint 同思路：位置是系统提供的唯一可信来源，放在注意力最高的位置，
-    避免模型无视中段位置层、凭对话语境瞎猜用户在哪。loc 为空串时不注入。
+    与 _time_hint 同思路：位置是系统提供的唯一可信来源，放在注意力高的位置，
+    避免模型无视位置层、凭对话语境瞎猜用户在哪。loc 为空串时不注入。
+    in_context=True 时位置事实已在【用户位置】层中，尾部只留引用式指令。
     """
     loc = (loc or "").strip()
     if not loc:
         return ""
+    if in_context:
+        return (
+            "\n\n【用户当前所在位置】严格以上文【用户位置】的系统数据为准（用户手动设置）。"
+            "当用户提到任何与位置有关的话题（在哪、天气、通勤、出差、旅游、附近有什么等）时，"
+            "以那个位置为参照自然回应；如果用户明确说自己换了位置，以用户说的为准，不要与他争执。"
+        )
     return (
         f"\n\n【用户当前所在位置】{loc}（用户手动设置）。"
         "当用户提到任何与位置有关的话题（在哪、天气、通勤、出差、旅游、附近有什么等）时，"
@@ -1252,9 +1322,19 @@ def _weather_text() -> str:
     return ""
 
 
-def _weather_hint() -> str:
-    """生成「用户所在位置天气」显式指令，追加到 system prompt 末尾（与位置指令相邻）。"""
-    text = _weather_text()
+def _weather_hint(in_context: bool = False, text: str | None = None) -> str:
+    """生成「用户所在位置天气」显式指令，追加到 system prompt 动态段（与位置指令相邻）。
+
+    in_context=True 时天气事实已在【今日天气】层中，尾部不再重复天气文案。
+    text 由调用方传入时复用（避免同请求二次读缓存、二次触发后台刷新）。"""
+    if in_context:
+        return (
+            "\n\n【用户所在位置天气】以上文【今日天气】里系统查询的真实天气为准（非推测）。"
+            "当用户问天气、要不要带伞、穿什么、冷不冷热不热时，以那个天气为参照自然回答；"
+            "如果用户说自己在别的地方，以用户说的为准。"
+        )
+    if text is None:
+        text = _weather_text()
     if not text:
         return ""
     return (
@@ -1276,11 +1356,12 @@ def _self_config(cfg: dict) -> tuple[str, str]:
             str(self_cfg.get("recent") or "").strip())
 
 
-def _self_hint() -> str:
-    """生成「你此刻在哪、在忙什么」显式指令，追加到 system prompt 末尾。
+def _self_hint(in_context: bool = False) -> str:
+    """生成「你此刻在哪、在忙什么」显式指令，追加到 system prompt 动态段。
 
     角色容易顺着对话语境瞎编自己的行程（如"我刚打完训练赛"），自况层给出
     系统配置的唯一可信近况，问「你在哪/最近干嘛」时以此为准。
+    in_context=True 时事实已在【你此刻在哪里、在忙什么】层中，尾部不重复。
     """
     cfg = load_config()
     loc, rec = _self_config(cfg)
@@ -1291,6 +1372,12 @@ def _self_hint() -> str:
         parts.append(f"最近在忙：{rec}")
     if not parts:
         return ""
+    if in_context:
+        return (
+            "\n\n【你此刻在哪里、在忙什么】严格以上文同名上下文块里系统配置的真实状态为准。"
+            "当用户问你在哪、在干嘛、最近忙什么、接下来有什么安排时，照此自然回答；"
+            "用户说了与你相关的新安排时，以用户说的为准并记住。"
+        )
     base = "。".join(parts) + "。"
     return (
         f"\n\n【你此刻在哪里、在忙什么】{base}"
@@ -1722,7 +1809,9 @@ async def _bg_role_news_refresh(force: bool = False) -> str:
             role = cfg.get("active_role", "")
             role_cfg = (cfg.get("roles") or {}).get(role) or {}
             # 1) 多来源聚合（persona/memory/state/location/weather）
-            facts = _collect_role_facts(role_cfg, cfg, role)
+            # 里面会 stat+读+解析 memory/state JSON（可达数百条记忆），
+            # 同步调用会在角色切换的响应路径上卡住事件循环
+            facts = await asyncio.to_thread(_collect_role_facts, role_cfg, cfg, role)
             # 2) 联网搜索最新动态
             results = await web_search(f"{keyword} 最新 动态 比赛 训练", None)
             if not results:
@@ -1807,13 +1896,21 @@ def _role_news_text() -> str:
     return ""
 
 
-def _role_news_hint(text: str | None = None) -> str:
-    """生成「你最近在忙什么（现实动态）」显式指令，追加到 system prompt 末尾。
-    调用方已取过动态文案时直接传入，避免一次请求重复读盘。"""
+def _role_news_hint(text: str | None = None, in_context: bool = False) -> str:
+    """生成「你最近在忙什么（现实动态）」显式指令，追加到 system prompt 动态段。
+    调用方已取过动态文案时直接传入，避免一次请求重复读盘。
+    in_context=True 时动态全文已在【你的现实动态】层中（可达数百字），尾部只留
+    引用式指令，不再复述全文 —— 这是每轮省 token 最多的一层。"""
     if text is None:
         text = _role_news_text()
     if not text:
         return ""
+    if in_context:
+        return (
+            "\n\n【你最近的现实动态】严格以上文【你的现实动态】里联网搜索得到的最新真实信息为准。"
+            "当用户问你在哪、最近在忙什么、比赛/训练/直播近况时，照此自然回答，不要编造动态；"
+            "如果用户提到你更新的消息，以用户说的为准。"
+        )
     return (
         f"\n\n【你最近的现实动态】{text}"
         "这是通过联网搜索得到的最新真实信息。当用户问你在哪、最近在忙什么、"
@@ -2002,7 +2099,9 @@ async def _story_recognize(user_msg: str) -> list[dict]:
     try:
         det = _story_regex_detect(user_msg)
         if det:
-            recorded = _story_record_from_talk(det["win"], det["score"])
+            # 记录会 deepcopy 整季日历并写两个 JSON，Windows 被占用时还会
+            # time.sleep 退避 —— 同步调用会把事件循环冻住，全场 SSE 一起卡
+            recorded = await asyncio.to_thread(_story_record_from_talk, det["win"], det["score"])
     except Exception as exc:  # noqa: BLE001
         _log.warning("story regex record failed: %s", exc)
     # 正则没记上（无比分/假设句）或出现 flag 关键词 → 交给 LLM 裁决
@@ -2016,11 +2115,11 @@ async def _story_recognize(user_msg: str) -> list[dict]:
             if ann:
                 sr = ann.get("story_result")
                 if not recorded and isinstance(sr, dict) and isinstance(sr.get("win"), bool):
-                    _story_record_from_talk(sr["win"], str(sr.get("score") or ""),
-                                            str(sr.get("mvp") or ""))
+                    await asyncio.to_thread(_story_record_from_talk, sr["win"],
+                                            str(sr.get("score") or ""), str(sr.get("mvp") or ""))
                 flag = ann.get("story_flag")
                 if flag in ("command_win", "confession"):
-                    sm.set_flag(flag, True, "岚风在对话里推进了剧情")
+                    await asyncio.to_thread(sm.set_flag, flag, True, "岚风在对话里推进了剧情")
         except Exception as exc:  # noqa: BLE001
             _log.warning("story recognizer failed: %s", exc)
     return (sm.state.get("log") or [])[before:]
@@ -2119,6 +2218,8 @@ _FP_CACHE_MAX = 128  # 条目上限：超限按插入顺序淘汰最旧（FIFO�
 def _voice_fingerprint(cfg: dict) -> str:
     """当前音色指纹：音色配置 + 参考音频 mtime/size，换音色后 TTS 缓存自动失效。"""
     voice = cfg.get("voice", {})
+    # 各 provider 子配置里要参与指纹的参考音频路径
+    ref_extra: list[str] = []
     base_parts = [
         str(cfg.get("active_role", "")),
         str(voice.get("provider", "")),
@@ -2127,6 +2228,8 @@ def _voice_fingerprint(cfg: dict) -> str:
         str(voice.get("model", "")),
         str(voice.get("language", "")),
         str(voice.get("base_url", "")),
+        # 配置里的语气指令会进合成参数，改了必须让旧音频失效
+        str(voice.get("style", "")),
     ]
     if voice.get("provider") == "aliyun":
         # 阿里云音色/模型在子配置里，必须进 cache_key，否则换音色缓存不失效
@@ -2139,7 +2242,21 @@ def _voice_fingerprint(cfg: dict) -> str:
             str(a.get("model", "")), str(a.get("voice", "")),
             str(a.get("speed", "")), str(a.get("vol", "")),
             str(a.get("pitch", "")), str(a.get("sample_rate", "")),
+            # 官方协议与 GMI 协议是两套上游（后者还要 ffmpeg 转码），不换指纹
+            # 就会在切协议后继续命中另一套的音频
+            str(a.get("api_schema", "")),
         ]
+    elif voice.get("provider") == "mimo":
+        # mimo 的 model/voice/ref_audio 全在子配置里，顶层 voice.* 读不到；
+        # 不补这一段的话指纹恒定，重新克隆音色后永远播旧声音
+        a = voice.get("mimo", {})
+        mimo_ref = str(a.get("ref_audio", ""))
+        base_parts += [
+            str(a.get("model", "")), str(a.get("voice", "")),
+            str(a.get("base_url", "")), mimo_ref,
+        ]
+        if mimo_ref:
+            ref_extra.append(mimo_ref)
     cache_key = "|".join(base_parts)
 
     # 收集参考文件的 stat 快照，对比缓存看是否命中
@@ -2148,6 +2265,16 @@ def _voice_fingerprint(cfg: dict) -> str:
     if ref_audio.exists():
         st = ref_audio.stat()
         ref_stats.append((str(ref_audio), st.st_mtime_ns, st.st_size))
+    for extra in ref_extra:
+        try:
+            p = Path(extra)
+            if p.is_file():
+                st = p.stat()
+                entry = (str(p), st.st_mtime_ns, st.st_size)
+                if entry not in ref_stats:
+                    ref_stats.append(entry)
+        except OSError:
+            continue
     stat_tuple = tuple(ref_stats)
 
     cached = _fp_cache.get(cache_key)
@@ -2225,15 +2352,38 @@ async def _maybe_cleanup_tts_cache(force: bool = False) -> None:
             _log.info("tts cache cleanup: removed %d files (%d bytes)", removed, bytes_removed)
 
 
-# 上传附件保留天数：att_* 文件没有任何 LRU 清理（TTS 缓存有），
-# 长期运行会无限堆积；超过保留期（按最近访问时间）的附件定期删除。
+# 上传附件清理：att_* 没有 LRU（TTS 缓存有），长期运行会无限堆积。
+# 但附件被 sessions.json 里的历史消息**无限期**引用，纯按时间删会让老照片 404：
+# 浏览器/SW 命中缓存时根本不发请求，服务端 atime 不刷新，Windows 的 atime 更新
+# 又受卷策略与 1 小时节流影响。所以只删「超过保留期 且 无任何会话引用」的孤儿文件。
 _UPLOAD_RETENTION_DAYS = 7.0
 _UPLOAD_CLEAN_INTERVAL = 6 * 3600.0
+# 上传进程崩溃残留的分片占位文件，没有复用价值，1 小时即可回收
+_UPLOAD_INFLIGHT_MAX_AGE = 3600.0
+_REFERENCED_ATT_RE = re.compile(r"att_[0-9a-f]{12}\.[A-Za-z0-9]{1,8}")
 
 
-def _scan_expired_uploads() -> list[Path]:
-    """同步扫描过期附件（由 asyncio.to_thread 调用）。"""
-    cutoff = time.time() - _UPLOAD_RETENTION_DAYS * 86400
+def _referenced_upload_names() -> set[str] | None:
+    """扫描会话存储，返回仍被引用的附件文件名；读不到返回 None（本轮跳过删除）。
+
+    用整份文本正则匹配而不是逐条遍历 history：消息 content 里也可能直接贴
+    /uploads/att_xxx.jpg 链接，结构化遍历会漏。
+    """
+    try:
+        raw = SESSIONS_PATH.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        _log.warning("upload cleanup: cannot read sessions (%s); skip this cycle", exc)
+        return None
+    return set(_REFERENCED_ATT_RE.findall(raw))
+
+
+def _scan_expired_uploads(now: float) -> list[Path]:
+    """同步扫描可删除的孤儿附件（由 asyncio.to_thread 调用）。"""
+    referenced = _referenced_upload_names()
+    if referenced is None:  # 引用集未知：宁可留盘也不误删历史消息的图片
+        return []
+    cutoff = now - _UPLOAD_RETENTION_DAYS * 86400
+    inflight_cutoff = now - _UPLOAD_INFLIGHT_MAX_AGE
     expired: list[Path] = []
     for p in UPLOAD_DIR.iterdir():
         if not p.is_file() or not p.name.startswith("att_"):
@@ -2242,18 +2392,22 @@ def _scan_expired_uploads() -> list[Path]:
             st = p.stat()
         except OSError:
             continue
-        # Windows NTFS 默认不更新 atime，mtime 兜底
-        if max(st.st_atime, st.st_mtime) < cutoff:
-            expired.append(p)
+        if p.name.startswith("att_inflight_"):
+            if st.st_mtime < inflight_cutoff:
+                expired.append(p)
+            continue
+        if p.name in referenced or st.st_mtime >= cutoff:
+            continue
+        expired.append(p)
     return expired
 
 
 async def _uploads_cleanup_loop() -> None:
-    """后台循环：清理长期未访问的上传附件，防止 uploads 目录打满磁盘。"""
+    """后台循环：清理无任何会话引用的过期附件，防止 uploads 目录打满磁盘。"""
     while True:
         await asyncio.sleep(_UPLOAD_CLEAN_INTERVAL)
         try:
-            expired = await asyncio.to_thread(_scan_expired_uploads)
+            expired = await asyncio.to_thread(_scan_expired_uploads, time.time())
             removed = 0
             for p in expired:
                 try:
@@ -2262,7 +2416,7 @@ async def _uploads_cleanup_loop() -> None:
                 except OSError as exc:
                     _log.warning("upload cleanup failed %s: %s", p, exc)
             if removed:
-                _log.info("upload cleanup: removed %d expired attachments", removed)
+                _log.info("upload cleanup: removed %d orphan attachments", removed)
         except Exception as exc:  # noqa: BLE001
             _log.warning("upload cleanup loop error: %s", exc)
 
@@ -2355,6 +2509,8 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 # 未配置口令时完全放行（保持纯本机直连的旧行为）。
 
 _COOKIE_NAME = "ai_token"
+# cookie 派生域常量：换它即让所有已发 cookie 失效（口令不变）
+_COOKIE_SCOPE = b"ai-persona-pwa-cookie-v1"
 
 
 class LoginRequest(BaseModel):
@@ -2373,6 +2529,16 @@ def _access_token() -> str | None:
     return env_tok or None
 
 
+def _cookie_value(token: str) -> str:
+    """登录 cookie 的值 = 口令的 HMAC，而不是口令本身。
+
+    直接下发口令，等于让任何能读到 cookie 的位置（http 降级抓包、导出的浏览器
+    profile、磁盘上的 cookie 库）都白拿一把 30 天有效、还无法轮换的永久主密钥；
+    而前端要用的 Bearer 口令是另一个值，不受影响。HMAC 以口令为密钥，无需另存
+    secret，截获 cookie 也推不回口令。注：本次升级后已登录设备需重新填一次口令。"""
+    return hmac.new(token.encode("utf-8"), _COOKIE_SCOPE, hashlib.sha256).hexdigest()
+
+
 def _auth_ok(request: Request, token: str) -> bool:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
@@ -2380,7 +2546,7 @@ def _auth_ok(request: Request, token: str) -> bool:
         if supplied and hmac.compare_digest(supplied, token):
             return True
     cookie = request.cookies.get(_COOKIE_NAME) or ""
-    return bool(cookie) and hmac.compare_digest(cookie, token)
+    return bool(cookie) and hmac.compare_digest(cookie, _cookie_value(token))
 
 
 @app.middleware("http")
@@ -2542,6 +2708,34 @@ def _login_locked(ip: str) -> bool:
     return rec["fails"] >= _LOGIN_FAIL_MAX
 
 
+def _behind_local_proxy(req: Request) -> bool:
+    """TCP 对端是本机回环/私有网段 => 请求经同机反向代理（ngrok/cloudflared）回源。
+
+    这是判断「能不能采信 X-Forwarded-* 头」的唯一依据：只有直连我们的那一跳
+    是自己人时，它追加的头部才可信；公网直连时任何人都能自己塞这些头。"""
+    host = req.client.host if req.client else ""
+    try:
+        peer = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return peer.is_loopback or peer.is_private
+
+
+def _cookie_secure(req: Request) -> bool:
+    """cookie 是否该带 Secure。
+
+    启动命令都是不带 --proxy-headers 的 uvicorn，所以 req.url.scheme 在隧道部署下
+    恒为 http —— 只按它判定的话，公网 HTTPS 站点的登录 cookie 永远不带 Secure，
+    一次 http 跳转/降级就把凭据明文带出去。经本机代理回源时改看 X-Forwarded-Proto
+    的末跳（同 _client_ip 的可信度推理）。"""
+    if req.url.scheme == "https":
+        return True
+    if not _behind_local_proxy(req):
+        return False
+    hops = [p.strip().lower() for p in (req.headers.get("x-forwarded-proto") or "").split(",") if p.strip()]
+    return bool(hops) and hops[-1] == "https"
+
+
 def _client_ip(req: Request) -> str:
     """限流用真实客户端 IP。
 
@@ -2551,12 +2745,7 @@ def _client_ip(req: Request) -> str:
     攻击者只能在前面伪造，末跳无法伪造。否则一个攻击者发 8 次错误口令就能让
     全用户共用的回环桶永远锁定（未认证 DoS）。"""
     host = req.client.host if req.client else "?"
-    try:
-        peer = ipaddress.ip_address(host)
-        via_proxy = peer.is_loopback or peer.is_private
-    except ValueError:
-        via_proxy = False
-    if via_proxy:
+    if _behind_local_proxy(req):
         hops = [p.strip() for p in (req.headers.get("x-forwarded-for") or "").split(",") if p.strip()]
         if hops:
             return hops[-1]
@@ -2578,8 +2767,8 @@ async def login_api(req: Request, payload: LoginRequest):
         raise HTTPException(401, "访问口令错误")
     _login_track.pop(ip, None)
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(_COOKIE_NAME, token, httponly=True, samesite="lax",
-                    secure=req.url.scheme == "https", max_age=30 * 86400)
+    resp.set_cookie(_COOKIE_NAME, _cookie_value(token), httponly=True, samesite="lax",
+                    secure=_cookie_secure(req), max_age=30 * 86400)
     return resp
 
 
@@ -2753,6 +2942,7 @@ async def llm_chat(messages: list[dict], temperature: float = 0.8, max_tokens: i
             use_thinking=use_thinking, client=httpx_client, timeout=timeout)
         _log.info("llm usage: provider=minimax model=%s billing=%s %s",
                   model, mconf.billing_mode, usage)
+        _record_llm_usage("minimax", model, usage)
         return content
     last_err: Exception | None = None
     for attempt in range(3):
@@ -2787,6 +2977,7 @@ async def llm_chat(messages: list[dict], temperature: float = 0.8, max_tokens: i
                 if finish_reason:
                     detail += f", finish_reason={finish_reason}"
                 raise HTTPException(502, f"模型返回了空回复，请重试；若持续失败请检查云端模型配置（{detail}）")
+            _record_llm_usage(provider_name, model, data.get("usage"))
             return content
         except HTTPException:
             raise
@@ -2854,6 +3045,10 @@ async def llm_chat_stream(messages: list[dict], temperature: float = 0.8, max_to
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     if provider_name in ("mimo", "deepseek"):
         payload["thinking"] = {"type": "enabled" if use_thinking else "disabled"}
+    if provider == "cloud":
+        # OpenAI 兼容供应商支持末帧回传 usage（MiMo/DeepSeek 等）：不增加计费、
+        # 不改正文，仅用于 token 用量记账；个别不支持的网关会忽略该字段。
+        payload["stream_options"] = {"include_usage": True}
     headers = {"Authorization": f"Bearer {api_key}"}
     if api_key and api_key != "none":
         headers["api-key"] = api_key
@@ -2870,9 +3065,11 @@ async def llm_chat_stream(messages: list[dict], temperature: float = 0.8, max_to
 
     yielded = False  # 一旦输出过 delta，中途失败不再重试（内容无法撤回）
     last_err: Exception | None = None
+    usage_info: dict | None = None  # 末帧 usage（include_usage），成功后统一记账
     for attempt in range(3):
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
+        usage_info = None
         try:
             async with httpx_client.stream("POST", url, json=payload, headers=headers, timeout=timeout) as r:
                 if r.status_code >= 400:
@@ -2900,7 +3097,13 @@ async def llm_chat_stream(messages: list[dict], temperature: float = 0.8, max_to
                         continue
                     choices = obj.get("choices") or []
                     if not choices:
+                        # include_usage 末帧：choices 为空、usage 在场（部分供应商
+                        # 也会在带 choices 的帧里附 usage，下面同位置兜底再取一次）
+                        if obj.get("usage"):
+                            usage_info = obj.get("usage")
                         continue
+                    if obj.get("usage"):
+                        usage_info = obj.get("usage")
                     ch = choices[0]
                     delta = ch.get("delta") or {}
                     piece = delta.get("content")
@@ -2912,6 +3115,7 @@ async def llm_chat_stream(messages: list[dict], temperature: float = 0.8, max_to
                     if rp:
                         reasoning_parts.append(rp)
             content = "".join(content_parts).strip()
+            _record_llm_usage(provider_name, model, usage_info, stream=True)
             if not content and reasoning_parts:
                 # thinking 模型只输出了思考过程没出正文：兜底输出一次
                 yield "".join(reasoning_parts).strip()
@@ -3384,21 +3588,36 @@ async def tts_synthesize(text: str, style: str = "", speed: float = 1.0, force: 
         _tts_inflight.pop(cache.name, None)
 
 
+# 长文本分段并发的合成请求数上限：各段相互独立，串行时出声延迟 = 段数 × 单段耗时，
+# 并发 3 后降到约 1/3；API 调用总数不变（不加价），段级缓存与在飞合并照常生效。
+# 云端计费接口单段限速远高于 3 并发；本地引擎在 _tts_do_synthesize 内有 skill_lock
+# 自行串行，不受此影响。
+_TTS_SEG_CONCURRENCY = 3
+
+
 async def _tts_do_synthesize_maybe_segmented(text: str, style: str, cfg: dict,
                                              cache: Path, force: bool) -> Path:
     """整段合成或长文本分段合成+拼接，返回最终可服务的音频路径。
 
     短文本直接走 _tts_do_synthesize（单段，行为与旧版完全一致）；
-    长文本逐段调 tts_synthesize（自动命中段级缓存或合成），拼接后写整段缓存。
+    长文本逐段调 tts_synthesize（自动命中段级缓存或合成，带并发上限），
+    拼接后写整段缓存。
     """
     segments = _split_tts_text(text)
     if len(segments) <= 1:
         return await _tts_do_synthesize(text, style, cfg, cache)
 
-    _log.info("tts segmented: %d chars -> %d segments (max %d)", len(text), len(segments), _TTS_SEG_MAX_CHARS)
-    seg_paths: list[Path] = []
-    for i, seg in enumerate(segments, 1):
-        seg_paths.append(await tts_synthesize(seg, style, force=force))
+    _log.info("tts segmented: %d chars -> %d segments (max %d, concurrent %d)",
+              len(text), len(segments), _TTS_SEG_MAX_CHARS, _TTS_SEG_CONCURRENCY)
+    sem = asyncio.Semaphore(_TTS_SEG_CONCURRENCY)
+
+    async def _one(seg: str) -> Path:
+        async with sem:
+            return await tts_synthesize(seg, style, force=force)
+
+    # gather 保序：seg_paths[i] 必对应 segments[i]，拼接顺序与串行版一致；
+    # 任一段失败立即抛错（其余段不被取消、后台跑完照常落段级缓存，不浪费已发出的调用）
+    seg_paths = list(await asyncio.gather(*(_one(seg) for seg in segments)))
     out_path = OUTPUT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
     try:
         await asyncio.to_thread(_concat_tts_segments, seg_paths, out_path)
@@ -3705,9 +3924,11 @@ async def _gmi_tts_synthesize(text: str, model: str, voice: str, base: str,
         "payload": {
             "text": text,
             "voice_id": voice,
-            "speed": str(m.get("speed", 1.0)),
-            "vol": str(int(m.get("vol", 1.0))),
-            "pitch": str(int(m.get("pitch", 0))),
+            "speed": str(_safe_float(m.get("speed"), 1.0)),
+            # 与官方协议路径同一套钳制：config 里 vol/pitch 被手改成 null/"1.5"
+            # 时 int(None)/int("1.5") 会直接 500，而这里只是合成一段语音
+            "vol": str(min(max(int(round(_safe_float(m.get("vol"), 1.0))), 0), 10)),
+            "pitch": str(min(max(int(round(_safe_float(m.get("pitch"), 0.0))), 0), 10)),
             "emotion": "auto",
             "language_boost": "auto",
             "format": "mp3",
@@ -3981,7 +4202,10 @@ async def _call_cloud_vision(messages: list[dict], cfg: dict) -> str | None:
             return None
         content = (choices[0].get("message") or {}).get("content") or ""
         return content.strip() or None
-    except (httpx.HTTPError, KeyError, ValueError, OSError):
+    except (httpx.HTTPError, KeyError, ValueError, OSError) as exc:
+        # 必须留痕：静默返回 None 会让 /api/chat 走「模型看不到图」的诚实降级，
+        # 用户以为是人设问题，实际可能是 key 轮转(401)/不支持图片(400)/读超时
+        _log.warning("vision failed (model=%s): %s", model, exc)
         return None
 
 
@@ -4010,7 +4234,10 @@ async def _call_local_vision(messages: list[dict], cfg: dict) -> str | None:
             return None
         content = (choices[0].get("message") or {}).get("content") or ""
         return content.strip() or None
-    except (httpx.HTTPError, KeyError, ValueError, OSError):
+    except (httpx.HTTPError, KeyError, ValueError, OSError) as exc:
+        # 必须留痕：静默返回 None 会让 /api/chat 走「模型看不到图」的诚实降级，
+        # 用户以为是人设问题，实际可能是 key 轮转(401)/不支持图片(400)/读超时
+        _log.warning("vision failed (model=%s): %s", model, exc)
         return None
 
 
@@ -4096,7 +4323,6 @@ async def status():
     # 密钥回传策略：一律脱敏为 ***+尾4。密钥真值只在 .env，前端保存时
     # 后端识别掩码值并跳过该字段（_is_masked_key），不会把掩码误存进配置。
     # （旧行为：配置了访问口令时明文回填——公网隧道下密钥会随每个登录会话传输，已废弃）
-    mask_keys = True
     cloud_out = dict(cloud_cfg)
     providers_out = {k: dict(v) for k, v in cfg.get("cloud_providers", {}).items()}
     # MiniMax 计费模式回填：cloud.billing_mode 缺省（老配置）时从当前供应商条目补
@@ -4106,20 +4332,12 @@ async def status():
         cloud_out["billing_mode"] = prov_entry["billing_mode"]
     voice_aliyun_out = dict(cfg.get("voice", {}).get("aliyun", {}))
     voice_minimax_out = dict(cfg.get("voice", {}).get("minimax", {}))
-    if mask_keys:
-        for d in (cloud_out, *providers_out.values()):
-            if d.get("api_key"):
-                d["api_key"] = _mask_key(d["api_key"])
-        if voice_aliyun_out.get("api_key"):
-            voice_aliyun_out["api_key"] = _mask_key(voice_aliyun_out["api_key"])
-        if voice_minimax_out.get("api_key"):
-            voice_minimax_out["api_key"] = _mask_key(voice_minimax_out["api_key"])
-    return {
+    resp = {
         "provider": cfg.get("provider", "local"),
         "active_online": active_online,
         "active_error": active_error,
         "local": local_cfg,
-        # 密钥策略见上：有口令明文、无口令脱敏；前端填掩码值保存时后端会忽略该字段
+        # 一切凭据字段在 return 前统一按叶子名脱敏；前端填掩码值保存时后端会忽略该字段
         "cloud": cloud_out,
         "cloud_providers": providers_out,
         "cloud_has_key": bool(cloud_cfg.get("api_key")),
@@ -4142,6 +4360,9 @@ async def status():
         "voice_style": cfg.get("voice", {}).get("style", ""),
         "voice_manual_provider": bool(cfg.get("voice", {}).get("manual_provider")),
     }
+    # 深拷贝后按叶子名统一脱敏：local_cfg 等字段是直接引用配置字典的，
+    # 就地改会污染 load_config 的缓存；逐个字段手写脱敏则一定会漏掉新字段
+    return mask_credentials(copy.deepcopy(resp))
 
 
 @app.get("/api/health")
@@ -4160,6 +4381,8 @@ async def health():
         "uptime": round(time.monotonic() - _START_MONOTONIC, 1),
         "bg_tasks": len(_bg_tasks),
         "tts_cache_files": cache_files,
+        # 进程启动以来的 LLM token 用量累计（重启清零）：成本可观测，无敏感信息
+        "llm_usage": dict(_llm_usage_total),
     }
 
 
@@ -4353,6 +4576,56 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
               "story_update": await _finish_story_update()})
 
 
+# SSE 心跳间隔：底层流静默超过该秒数就发一行 ": ping" 注释，证明连接还活着。
+# 静默窗口的来源：等首个 token（thinking 模式可达数十秒）、联网搜索轮（最长 15s 超时）、
+# 长文续写轮、剧情识别收尾——移动网络 NAT 表项 / ngrok 隧道 / 反向代理都可能掐断
+# 长时间无字节的连接，表现为"一直在思考"然后突然断流。
+_SSE_HEARTBEAT_INTERVAL = 15.0
+_SSE_HEARTBEAT_QUEUE_MAX = 64  # 有界队列：生产者快于网络写入时提供背压，不无限占内存
+
+
+async def _sse_with_heartbeat(gen, interval: float = _SSE_HEARTBEAT_INTERVAL):
+    """SSE 心跳包装器：底层生成器静默超过 interval 秒时发 ": ping\\n\\n" 注释行。
+
+    为什么不用 wait_for(anext(gen))：wait_for 超时会把 CancelledError 注入底层
+    生成器当前挂起的 await 点，第一次心跳超时就会把 LLM 流整个杀掉。
+    这里改成「生产者任务 + 有界队列」：生产者任务独占消费底层流（永不因心跳被取消），
+    消费者在队列空闲时发心跳。SSE 注释行浏览器 EventSource 与本项目前端的
+    fetch 流解析器（parseSSEEvent 只取 data: 行）都会忽略，不改变事件语义。"""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_SSE_HEARTBEAT_QUEUE_MAX)
+    _DONE = object()
+
+    async def _producer():
+        try:
+            async for chunk in gen:
+                await queue.put(chunk)
+        except BaseException as exc:  # noqa: BLE001 底层异常原样传给消费者重抛
+            await queue.put(exc)
+        finally:
+            await queue.put(_DONE)
+
+    producer_task = asyncio.create_task(_producer())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if item is _DONE:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        # 消费者被客户端断开 / 服务关闭而终结时，连带收掉生产者任务
+        producer_task.cancel()
+        try:
+            await producer_task
+        except BaseException:  # noqa: BLE001 收尾阶段：取消/异常都吞掉
+            pass
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     global _last_activity_ts
@@ -4371,6 +4644,7 @@ async def chat(req: ChatRequest):
     self_loc, self_rec = _self_config(cfg)  # 角色自况：自己此刻在哪、最近在忙什么
     news_text = _role_news_text()            # 角色现实动态：联网搜索的真实最近消息
     ctx_block = ""
+    ctx_layers: dict[str, bool] = {}
     mem, st = None, None
     if engine_on and active_role:
         try:
@@ -4383,6 +4657,8 @@ async def chat(req: ChatRequest):
                 self_location=self_loc, self_recent=self_rec, news=news_text,
             )
             ctx_block = role_engine.format_context_block(ctx)
+            # 记录哪些事实层已进上下文块：尾部指令据此改为「引用式」，不再复述一遍事实
+            ctx_layers = {k: bool(ctx.get(k)) for k in ("time", "self", "news", "location", "weather")}
         except Exception as exc:  # noqa: BLE001
             _log.warning("role_engine context build failed: %s", exc)
             ctx_block = ""
@@ -4398,17 +4674,25 @@ async def chat(req: ChatRequest):
             "[search:搜索词]，例如 [search:成都AG超玩会 大帅 2026年KPL]。"
             "我会自动搜索并把结果发给你，你再基于结果正常回答；最终回答里不要保留 [search:...]。"
         )
-    # 时间指令放 system 末尾：模型对末尾内容注意力最高，避免中段的时间层被忽略、顺着语境编造时间
+    # 稳定段：每条消息逐字相同的格式约定，放在所有动态内容之前以命中云端前缀缓存折扣；
+    # 动态段：上下文事实块在前，尾部指令在中（ctx 已有的事实只引用不复述），时间指令收尾。
     # 服从铁律由 build_system_content 固定注入在 persona 之后（代码写死，前端改人设也去不掉）
+    stable_hints = _META_HINT + style_hint + search_hint
+    dynamic_hints = (
+        _self_hint(ctx_layers.get("self", False))
+        + _role_news_hint(news_text, ctx_layers.get("news", False))
+        + _location_hint(location_text, ctx_layers.get("location", False))
+        + _weather_hint(ctx_layers.get("weather", False), weather_text)
+        + _story_hint()
+        + _time_hint(ctx_layers.get("time", False))
+    )
     system = {"role": "system",
-              "content": build_system_content(
-                  persona, ctx_block,
-                  _META_HINT + style_hint + search_hint
-                  + _time_hint() + _self_hint() + _role_news_hint(news_text)
-                  + _location_hint(location_text) + _weather_hint() + _story_hint())}
+              "content": build_system_content(persona, stable_hints, ctx_block + dynamic_hints)}
     provider = cfg.get("provider", "cloud")
-    # 云端模型上下文窗口大，超长历史回复全文保留利于追问；本地小上下文才截断
-    history = _clean_history(req.history, user_text, clip_long_replies=(provider == "local"))
+    # 超长历史回复一律压缩，但云端豁免最近一条（紧接追问需完整上文）：
+    # 旧版云端全部不截断，一篇长文写完后每轮都重发上万字旧文，纯烧 token
+    history = _clean_history(req.history, user_text, clip_long_replies=True,
+                             keep_last_full=(provider == "cloud"))
     # 附件描述只算一次（含读盘），首次对话与退化重试共用，避免重复 IO
     user_content = await _attachment_prompt_text(req.attachments, user_text)
     # 时间锚点紧贴本轮消息：防止模型被历史里的时间表述带跑、编造当前时间
@@ -4433,10 +4717,12 @@ async def chat(req: ChatRequest):
     if _story_role() and user_text:
         story_task = asyncio.create_task(_story_recognize(user_text))
     if req.stream:
-        # SSE 流式输出：边生成边推送增量，前端逐块渲染（视觉/搜索/长文续写内部处理）
+        # SSE 流式输出：边生成边推送增量，前端逐块渲染（视觉/搜索/长文续写内部处理）。
+        # 外包心跳层：静默窗口期发 ": ping" 注释，防 NAT/隧道/代理掐断静默连接
         return StreamingResponse(
-            _chat_stream_events(system, history, user_content, cfg, out_tokens, chat_thinking, req, active_role,
-                                story_task=story_task),
+            _sse_with_heartbeat(
+                _chat_stream_events(system, history, user_content, cfg, out_tokens, chat_thinking, req, active_role,
+                                    story_task=story_task)),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -4530,11 +4816,60 @@ async def chat(req: ChatRequest):
         _detach_bg(story_task)
 
 
+# ------------------------------------------------------------ 后处理 LLM 节流 ----
+# 每轮对话后必发的标注 LLM 是对话链路第二大 token 开销（system+prompt 约 1~2k
+# 输入 token、输出 300 封顶，约为主对话开销的三成）。对「嗯嗯/好的/哈哈/666」
+# 这类既无新事实也无情绪波动的短寒暄，标注结果必然是空记忆+微幅情绪移动，纯浪费。
+# 本地零成本判定跳过这次调用；剧情正则兜底、亲密度每轮微涨照旧，情绪交自然衰减。
+_POSTPROC_GATE_USER_MAX = 10    # 用户消息（去标点/表情/空白后）长度上限
+_POSTPROC_GATE_REPLY_MAX = 24   # 角色回复长度上限（短才可能是纯附和）
+# 信号词：命中任一则不节流。保守从宽（情绪/剧情/约定/偏好/计划/健康/人生大事），
+# 宁可多花一次标注调用，也不漏掉值得入库的事实或情绪转折
+_POSTPROC_SIGNAL_RE = re.compile(
+    r"喜欢|讨厌|爱|想你|心想|生气|难过|开心|高兴|快乐|幸福|感动|委屈|失望|寂寞|孤单|"
+    r"累|烦|哭|痛|怕|担心|紧张|激动|兴奋|焦虑|崩溃|害羞|脸红|心跳|心动|安心|暖心|"
+    r"赢|输|比分|比赛|训练赛|决赛|夺冠|冠军|mvp|指挥|表白|在一起|分手|结婚|"
+    r"记得|记住|别忘了|忘记|答应|承诺|约定|约好|明天|后天|周末|下周|以后|下次|生日|"
+    r"礼物|想吃|爱吃|想去|忌口|过敏|陪|等你|原谅|"
+    r"生病|感冒|发烧|受伤|住院|出院|辞职|离职|搬家|出事|被骗|丢了",
+    re.I,
+)
+_POSTPROC_NONCONTENT_RE = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9]")
+
+
+def _is_trivial_exchange(user_msg: str, reply: str) -> bool:
+    """判定一轮对话是否为无需 LLM 标注的短寒暄。
+
+    判据全部满足才算琐碎：去标点/表情/空白后双方都很短，且双方都不含任何
+    情绪/剧情/约定/偏好/健康类信号词。空文本不节流（交给原链路的防御逻辑）。"""
+    u = _POSTPROC_NONCONTENT_RE.sub("", user_msg or "")
+    r = _POSTPROC_NONCONTENT_RE.sub("", reply or "")
+    if not u or not r:
+        return False
+    if len(u) > _POSTPROC_GATE_USER_MAX or len(r) > _POSTPROC_GATE_REPLY_MAX:
+        return False
+    if _POSTPROC_SIGNAL_RE.search(u) or _POSTPROC_SIGNAL_RE.search(r):
+        return False
+    return True
+
+
 async def _post_process_chat(role: str, user_msg: str, reply: str) -> None:
     """后台：用轻量 LLM 调用抽取情绪变化与新事实，写回状态库+记忆库。
     任何失败都静默跳过，绝不影响主对话链路。"""
     try:
         mem, st = _get_role_stores(role)
+        # 短寒暄节流：跳过标注 LLM（role_engine.postproc_gate=false 可关闭，默认开）
+        gate_on = _as_bool((load_config().get("role_engine") or {}).get("postproc_gate", True), True)
+        if gate_on and _is_trivial_exchange(user_msg, reply):
+            # 剧情正则兜底必须照跑：短消息也可能是「赢了3:1」式赛果宣布？
+            # ——不会，含胜负信号词的消息过不了节流判定；这里保留纯属防御纵深。
+            if _story_role():
+                await asyncio.to_thread(_story_result_regex_handle, user_msg)
+            # 情绪不做 LLM 移动（短寒暄本就无转折，自然衰减接管）；
+            # 亲密度保留正常轮次的每轮 +0.01 微涨，关系成长不停摆
+            await asyncio.to_thread(st.update, energy_delta=0.0, intimacy_delta=0.01)
+            _log.info("postprocess gate: trivial exchange, annotation LLM skipped")
+            return
         # 记忆/状态的读写（JSON 读盘 + O(n) 相似度打分）全部走线程池，不占事件循环
         state = await asyncio.to_thread(st.get_decayed)
         # 喂已有最相关记忆给标注器，从源头避免重复事实反复入库
@@ -4544,7 +4879,7 @@ async def _post_process_chat(role: str, user_msg: str, reply: str) -> None:
         if not ann:
             # LLM 标注失败时，剧情分支用正则兜底识别比赛结果
             if _story_role():
-                _story_result_regex_handle(user_msg)
+                await asyncio.to_thread(_story_result_regex_handle, user_msg)
             return
         await asyncio.to_thread(st.update, emotion=ann.get("emotion"),
                                 energy_delta=ann.get("energy_delta", 0), intimacy_delta=0.01)
@@ -4554,15 +4889,16 @@ async def _post_process_chat(role: str, user_msg: str, reply: str) -> None:
         if _story_role():
             sr = ann.get("story_result")
             if isinstance(sr, dict) and isinstance(sr.get("win"), bool):
-                _story_record_from_talk(sr["win"], str(sr.get("score") or ""),
-                                        str(sr.get("mvp") or ""))
+                # 与上面 mem/st 同理：日历 deepcopy + 两个 JSON 写盘必须离开事件循环
+                await asyncio.to_thread(_story_record_from_talk, sr["win"],
+                                        str(sr.get("score") or ""), str(sr.get("mvp") or ""))
             else:
-                _story_result_regex_handle(user_msg)
+                await asyncio.to_thread(_story_result_regex_handle, user_msg)
             sf = ann.get("story_flag")
             if sf in ("command_win", "confession"):
                 sm = _get_story_manager()
                 if sm is not None:
-                    sm.set_flag(sf, True, "岚风在对话里推进了剧情")
+                    await asyncio.to_thread(sm.set_flag, sf, True, "岚风在对话里推进了剧情")
         for text in ann.get("memories") or []:
             # 防记忆污染：AI 自己的回复原文/台词不得当成用户事实入库，否则下轮会被注入 system 导致复读。
             if role_engine._dup_sim(text, reply) >= 0.5 or role_engine._dup_sim(text, user_msg) >= 0.5:
@@ -4624,14 +4960,16 @@ async def role_memories(role: str = "", top: int = 10):
         items = await asyncio.to_thread(mem.load)
         # 按 importance × 新鲜度 降序（与裁剪分数一致），取前 top 条
         def _rank(m: dict) -> float:
-            imp = float(m.get("importance", 0.3))
+            # dict.get(k, default) 在键存在但值为 null 时返回 None，float(None) 直接
+            # TypeError -> 整个记忆页 500，而聊天链路（role_engine._fnum）却正常
+            imp = _safe_float(m.get("importance"), 0.3)
             last_hit = role_engine._parse_iso(m.get("last_hit"))
             recency = 1.0
             if last_hit:
                 age_days = max(0.0, (time.time() - last_hit.timestamp()) / 86400)
                 recency = max(0.0, 1.0 - age_days / 60.0)
             return imp * 0.6 + recency * 0.4
-        top_n = max(1, min(int(top), 100))
+        top_n = max(1, min(_safe_int(top, 10), 100))
         items.sort(key=_rank, reverse=True)
         return {
             "enabled": True,
@@ -4640,10 +4978,10 @@ async def role_memories(role: str = "", top: int = 10):
                 {
                     "id": m.get("id", ""),
                     "text": m.get("text", ""),
-                    "importance": float(m.get("importance", 0.3)),
+                    "importance": _safe_float(m.get("importance"), 0.3),
                     "created_at": m.get("created_at", ""),
                     "last_hit": m.get("last_hit", ""),
-                    "hit_count": int(m.get("hit_count", 1)),
+                    "hit_count": _safe_int(m.get("hit_count"), 1),
                 }
                 for m in items[:top_n]
             ],
@@ -4679,9 +5017,14 @@ async def activity():
     return {"last_chat_ts": last, "active": bool(last) and (now_ms - last) < 300_000}
 
 
+# greeting 并发合并：页面多开/前端重试可能同时打两个问候请求，两次都是完整 LLM
+# 调用（system prompt 四千字+）。同角色在飞的生成只执行一次，并发请求共享同结果。
+_greeting_inflight: dict[str, asyncio.Future] = {}
+
+
 @app.post("/api/greeting")
 async def role_greeting():
-    """主动问候：基于记忆+情绪+时间生成大帅的主动开场白。
+    """主动问候：基于记忆+情绪+时间生成大帅的主动开场白（同角色并发请求合并）。
 
     前端在页面打开时按阈值调用（距上次聊天够久 / 新的一天还没问候过）。
     频率控制在前端 localStorage（每天最多 1-2 次），后端只负责生成。
@@ -4690,13 +5033,38 @@ async def role_greeting():
     _last_activity_ts = time.time() * 1000
     cfg = load_config()
     active_role = cfg.get("active_role", "")
-    engine_cfg = cfg.get("role_engine") or {}
-    engine_on = bool(engine_cfg.get("enabled", True))
     if not active_role:
         raise HTTPException(400, "未激活角色")
+    inflight = _greeting_inflight.get(active_role)
+    if inflight is not None:
+        return await asyncio.shield(inflight)
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    _greeting_inflight[active_role] = fut
+    try:
+        result = await _generate_greeting(cfg, active_role)
+        if not fut.done():
+            fut.set_result(result)
+        return result
+    except BaseException as exc:
+        if not fut.done():
+            # 首个请求被客户端取消时，等待方不该表现为自己也中断：转成可重试错误
+            if isinstance(exc, asyncio.CancelledError):
+                fut.set_exception(HTTPException(502, "问候生成中断，请重试"))
+            else:
+                fut.set_exception(exc)
+        raise
+    finally:
+        _greeting_inflight.pop(active_role, None)
+
+
+async def _generate_greeting(cfg: dict, active_role: str) -> dict:
+    """实际组装上下文并调用 LLM 生成主动问候（由 role_greeting 并发合并后调用）。"""
+    engine_cfg = cfg.get("role_engine") or {}
+    engine_on = bool(engine_cfg.get("enabled", True))
     persona = current_persona(cfg)
     # 组装上下文（和 /api/chat 同一套，但不带用户消息 -- 这是主动开口）
     ctx_block = ""
+    ctx_layers: dict[str, bool] = {}
     location_text = _location_city()  # 位置感知：仅手动配置位置，自动定位已下线
     weather_text = _weather_text()
     self_loc, self_rec = _self_config(cfg)
@@ -4711,6 +5079,7 @@ async def role_greeting():
                 self_location=self_loc, self_recent=self_rec, news=news_text,
             )
             ctx_block = role_engine.format_context_block(ctx)
+            ctx_layers = {k: bool(ctx.get(k)) for k in ("time", "self", "news", "location", "weather")}
         except Exception as exc:  # noqa: BLE001
             _log.warning("greeting context build failed: %s", exc)
     style_hint = _STYLE_HINT
@@ -4762,12 +5131,21 @@ async def role_greeting():
         )
         greeting_user = "（你主动发消息给老公）"
         greeting_fallback = "老公，在忙吗？"
+    # 与 /api/chat 同一套分段：稳定约定前置（前缀缓存友好），任务指令+上下文事实+
+    # 引用式尾部指令为动态段，时间指令收尾
+    stable_hints = _META_HINT + style_hint
+    dynamic_hints = (
+        ctx_block
+        + _self_hint(ctx_layers.get("self", False))
+        + _role_news_hint(news_text, ctx_layers.get("news", False))
+        + _location_hint(location_text, ctx_layers.get("location", False))
+        + _weather_hint(ctx_layers.get("weather", False), weather_text)
+        + _story_hint()
+        + _time_hint(ctx_layers.get("time", False))
+    )
     system = {"role": "system",
-              "content": build_system_content(
-                  persona, ctx_block,
-                  _META_HINT + greeting_instruction + style_hint
-                  + _time_hint() + _self_hint() + _role_news_hint(news_text)
-                  + _location_hint(location_text) + _weather_hint() + _story_hint())}
+              "content": build_system_content(persona, stable_hints,
+                                              greeting_instruction + dynamic_hints)}
     messages = [system, {"role": "user", "content": greeting_user}]
     raw = await llm_chat(messages)
     fallback_style = cfg.get("voice", {}).get("style") or "自然"
@@ -4821,13 +5199,18 @@ async def tts_file(h: str = "", text: str = "", style: str = ""):
     """
     cfg = load_config()
     # 优先按缓存文件名直接取：最稳，不受音色配置变更影响
+    # Cache-Control: no-cache → 浏览器每次重放先协商（FileResponse 自带 ETag），
+    # 未变的音频 304 空体秒回，重载/切会话后重听不再整段重新下载；
+    # 「重新合成」会覆盖同名文件使 ETag 变化，协商自动拿到新音频，不会串旧声
     if h:
         name = h if isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}\.wav", h) else ""
         if name:
             p = TTS_CACHE_DIR / name
             try:
                 if p.stat().st_size:
-                    return FileResponse(p, media_type="audio/wav", filename=name)
+                    resp = FileResponse(p, media_type="audio/wav", filename=name)
+                    resp.headers["Cache-Control"] = "no-cache"
+                    return resp
             except OSError:
                 pass
     # 兜底：按文本+风格+当前音色指纹定位（与 tts_cache_path 同源）
@@ -4836,7 +5219,9 @@ async def tts_file(h: str = "", text: str = "", style: str = ""):
         p = tts_cache_path(t, style or "", cfg)
         try:
             if p.stat().st_size:
-                return FileResponse(p, media_type="audio/wav", filename=p.name)
+                resp = FileResponse(p, media_type="audio/wav", filename=p.name)
+                resp.headers["Cache-Control"] = "no-cache"
+                return resp
         except OSError:
             pass
     raise HTTPException(404, "音频尚未合成或缓存已过期")
@@ -4856,18 +5241,16 @@ class SessionsRequest(BaseModel):
 # 已迁入 server_pkg.text_utils（顶层 import 重导出）。
 
 
-@app.get("/api/sessions")
-async def get_sessions(include_test: int = 0):
-    """读取持久化的会话历史（data/sessions.json），文件不存在或损坏时返回空列表。
-    带 mtime 缓存：不频繁读盘，且并发安全。
-    deleted 为删除墓碑列表（多端同步用：任一端删除的会话不应被另一端复活）。
-    默认过滤测试会话（id 以 t- 开头），include_test=1 时全部返回。"""
+async def _read_sessions_cached() -> dict:
+    """带 mtime 缓存读取 sessions.json 完整状态 {sessions, deleted}（get_sessions
+    与 /api/stats 共用）。文件不存在/损坏时返回空结构；读盘与 JSON 解析走线程池，
+    并发写竞态按「持锁复核 mtime」处理，旧内容不会覆盖并发写入的新缓存。"""
     if not SESSIONS_PATH.exists():
-        return {"sessions": [], "deleted": [], "fp": ""}
+        return {"sessions": [], "deleted": []}
     try:
         mtime = SESSIONS_PATH.stat().st_mtime_ns
     except OSError:
-        return {"sessions": [], "deleted": [], "fp": ""}
+        return {"sessions": [], "deleted": []}
     if mtime != _sess_cache["_mtime_ns"]:
         try:
             raw = await asyncio.to_thread(SESSIONS_PATH.read_text, encoding="utf-8")
@@ -4882,10 +5265,7 @@ async def get_sessions(include_test: int = 0):
             fp = _sessions_fp(raw)
         except (json.JSONDecodeError, OSError, AttributeError):
             # 读/解析失败不动缓存（可能是瞬时故障），本次返回空即可
-            return {"sessions": [], "deleted": [], "fp": ""}
-        # 复核窗口：读盘期间可能有并发 put_sessions 写了新文件。
-        # 持锁后再看 mtime，文件已变就放弃本次缓存更新（下一请求重读），
-        # 避免旧内容覆盖并发写入的新缓存
+            return {"sessions": [], "deleted": []}
         async with _io_locks["sessions"]:
             try:
                 cur_mtime = SESSIONS_PATH.stat().st_mtime_ns
@@ -4896,6 +5276,20 @@ async def get_sessions(include_test: int = 0):
                 _sess_cache["_mtime_ns"] = mtime
                 _sess_cache["_fp"] = fp
     value = _sess_cache["_value"]
+    return {"sessions": list(value.get("sessions", [])), "deleted": list(value.get("deleted", []))}
+
+
+@app.get("/api/sessions")
+async def get_sessions(request: Request, include_test: int = 0):
+    """读取持久化的会话历史（data/sessions.json），文件不存在或损坏时返回空列表。
+    带 mtime 缓存（_read_sessions_cached）：不频繁读盘，且并发安全。
+    deleted 为删除墓碑列表（多端同步用：任一端删除的会话不应被另一端复活）。
+    默认过滤测试会话（id 以 t- 开头），include_test=1 时全部返回。
+
+    ETag 协商缓存：fp（文件内容指纹）作为弱 ETag，客户端带 If-None-Match 且
+    内容未变时返回 304 空体——多端轮询/重载场景免掉数 MB 的 JSON 重传与解析。
+    ETag 混入 include_test 变体，两种过滤形态不会互串 304。"""
+    value = await _read_sessions_cached()
     sessions = list(value.get("sessions", []))
     deleted = list(value.get("deleted", []))
     if not include_test:
@@ -4903,7 +5297,67 @@ async def get_sessions(include_test: int = 0):
         # 真实前端（手机/桌面）永远收不到，也就不会显示在会话列表。
         sessions = [s for s in sessions if not _is_test_session(s)]
         deleted = [t for t in deleted if not _is_test_session(t)]
-    return {"sessions": sessions, "deleted": deleted, "fp": _sess_cache.get("_fp", "")}
+    fp = _sess_cache.get("_fp", "")
+    etag = f'W/"{fp}.{1 if include_test else 0}"' if fp else ""
+    if etag:
+        inm = request.headers.get("if-none-match") or ""
+        if etag in (t.strip() for t in inm.split(",") if t.strip()):
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+    resp = JSONResponse({"sessions": sessions, "deleted": deleted, "fp": fp})
+    if etag:
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/api/stats")
+async def chat_stats():
+    """陪伴统计：从 sessions.json 聚合的纯本地数字（零 API 成本、零外部依赖），
+    供设置面板「陪伴足迹」展示。只读缓存路径不写盘，调用频率低（打开设置时一次）。
+
+    按日统计只认消息级 ts（2026-09 起新消息才带），旧消息无 ts 不计入 daily_7d /
+    days_active，但累计口径（条数/字数/图片数）覆盖全部历史，不会漏。"""
+    value = await _read_sessions_cached()
+    sessions = [s for s in value.get("sessions", []) if isinstance(s, dict) and not _is_test_session(s)]
+    now_ms = time.time() * 1000
+    total = user_n = ai_n = 0
+    chars = 0
+    images = 0
+    first_ts = None
+    day_counts: dict[str, int] = {}
+    for s in sessions:
+        for m in (s.get("history") or []):
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role == "event":  # 剧情分隔线是系统标记，不算对话消息
+                continue
+            total += 1
+            if role == "user":
+                user_n += 1
+            elif role == "assistant":
+                ai_n += 1
+            chars += len(m.get("content") or "")
+            for a in (m.get("attachments") or []):
+                if isinstance(a, dict) and a.get("kind") == "image":
+                    images += 1
+            ts = m.get("ts")
+            if isinstance(ts, (int, float)) and ts > 0:
+                if first_ts is None or ts < first_ts:
+                    first_ts = ts
+                day = time.strftime("%Y-%m-%d", time.localtime(ts / 1000))
+                day_counts[day] = day_counts.get(day, 0) + 1
+        # 最早活动时间用会话 updatedAt 兜底（老会话消息无 ts 也能给出起点）
+        uts = s.get("updatedAt")
+        if isinstance(uts, (int, float)) and uts > 0 and (first_ts is None or uts < first_ts):
+            first_ts = uts
+    daily = []
+    for i in range(6, -1, -1):
+        d = time.strftime("%Y-%m-%d", time.localtime((now_ms - i * 86400000) / 1000))
+        daily.append({"date": d, "count": day_counts.get(d, 0)})
+    return {"total_messages": total, "user_messages": user_n, "ai_messages": ai_n,
+            "total_chars": chars, "total_images": images, "total_sessions": len(sessions),
+            "days_active": len(day_counts), "first_ts": first_ts, "daily_7d": daily}
 
 
 @app.get("/api/sessions/fingerprint")
@@ -4927,7 +5381,16 @@ async def put_sessions(req: SessionsRequest, client: str = ""):
     不做整包覆盖：以现有文件为基底按 id 合并（updatedAt 新者胜）再按墓碑过滤，
     避免某端的旧快照抹掉另一端刚写入的消息/把已删会话复活。
     写锁 + 原子 replace + 写后更新缓存。client 为来源设备 id，广播时跳过来源避免回声。"""
-    incoming = req.sessions[-500:]
+    # 客户端与服务端都按 updatedAt **倒序**（最新在前）排列会话，所以截断必须
+    # 取前 N 条；[-500:] 会保留最旧的 500 条、把正在聊的和置顶的会话整个丢掉，
+    # 那些消息进不了合并就直接消失在所有设备上。这里显式按时间排序再截断，
+    # 不依赖调用方的数组顺序。
+    _SESS_INGEST_MAX = 500
+    incoming = sorted(
+        (s for s in req.sessions if isinstance(s, dict)),
+        key=_sess_updated_at,
+        reverse=True,
+    )[:_SESS_INGEST_MAX]
 
     def _dump(obj) -> str:
         return json.dumps(obj, ensure_ascii=False, indent=2)
@@ -4985,8 +5448,14 @@ async def put_sessions(req: SessionsRequest, client: str = ""):
         if len(payload_str.encode("utf-8")) > 32 * 1024 * 1024:
             raise HTTPException(400, "sessions 数据过大")
         tmp = SESSIONS_PATH.with_suffix(".tmp")
-        await asyncio.to_thread(tmp.write_text, payload_str, encoding="utf-8")
-        await asyncio.to_thread(tmp.replace, SESSIONS_PATH)
+        try:
+            await asyncio.to_thread(tmp.write_text, payload_str, encoding="utf-8")
+            await asyncio.to_thread(tmp.replace, SESSIONS_PATH)
+        except OSError as exc:
+            # 云盘同步客户端会瞬时锁文件，写失败要把临时文件收掉，
+            # 否则每次重试都在 data/ 留一份数十 MB 的 sessions.tmp
+            await asyncio.to_thread(tmp.unlink, missing_ok=True)
+            raise HTTPException(500, f"会话保存失败：{exc}")
         try:
             _sess_cache["_mtime_ns"] = SESSIONS_PATH.stat().st_mtime_ns
         except OSError:
@@ -5473,17 +5942,10 @@ async def upload_files(files: list[UploadFile] = File(...)):
     if len(files) > 8:
         raise HTTPException(400, "一次最多上传 8 个文件")
     results = []
-    written: list[Path] = []  # 本批已落盘文件：中途失败时一并清理，不留孤儿
-
-    def _cleanup_batch() -> None:
-        for w in written:
-            w.unlink(missing_ok=True)
-
     for f in files:
         original = (f.filename or "").strip() or "file"
         suffix = (Path(original).suffix or "").lower()
         if suffix not in _ALLOWED_ATTACH_SUFFIXES:
-            _cleanup_batch()
             raise HTTPException(400, f"不支持的文件类型: {suffix or '无扩展名'}（{original}）")
         # 内容寻址：文件名 = 内容 sha256 前 12 位。同一文件重复上传（改备注名/重发）
         # 直接命中已有文件，不占双份磁盘，URL 也稳定（历史消息里的链接仍然有效）。
@@ -5506,15 +5968,15 @@ async def upload_files(files: list[UploadFile] = File(...)):
                     await asyncio.to_thread(fout.write, chunk)
         except HTTPException:
             tmp.unlink(missing_ok=True)
-            _cleanup_batch()
+            # 本批前面已落盘的文件不回删：内容寻址文件名可能被并发的另一端
+            # 去重命中并已把 URL 交给用户，回删会造成历史消息 404；
+            # 真成为孤儿的由 _uploads_cleanup_loop 按引用集回收。
             raise
         except OSError as exc:
             tmp.unlink(missing_ok=True)
-            _cleanup_batch()
             raise HTTPException(500, f"上传保存失败: {exc}")
         if total == 0:
             tmp.unlink(missing_ok=True)
-            _cleanup_batch()
             raise HTTPException(400, f"文件为空: {original}")
         # iPhone 照片默认 HEIC：后缀可能是 .jpg 但内容仍是 HEIC，浏览器 img 无法解码，
         # 云端视觉模型也只认 bmp/gif/png/jpeg/webp。在确定内容寻址哈希之前就转成 JPEG，
@@ -5534,11 +5996,14 @@ async def upload_files(files: list[UploadFile] = File(...)):
             except OSError:
                 pass  # 转码失败保留原文件，交给视觉链路兜底转码
         dest = UPLOAD_DIR / f"att_{h.hexdigest()[:12]}{final_suffix}"
-        if dest.exists() and dest.stat().st_size == total:
+        try:
+            deduped = dest.stat().st_size == total
+        except OSError:
+            deduped = False  # 不存在，或并发请求正在落盘：走 replace 覆写同内容
+        if deduped:
             tmp.unlink(missing_ok=True)  # 已有同内容文件：去重复用
         else:
-            tmp.replace(dest)
-            written.append(dest)
+            tmp.replace(dest)  # Windows 上 replace 原子，并发落同名文件不会留半成品
         stored = dest.name
         kind = ("image" if final_suffix in _IMAGE_SUFFIXES
                 else ("doc" if final_suffix in _DOC_SUFFIXES else "file"))

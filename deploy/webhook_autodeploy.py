@@ -22,6 +22,7 @@
 """
 
 import argparse
+import hmac
 import ipaddress
 import json
 import os
@@ -249,7 +250,8 @@ class HookHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         got = self.headers.get("X-Gitee-Token", "")
-        if not got or got != self.secret:
+        # 定长比较：普通 != 会在第一个不同字节就返回，攻击者可按响应时间逐字节猜口令
+        if not got or not hmac.compare_digest(got, self.secret):
             self.send_error(403)
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -315,8 +317,11 @@ def main():
 
     HookHandler.secret = secret
     HookHandler.app_port = args.app_port
-    server = HTTPServer(("0.0.0.0", args.port), HookHandler)
-    log(f"Webhook 接收服务已启动: http://0.0.0.0:{args.port}/webhook")
+    # 只绑回环：隧道是按 http://127.0.0.1:{port} 回源的，没有任何东西需要从外部
+    # 访问它。绑 0.0.0.0 等于把「git pull + taskkill + 起服务」这台机器的执行入口
+    # 暴露给整个局域网，而口令只有单一固定值、无时间戳/nonce，抓到即可永久重放。
+    server = HTTPServer(("127.0.0.1", args.port), HookHandler)
+    log(f"Webhook 接收服务已启动: http://127.0.0.1:{args.port}/webhook")
     log("按 Ctrl+C 停止（自动关闭隧道）")
 
     try:

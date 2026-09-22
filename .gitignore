@@ -21,6 +21,10 @@ static/
 
 # 原子写中断残留保护
 *.tmp
+# 模型/发行版下载断点续传的半成品（可达数 GB，误 add 会被 Gitee 拒绝）
+*.part
+# 记录断点属于哪个下载源（跨镜像续传会拼出损坏文件，见 llm/get_llm.py）
+*.part.url
 
 # 本地大文件（模型、CUDA 运行时、视频）
 llm/bin/

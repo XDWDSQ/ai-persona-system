@@ -140,6 +140,7 @@
   .modal-f .undo{background:var(--accent-soft);color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
   .modal-f .undo:hover{background:color-mix(in srgb,var(--accent) 18%,var(--card))}
   .modal-f .undo:disabled{opacity:.5;cursor:not-allowed}
+  @media (prefers-reduced-motion:reduce){.modal{animation:none}}
 </style>
 </head>
 <body>
@@ -193,7 +194,7 @@
 </div>
 
 <!-- 赛果详情弹层 -->
-<div class="modal-mask" id="modalMask">
+<div class="modal-mask" id="modalMask" role="dialog" aria-modal="true" aria-label="比赛详情">
   <div class="modal">
     <div class="modal-h"><b id="mTitle">比赛详情</b><button class="x" id="mClose" aria-label="关闭">✕</button></div>
     <div class="modal-b" id="mBody"></div>
@@ -344,9 +345,13 @@ function renderCal(){
     if (st === 'off') cell.classList.add('off');
     if (mm) {
       cell.classList.add('match');
-      if (mm.status === 'played') {
+      /* 未晋级的取消场在 story_kpl2027 里带着 result.win=false，不先分流的话
+         日历会把「场次取消」画成一堆凭空多出来的败局 */
+      var cancelled = mm.status === 'skipped'
+        || (mm.result && mm.result.score && mm.result.score.indexOf('-') === 0);
+      if (mm.status === 'played' && mm.result) {
         cell.classList.add(mm.result.win ? 'win' : 'loss');
-        if (mm.result.score && mm.result.score.indexOf('-') === 0) cell.classList.add('skipped');
+        if (cancelled) cell.classList.add('skipped');
       } else if (mm.status === 'skipped') {
         cell.classList.add('skipped');
       }
@@ -364,7 +369,8 @@ function renderCal(){
     if (mm) {
       var tag = document.createElement('span');
       tag.className = 'tag';
-      tag.textContent = mm.result ? (mm.result.win ? '胜' : '负') + ' ' + mm.opponent : 'vs ' + mm.opponent;
+      tag.textContent = cancelled ? ('取消 ' + mm.opponent)
+        : mm.result ? (mm.result.win ? '胜' : '负') + ' ' + mm.opponent : 'vs ' + mm.opponent;
       cell.appendChild(tag);
       if (mm.result && mm.result.score && mm.result.score.indexOf('-') !== 0) {
         var res = document.createElement('span');
@@ -386,8 +392,9 @@ function renderCal(){
 
     (function(ds2, mm2, ev2){
       cell.addEventListener('click', function(){
-        /* 已记录的场次 → 弹详情（回看赛果/撤销口误），不直接跳转 */
-        if (mm2 && mm2.status === 'played' && mm2.result) { openMatchModal(mm2); return; }
+        /* 已记录的场次与取消场都弹详情（回看赛果/撤销口误/看「未晋级」说明），
+           取消场只给日期跳转的话，用户点上去完全不知道这场为什么没了 */
+        if (mm2 && mm2.result && (mm2.status === 'played' || mm2.status === 'skipped')) { openMatchModal(mm2); return; }
         if (ds2 === todayDS && S && S.mode === 'follow') { toast('这就是当前剧情日'); return; }
         var label2 = mm2 ? ('比赛日 vs ' + mm2.opponent) : (ev2 ? ev2.title : '跳转到 ' + ds2);
         if (ds2 < todayDS || (S && S.mode === 'override' && ds2 === todayDS)) {
@@ -404,10 +411,17 @@ function renderCal(){
 
 function doJump(ds){
   API.post('/api/story/jump', { date: ds }).then(function(s){
-    S = s;
-    toast('已跳转到 ' + s.virtual_date);
-    viewMonth = { y: parseInt(s.virtual_date.slice(0,4)), m: parseInt(s.virtual_date.slice(5,7)) };
-    renderAll();
+    /* 服务端已经跳成功了：这里的任何抛错都不能再报「跳转失败」，
+       否则用户以为没跳、反复点，而剧情时钟其实一直在动 */
+    try {
+      S = s;
+      toast('已跳转到 ' + s.virtual_date);
+      var vd = (s && s.virtual_date) || (S && S.virtual_date) || '';
+      if (vd.length >= 7) viewMonth = { y: parseInt(vd.slice(0, 4)), m: parseInt(vd.slice(5, 7)) };
+      renderAll();
+    } catch (e2) {
+      toast('已跳转，但界面刷新失败：' + e2.message + '（切月或重开本页可恢复）');
+    }
   }).catch(function(e){ toast('跳转失败：' + e.message); });
 }
 
@@ -463,7 +477,7 @@ function renderLog(){
 }
 
 /* ---------- 赛果详情弹层（含撤销） ---------- */
-var _modalMatch = null;
+var _modalMatch = null, _modalReturnFocus = null;
 function stageNameOf(key){
   for (var i = 0; i < (D.stages || []).length; i++) {
     if (D.stages[i].key === key) return D.stages[i].name;
@@ -497,11 +511,15 @@ function openMatchModal(mm){
   undoBtn.style.display = cancelled ? 'none' : '';
   undoBtn.disabled = false;
   undoBtn.textContent = '撤销这个结果';
+  _modalReturnFocus = document.activeElement;
   document.getElementById('modalMask').classList.add('show');
+  setTimeout(function(){ document.getElementById('mClose').focus(); }, 30);
 }
 function closeModal(){
   document.getElementById('modalMask').classList.remove('show');
   _modalMatch = null;
+  var ret = _modalReturnFocus; _modalReturnFocus = null;
+  if (ret && ret.focus){ try { ret.focus(); } catch (e2) {} }
 }
 function reloadAll(){
   return Promise.all([API.get('/api/story/calendar'), API.get('/api/story/status')]).then(function(rs){
@@ -532,7 +550,8 @@ document.getElementById('mUndo').addEventListener('click', function(){
     S = s;
     closeModal();
     toast('已撤销，战绩已重算');
-    return reloadAll();
+    /* 撤销在服务端已经成功了：重拉/重绘失败不能再冒泡成「撤销失败」 */
+    return reloadAll().catch(function(e2){ toast('已撤销，但界面刷新失败：' + e2.message); });
   }).catch(function(e){
     btn.disabled = false;
     btn.textContent = '撤销这个结果';
@@ -562,14 +581,38 @@ document.getElementById('todayBtn').addEventListener('click', function(){
 });
 
 /* 初始化 */
-Promise.all([API.get('/api/story/calendar'), API.get('/api/story/status')]).then(function(rs){
-  D = rs[0]; S = rs[1];
-  var vd = S.virtual_date;
-  viewMonth = { y: parseInt(vd.slice(0,4)), m: parseInt(vd.slice(5,7)) };
-  renderAll();
-}).catch(function(e){
-  document.querySelector('.wrap').innerHTML = '<div class="loading">加载失败：' + e.message + '（请确认当前角色为「大帅·2027」，并在聊天页登录）</div>';
-});
+function initStory(){
+  return Promise.all([API.get('/api/story/calendar'), API.get('/api/story/status')]).then(function(rs){
+    D = rs[0]; S = rs[1];
+    var vd = S.virtual_date || '';
+    if (vd.length >= 7) viewMonth = { y: parseInt(vd.slice(0,4)), m: parseInt(vd.slice(5,7)) };
+    renderAll();
+  });
+}
+/* 失败要写进自己的节点：原来直接 .wrap.innerHTML = 提示，会把 #cal / #todayCard /
+   #statsRow / #logList 一并抹掉，之后任何渲染都拿不到容器；而隧道下
+   「HTML 顶替 JSON」这类失败恰恰是首次访问最常见的路径。 */
+function showLoadError(e){
+  var box = document.getElementById('loadError');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'loadError';
+    box.className = 'loading';
+    document.body.appendChild(box);
+  }
+  box.textContent = '加载失败：' + ((e && e.message) || e)
+    + '（请确认当前角色为「大帅·2027」，并在聊天页登录）';
+  var btn = document.createElement('button');
+  btn.className = 'btn';
+  btn.textContent = '重试';
+  btn.addEventListener('click', function(){
+    box.remove();
+    initStory().catch(showLoadError);
+  });
+  box.appendChild(document.createElement('br'));
+  box.appendChild(btn);
+}
+initStory().catch(showLoadError);
 </script>
 </body>
 </html>

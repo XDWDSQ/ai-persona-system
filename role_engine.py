@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -104,16 +105,30 @@ def _atomic_write(path: Path, data) -> bool:
 
 
 def _safe_load(path: Path, default: dict) -> dict:
-    """读 JSON，损坏/不存在时返回 default 并尝试重置。"""
+    """读 JSON；只有内容确实不是合法 JSON 才重置，且重置前先留一份取证副本。
+
+    两类失败必须区分开：本项目跑在云盘同步目录里，同步客户端/杀软会瞬间锁住
+    文件（OSError）或让一次读取截断（UnicodeDecodeError），此时磁盘上的数据是
+    完好的 —— 若照旧写回 default，就等于把用户积累几百条的长期记忆静默清空。
+    """
+    if not path.exists():
+        return default
     try:
-        if path.exists():
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-        _log.warning("role_engine load %s failed (%s), resetting", path, exc)
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        _log.warning("role_engine load %s transiently unreadable (%s); keep file", path, exc)
+        return default
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        _log.warning("role_engine load %s corrupt (%s); backing up then resetting", path, exc)
+        try:
+            path.with_name(f"{path.name}.corrupt-{int(time.time())}").write_text(raw, encoding="utf-8")
+        except OSError as bexc:
+            _log.warning("role_engine corrupt backup failed %s: %s", path, bexc)
         _atomic_write(path, default)
-    return default
+        return default
+    return data if isinstance(data, dict) else default
 
 
 def _fnum(v, default: float) -> float:
@@ -196,9 +211,35 @@ class MemoryStore:
         return _atomic_write(self.path, {"version": 1, "memories": mems})
 
     # -- 检索 --
-    def search(self, query: str, top_k: int = _MEMORY_TOP_K_DEFAULT) -> list[dict]:
-        """按 关键词命中 + importance + 新鲜度 打分取 top_k。无结果时返回 []。
+    @staticmethod
+    def _terms(text: str) -> set[str]:
+        """检索词元：中文按字符二元组切分，英文/数字按词切分并小写。
 
+        中文没有空格，旧实现把整段连续中文贪婪成一个「词」，跨句子几乎永不相等，
+        关键词通道形同虚设，实际全靠 3-gram Jaccard 的 0.4 硬门。二元组（如
+        「玉环」「双排」「火锅」）既有跨句匹配能力，又能配合 IDF 区分专有词与
+        常见词，是零外部依赖下最划算的中文短文本检索词元。"""
+        terms: set[str] = set()
+        for run in re.findall(r"[\u4e00-\u9fff]+", text or ""):
+            if len(run) == 1:
+                terms.add(run)
+            else:
+                for i in range(len(run) - 1):
+                    terms.add(run[i:i + 2])
+        terms.update(re.findall(r"[a-z0-9]+", (text or "").lower()))
+        return terms
+
+    def search(self, query: str, top_k: int = _MEMORY_TOP_K_DEFAULT) -> list[dict]:
+        """按 IDF 加权词元覆盖 + 字符 3-gram 相似度 + importance + 新鲜度取 top_k。
+
+        相关性（纯本地计算，零 API 成本）：
+          coverage = 查询词元被该记忆按 IDF 权重覆盖的比例 —— 常见词（老公/我们/
+          今天）权重低，专有词（玉环/火锅/生日地名）权重高，避免「含一个常见词」
+          与「命中多个专有词」同分；
+          relevance = 0.7*coverage + 0.3*trigram Jaccard，词元抓语义重合、
+          3-gram 抓语序与近义改写，互补。
+        与查询零相关的记忆不再靠 importance/新鲜度凑分混进结果（旧实现会），
+        top_k 槽位全给相关记忆；没有相关记忆时不注入，连 token 也省了。
         打分阶段不加锁读快照；命中条目在返回前经 _touch_many 持锁批量刷新
         last_hit/hit_count（一次写盘），保证高频回忆的记忆不因时间衰减被淘汰。"""
         if not query or not query.strip():
@@ -207,27 +248,45 @@ class MemoryStore:
             # 边界：取 0 条就是 0 条（旧实现先 append 再判 >=top_k，top_k=0 仍返回 1 条
             # 且触发无谓的 touch 写盘）
             return []
+        mems = self.load()
+        q_terms = self._terms(query)
         q_sh = _shingles(query)
-        q_tokens = set(re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+", query.lower()))
+        # 语料文档频率：每个词元在多少条记忆里出现，用于 IDF 加权
+        df: dict[str, int] = {}
+        doc_terms: list[set[str]] = []
+        for m in mems:
+            t = self._terms(m.get("text", ""))
+            doc_terms.append(t)
+            for term in t:
+                df[term] = df.get(term, 0) + 1
+        n = len(mems) or 1
+
+        def _idf(term: str) -> float:
+            # 平滑 IDF：语料里没出现过的查询词元拿最高权重（正是最该靠记忆匹配的专有词）
+            return math.log((n + 1) / (df.get(term, 0) + 0.5)) + 1.0
+
+        q_weight = {t: _idf(t) for t in q_terms}
+        q_total = sum(q_weight.values()) or 1.0
         now = time.time()
         scored = []
-        for m in self.load():
+        for m, m_terms in zip(mems, doc_terms):
             text = m.get("text", "")
-            # 关键词命中：记忆文本与查询共现的 2 字以上中文词 / 英文词
-            m_tokens = set(re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+", text.lower()))
-            overlap = len(q_tokens & m_tokens)
+            shared_w = sum(q_weight[t] for t in q_terms if t in m_terms)
+            coverage = shared_w / q_total
             sim = _jaccard(q_sh, _shingles(text))
+            relevance = 0.7 * coverage + 0.3 * sim
+            if relevance <= 0.0:
+                continue  # 与查询零重合：不再让重要度/新鲜度把无关记忆凑进 top_k
             # 新鲜度：last_hit 越近越好，100 天内线性衰减到 0（10 天≈0.9，60 天≈0.4）
             last_hit = _parse_iso(m.get("last_hit"))
             recency = 1.0
             if last_hit:
                 age_days = max(0.0, (now - last_hit.timestamp()) / 86400)
                 recency = max(0.0, 1.0 - age_days / 100.0)
-            score = 0.5 * (1.0 if overlap > 0 or sim > 0.4 else 0.0) \
-                + 0.3 * _fnum(m.get("importance", 0.3), 0.3) \
-                + 0.2 * recency
-            if score > 0.05:
-                scored.append((score, m))
+            score = 0.55 * relevance \
+                + 0.25 * _fnum(m.get("importance", 0.3), 0.3) \
+                + 0.20 * recency
+            scored.append((score, m))
         scored.sort(key=lambda x: x[0], reverse=True)
         # 结果互斥：与已选条目高度相似的（同义改写）跳过，保证 top_k 条信息不重复
         picked: list[tuple[float, dict]] = []

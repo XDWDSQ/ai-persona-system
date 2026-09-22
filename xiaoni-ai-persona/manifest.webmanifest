@@ -1,7 +1,7 @@
 {
   "name": "小拟 · AI 拟人陪伴",
   "short_name": "小拟",
-  "description": "用我的声音聊天——AI 拟人陪伴系统",
+  "description": "AI 拟人对话陪伴系统——人设对话、语音克隆、剧情分支",
   "id": "/pages/chat.html",
   "start_url": "/pages/chat.html",
   "scope": "/",

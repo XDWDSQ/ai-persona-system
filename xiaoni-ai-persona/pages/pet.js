@@ -25,6 +25,12 @@
  *   - .pet-img 显式 image-rendering:auto（双线性插值，浏览器各向异性过滤由引擎自动开启；
  *     锐利度主要靠素材分辨率 384px > 显示尺寸 160px × DPR，见下方 ASSET_PX 说明）
  *   - 小屏(mini)与常规显示尺寸不变，交互逻辑零改动
+ *
+ * v4 智能定位要点（不用手动挪位）：
+ *   - 首次/切屏自动落在「顶栏与输入栏之间」安全区的右下角，绝不压输入栏/发送键
+ *   - 浮层（设置/确认/附件菜单/灯箱）打开时自动让位，关闭后归位
+ *   - 空闲一段时间会自己“漫步”：沿安全区右侧底部歇歇走走，像活物
+ *   - 手动拖走仍尊重你的自定义位置；右键菜单可随时「回到智能位置」
  * ========================================================================== */
 (function () {
   'use strict';
@@ -95,7 +101,187 @@
   var _clampTimer = 0;
   function scheduleClamp() {
     if (_clampTimer) clearTimeout(_clampTimer);
-    _clampTimer = setTimeout(clampToViewport, 120);
+    _clampTimer = setTimeout(function () {
+      clampToViewport();
+      /* v4 智能模式：窗口变完形后回落舒适位，而不是留在原先漫步的角落 */
+      if (_auto && _el && !_el.classList.contains('mini')) {
+        var a = smartAnchor();
+        var r = _el.getBoundingClientRect();
+        if (Math.abs(a.x - r.left) > 2 || Math.abs(a.y - r.top) > 2) glideTo(a.x, a.y);
+      }
+    }, 120);
+  }
+
+  /* ==========================================================================
+   * v4 智能定位引擎
+   *   安全区 = 顶栏(.chat-top)下方 ~ 输入栏(.inputbar)上方，右缘贴近视口右侧。
+   *   智能落点永远在安全区内，浮层打开时让位，空闲时缓慢“漫步”。
+   * ========================================================================== */
+  var WANDER_DELAY = 9000;              // 空闲多久开始漫步（ms）
+  var SIT_MIN = 2600, SIT_MAX = 8200;   // 走到目标后的歇息时长范围（ms）
+  var _auto = true;                     // 智能定位模式：手动拖拽后关闭
+  var _glideRaf = 0, _gliding = false;
+  var _wanderTimer = 0, _sitTimer = 0;
+  var _dodged = false;              // 正在躲附件菜单，复位时需归位
+
+  /* 可活动安全区（实时量测，自适应桌面/移动/键盘弹起） */
+  function shieldRect() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var x0 = 8, x1 = vw - SIZE - 8, y0 = 8, y1 = vh - SIZE - 8;
+    var topEl = document.querySelector('.chat-top'), inpEl = document.querySelector('.inputbar');
+    if (topEl) { var tr = topEl.getBoundingClientRect(); y0 = Math.max(y0, tr.bottom + 6); }
+    if (inpEl) {
+      var ir = inpEl.getBoundingClientRect();
+      if (ir.top > 0) y1 = Math.min(y1, ir.top - 8);   // 贴着输入栏上方，绝不压发送键
+    }
+    /* 移动端侧边抽屉打开时别飘到它上面 */
+    var side = document.querySelector('.side');
+    if (side) {
+      var sr = side.getBoundingClientRect();
+      if (getComputedStyle(side).position === 'fixed' && sr.width > 0 && sr.right > 0) {
+        x0 = Math.max(x0, sr.right + 8);
+      }
+    }
+    /* 空间被键盘/安全区压没了（如输入栏顶到屏底附近），退回视口兜底 */
+    if (y1 - y0 < SIZE + 24) { y0 = 12; y1 = vh - SIZE - 12; }
+    return { x0: x0, x1: Math.max(x0, x1), y0: y0, y1: Math.max(y0, y1) };
+  }
+  /* 写位置前一律钳进安全区（自动模式下永不飘出屏幕/压住输入栏） */
+  function setPos(x, y) {
+    if (!_el) return;
+    var s = shieldRect();
+    x = Math.max(s.x0, Math.min(s.x1, x));
+    y = Math.max(s.y0, Math.min(s.y1, y));
+    _el.style.left = x + 'px'; _el.style.top = y + 'px';
+    _el.style.right = 'auto'; _el.style.bottom = 'auto';
+  }
+  /* 智能落点：安全区右下角（贴着输入栏上方，右侧贴边） */
+  function smartAnchor() {
+    var s = shieldRect();
+    return { x: s.x1, y: s.y1 - 6 };
+  }
+  /* 平滑滑到目标点（rAF 指数趋近，可被任何打断取消） */
+  function glideTo(tx, ty, onDone) {
+    if (!_el || _el.classList.contains('mini')) return;
+    stopGlide();
+    var r = _el.getBoundingClientRect();
+    var fx = r.left, fy = r.top;
+    _gliding = true;
+    (function step() {
+      fx += (tx - fx) * 0.10; fy += (ty - fy) * 0.10;
+      setPos(fx, fy);
+      if (Math.abs(tx - fx) < 1.2 && Math.abs(ty - fy) < 1.2) {
+        setPos(tx, ty);
+        stopGlide();
+        if (onDone) onDone();
+        return;
+      }
+      _glideRaf = requestAnimationFrame(step);
+    })();
+  }
+  function stopGlide() {
+    _gliding = false;
+    if (_glideRaf) { cancelAnimationFrame(_glideRaf); _glideRaf = 0; }
+  }
+  function clearWanderTimer() {
+    if (_wanderTimer) { clearTimeout(_wanderTimer); _wanderTimer = 0; }
+    if (_sitTimer)   { clearTimeout(_sitTimer);   _sitTimer = 0; }
+  }
+  function overlayOpen() {
+    var sels = ['#settings', '#confirm-modal', '#attach-menu', '#lightbox'];
+    for (var i = 0; i < sels.length; i++) {
+      var el = document.querySelector(sels[i]);
+      if (el && getComputedStyle(el).display !== 'none' && el.offsetParent !== null) return true;
+    }
+    return false;
+  }
+  function inputFocused() {
+    var a = document.activeElement;
+    return !!(a && a.matches && a.matches('textarea,input,select'));
+  }
+  function canWander() {
+    if (!_auto || !_el || _el.classList.contains('mini')) return false;
+    if (inputFocused() || overlayOpen()) return false;
+    if (_current === 'thinking' || _current === 'speaking') return false;
+    if (document.visibilityState !== 'visible') return false;
+    var side = document.querySelector('.side');
+    if (side && side.classList.contains('open')) return false;  // 抽屉开着不闹
+    return true;
+  }
+  function resumeWanderAfter(ms) {
+    clearWanderTimer();
+    _wanderTimer = setTimeout(planWander, ms);
+  }
+  function planWander() {
+    if (!canWander()) return;
+    stopGlide();
+    var s = shieldRect();
+    var r = _el.getBoundingClientRect();
+    var cx = r.left + SIZE / 2, cy = r.top + SIZE / 2;
+    /* 新目标：偏右侧踱步（少盖聊天正文），多数贴着安全区底部，偶尔上探；步幅不大 */
+    var lb = s.x0 + (s.x1 - s.x0) * 0.28;
+    var tx = cx + (Math.random() * 2 - 1) * 180;
+    tx = Math.max(lb, Math.min(s.x1, tx));
+    var low = s.y1, up = s.y0 + (s.y1 - s.y0) * 0.35;
+    var ty = (Math.random() < 0.7) ? (low + r.top) / 2 : (up + cy) / 2;
+    ty = Math.max(s.y0, Math.min(s.y1, ty));
+    glideTo(tx, ty, function () {
+      if (!canWander()) return;
+      clearWanderTimer();
+      _sitTimer = setTimeout(function () { if (canWander()) planWander(); },
+                             SIT_MIN + Math.random() * (SIT_MAX - SIT_MIN));
+    });
+  }
+  /* 用户有动作 / 状态切换：先停下，安静一会儿再考虑走两步 */
+  function wanderIdleReset() {
+    if (!_auto) return;
+    pauseWander();
+    if (_el && _el.classList.contains('mini')) return;
+    dodgeCheck();                 // 顺手看一眼附件菜单是否挡住了宠物
+    resumeWanderAfter(WANDER_DELAY);
+  }
+  function pauseWander() {
+    stopGlide();
+    clearWanderTimer();
+  }
+  function rectOverlap(a, b, pad) {
+    pad = pad || 12;
+    return !(a.right - pad < b.left || b.right < a.left + pad ||
+             a.bottom - pad < b.top || b.bottom < a.top + pad);
+  }
+  /* 附件菜单（z-index 高于宠物、非全屏、贴着输入栏）打开且压住宠物时让位；
+     全屏浮层（设置/灯箱）在宠物之上自成图层，直接被盖住，无需躲闪 */
+  function dodgeCheck() {
+    if (!_auto || !_el || _el.classList.contains('mini')) return;
+    var menu = document.querySelector('#attach-menu');
+    if (!menu) { _dodged = false; return; }
+    var petR = _el.getBoundingClientRect();
+    var menuOpen = getComputedStyle(menu).display !== 'none' && menu.offsetParent !== null;
+    if (menuOpen) {
+      var mr = menu.getBoundingClientRect();
+      if (rectOverlap(petR, mr)) {
+        var a = smartAnchor();
+        var ar = { left: a.x, top: a.y, right: a.x + SIZE, bottom: a.y + SIZE };
+        if (rectOverlap(ar, mr, 8)) {      // 右下角也被占住时挪到左下角
+          var s = shieldRect();
+          a = { x: s.x0, y: s.y1 };
+        }
+        _dodged = true;
+        glideTo(a.x, a.y);
+        return;
+      }
+    } else if (_dodged) {                  // 菜单收起来了，坐回老位置
+      _dodged = false;
+      var anchor = smartAnchor();
+      var r = _el.getBoundingClientRect();
+      if (Math.abs(anchor.x - r.left) > 4 || Math.abs(anchor.y - r.top) > 4) {
+        glideTo(anchor.x, anchor.y);
+      }
+    }
+  }
+  /* 常驻低频巡检：附件菜单是异步弹/收的，事件驱动可能漏，兜底轮询 */
+  function startDodgeTimer() {
+    setInterval(dodgeCheck, 1100);
   }
 
   /* ---------- 注入 CSS ---------- */
@@ -232,6 +418,21 @@
     });
   }
 
+  /* ---------- 情绪闪现：短动画后回到原状态（摸头/拖后害羞）。
+     token 机制保证：期间聊天状态事件（thinking/speaking/idle）优先，不被覆盖回去 ---------- */
+  var _moodToken = 0;
+  function moodBurst(stateName, ms) {
+    if (!HAS_ASSET[stateName]) return;
+    var my = ++_moodToken;
+    var prev = _current || 'idle';
+    applyState(stateName);
+    setTimeout(function () {
+      if (_moodToken !== my) return;  /* 期间有新闪现或聊天状态事件 */
+      _moodToken++;
+      if (_current === stateName) applyState(prev === '' ? 'idle' : prev);
+    }, ms);
+  }
+
   /* ---------- 气泡 ---------- */
   function popBubble(text) {
     if (!_bubble) return;
@@ -252,13 +453,21 @@
       if (e.button !== 0 && e.pointerType === 'mouse') return;  // 右键交给 contextmenu
       // 双指/多指：只有第一指接管拖拽，第二指落下直接忽略，
       // 否则两指坐标互相覆盖会让宠物跳动、第二指还可能误弹长按菜单
-      if (activePointerId !== null) return;
+      if (!e.isPrimary) return;
+      // 自愈：activePointerId 残留但 drag 已为 false（capture 失败、系统手势抢走指针，
+      // 导致 pointerup 没回到本元素），若继续 return 会永久卡死拖拽+长按直到刷新
+      if (activePointerId !== null) {
+        if (drag) return;
+        activePointerId = null;
+      }
       activePointerId = e.pointerId;
       drag = true; moved = false;
       startX = e.clientX; startY = e.clientY;
       var r = _el.getBoundingClientRect();
       ox = e.clientX - r.left; oy = e.clientY - r.top;
-      try { _el.setPointerCapture(e.pointerId); } catch (_) {}
+      try { _el.setPointerCapture(e.pointerId); } catch (_) {
+        /* capture 失败不致命也不重试：下面把 pointerup/pointercancel 同时挂在 window 上兜底 */
+      }
       /* 长按 450ms = 弹菜单（移动端无右键，长按替代） */
       clearPress();
       pressTimer = setTimeout(function () {
@@ -274,6 +483,7 @@
                      Math.abs(e.clientY - startY) > DRAG_THRESHOLD)) {
         clearPress();               // 在拖 → 不是长按
         moved = true;
+        hideCtx();                  // 菜单按旧坐标定位，宠物一动就必须收起
         _el.classList.add('dragging');
       }
       if (!moved) return;
@@ -285,6 +495,7 @@
       _el.style.right = 'auto'; _el.style.bottom = 'auto';
     });
     function endDrag(e) {
+      // 第二指误触的 pointerup 不能结束第一指的拖拽：先比 pointerId
       if (e && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
       if (!drag) return;
       drag = false;
@@ -293,19 +504,39 @@
       _el.classList.remove('dragging');
       if (moved) {
         _suppressClickUntil = Date.now() + 300;  // 松手的合成 click 不弹气泡
+        /* 合成 click 会先在 _suppressClickUntil 判断处 return，走不到清 _longPress 的那行；
+           这里不清，则「长按→拖拽→松手」之后用户的下一次真实单击会被凭空吃掉 */
+        _longPress = false;
         try {
           var r = _el.getBoundingClientRect();
           localStorage.setItem(POS_KEY, JSON.stringify({ x: r.left, y: r.top }));
         } catch (_) {}
+        /* 拖过即为自定义位置：不打标记，旋转屏幕/缩小窗口时 clampToViewport 直接 return，
+           宠物会留在新视口外，按代码自己的说法只能清 localStorage 找回。
+           放 try 外：localStorage 写失败（无痕/配额）时内存里的位置同样需要钳制 */
+        _hasCustomPos = true;
+        /* v4：手动拖过 = 退出智能定位，尊重用户自定义位置，不再自动漫步 */
+        _auto = false;
+        pauseWander();
+        moodBurst('shy', 1500);  /* 被拖走后害羞一下 */
       }
     }
     _el.addEventListener('pointerup', endDrag);
     _el.addEventListener('pointercancel', endDrag);
+    /* capture 失败或被系统手势抢走指针时，pointerup 只会派发到别处（宠物被钳制在视口内，
+       手指却能移出元素），只挂 _el 会让 drag 状态永久卡死；window 上再兜一层。
+       桌宠与页面同生命周期、无卸载路径，故不需 removeEventListener。 */
+    window.addEventListener('pointerup', endDrag);
+    window.addEventListener('pointercancel', endDrag);
+    /* 捕获被释放（浏览器/系统收回指针）时也收尾，不依赖 pointerup 是否到达 */
+    _el.addEventListener('lostpointercapture', endDrag);
   }
 
   /* ---------- 最小化 / 恢复 ---------- */
   function setMini(on) {
     _el.classList.toggle('mini', !!on);
+    if (on) pauseWander();                    // 圆点状态不漫步
+    else if (_auto) resumeWanderAfter(WANDER_DELAY);
     try {
       if (on) localStorage.setItem(MINI_KEY, '1');
       else localStorage.removeItem(MINI_KEY);
@@ -313,6 +544,10 @@
   }
 
   /* ---------- 右键菜单 ---------- */
+  function hideCtx() {
+    var m = document.getElementById('pet-ctx');
+    if (m) m.classList.remove('show');
+  }
   function ensureCtxMenu() {
     var m = document.getElementById('pet-ctx');
     if (m) return m;
@@ -351,6 +586,20 @@
       });
     });
     var sep = document.createElement('div'); sep.className = 'pet-ctx-sep'; m.appendChild(sep);
+    /* v4：手动拖过位置后出现「回到智能位置」，一键恢复自动落位/漫步 */
+    if (!_auto) {
+      var reauto = document.createElement('div');
+      reauto.className = 'pet-ctx-item'; reauto.textContent = '回到智能位置';
+      reauto.addEventListener('click', function () {
+        _auto = true; _hasCustomPos = false;
+        try { localStorage.removeItem(POS_KEY); } catch (_) {}
+        m.classList.remove('show');
+        stopGlide();
+        var a = smartAnchor();
+        glideTo(a.x, a.y, function () { resumeWanderAfter(WANDER_DELAY); });
+      });
+      m.appendChild(reauto);
+    }
     if (_manual) {
       var auto = document.createElement('div');
       auto.className = 'pet-ctx-item'; auto.textContent = '解锁 · 跟随聊天自动';
@@ -390,7 +639,9 @@
     /* 恢复位置 / 最小化 / 手动状态 */
     try {
       var pos = JSON.parse(localStorage.getItem(POS_KEY) || 'null');
-      if (pos && typeof pos.x === 'number') {
+      /* x/y 都要校验：只查 x 时，y 为 undefined/null 会把 style.top 写成 "undefinedpx"
+         静默失效——宠物落回 CSS 默认位置，却已被标记成自定义位置 */
+      if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
         _hasCustomPos = true;
         _el.style.left = pos.x + 'px'; _el.style.top = pos.y + 'px';
         _el.style.right = 'auto'; _el.style.bottom = 'auto';
@@ -411,9 +662,10 @@
         popBubble('回来啦~');
         return;
       }
-      var pool = (BUBBLE[_current] || BUBBLE.idle).slice();
+      var pool = (BUBBLE[_current] || BUBBLE.id).slice();
       pool.push(_current);
       popBubble(pool[Math.floor(Math.random() * pool.length)]);
+      moodBurst('pat', 1800);  /* 摸头动画 1.8s，随后回到聊天状态 */
     });
     makeDraggable();
     var initial = _current;
@@ -423,6 +675,22 @@
     /* 恢复的保存位置按当前视口再钳制一次；旋转屏幕/窗口缩放时同样钳制，
        防止横屏拖到边缘、切竖屏后宠物永久停在屏幕外 */
     clampToViewport();
+    /* v4 智能定位：没有用户拖过/存过的坐标 → 自动落位 + 空闲漫步；
+       有自定义坐标 → 尊重手动位置，退出智能模式
+       活动监听常驻注册：菜单「回到智能位置」切回自动模式后同样生效 */
+    if (!_hasCustomPos) {
+      _auto = true;
+      var anchor = smartAnchor();
+      setPos(anchor.x, anchor.y);
+      resumeWanderAfter(WANDER_DELAY);
+    } else {
+      _auto = false;
+    }
+    /* 用户有动作（点击/聚焦/切回标签）就重置空闲时钟：刚操作过不立刻乱跑 */
+    document.addEventListener('pointerdown', wanderIdleReset, true);
+    document.addEventListener('focusin', wanderIdleReset, true);
+    document.addEventListener('visibilitychange', wanderIdleReset);
+    startDodgeTimer();
     window.addEventListener('resize', scheduleClamp);
     window.addEventListener('orientationchange', scheduleClamp);
   }
@@ -431,6 +699,9 @@
   window.addEventListener('pet:state', function (e) {
     var s = e.detail && e.detail.state;
     if (s && !_manual) applyState(s);
+    /* v4：思考/说话时乖乖站好，不漫步；回 idle 再考虑走两步 */
+    if (s === 'thinking' || s === 'speaking') pauseWander();
+    else if (s === 'idle' && _auto) resumeWanderAfter(WANDER_DELAY);
   });
 
   /* ---------- 启动 ---------- */

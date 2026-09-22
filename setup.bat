@@ -1,25 +1,26 @@
 @echo off
-REM AI ÄâÈËÏµÍ³ Ê×´Î³õÊ¼»¯£¨Ò»´ÎÐÔ£©
-REM ×÷ÓÃ£º´´½¨ TTS ÔËÐÐ»·¾³¡¢°²×°ºó¶ËÒÀÀµ
-REM ËµÃ÷£º±¾µØ LLM ÒÑ´Ó½çÃæÏÂÏß£¨ÔÆ¶Ë API ÎªÖ÷ÒýÇæ£©£¬²»ÔÙÔ¤ÏÂÔØÄ£ÐÍ£»
-REM       ÈçÐè±¾µØÍÆÀí£¬ÊÖ¶¯ÔËÐÐ llm\get_llm.py Óë llm\start_llm.bat¡£
+chcp 65001 >nul
+REM AI æ‹Ÿäººç³»ç»Ÿ é¦–æ¬¡åˆå§‹åŒ–ï¼ˆä¸€æ¬¡æ€§ï¼‰
+REM ä½œç”¨ï¼šåˆ›å»º TTS è¿è¡ŒçŽ¯å¢ƒã€å®‰è£…åŽç«¯ä¾èµ–
+REM è¯´æ˜Žï¼šæœ¬åœ° LLM å·²ä»Žç•Œé¢ä¸‹çº¿ï¼ˆäº‘ç«¯ API ä¸ºä¸»å¼•æ“Žï¼‰ï¼Œä¸å†é¢„ä¸‹è½½æ¨¡åž‹ï¼›
+REM       å¦‚éœ€æœ¬åœ°æŽ¨ç†ï¼Œæ‰‹åŠ¨è¿è¡Œ llm\get_llm.py ä¸Ž llm\start_llm.batã€‚
 cd /d "%~dp0"
 set "PY=%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe"
 
-echo === [1/3] ×¼±¸ TTS ÉùÒô¿ËÂ¡»·¾³£¨Qwen3-TTS£©===
+echo === [1/3] å‡†å¤‡ TTS å£°éŸ³å…‹éš†çŽ¯å¢ƒï¼ˆQwen3-TTSï¼‰===
 if exist "%USERPROFILE%\.trae-cn\skills\local-tts\scripts\install-env.ps1" (
     powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%USERPROFILE%\.trae-cn\skills\local-tts\scripts\install-env.ps1' -SkillRoot '%USERPROFILE%\.trae-cn\skills\local-tts'"
 ) else (
-    echo [×¢Òâ] ±¾µØ TTS skill Î´°²×°£¨ÔÆ¶ËºÏ³É²»ÊÜÓ°Ïì£¬¿ÉÌø¹ý£©
+    echo [æ³¨æ„] æœ¬åœ° TTS skill æœªå®‰è£…ï¼ˆäº‘ç«¯åˆæˆä¸å—å½±å“ï¼Œå¯è·³è¿‡ï¼‰
 )
 
-echo === [2/3] °²×°ºó¶ËÒÀÀµ ===
+echo === [2/3] å®‰è£…åŽç«¯ä¾èµ– ===
 if exist "%PY%" (
     "%PY%" -m pip install -r requirements.txt -q
 ) else (
-    echo [´íÎó] Python »·¾³Î´¾ÍÐ÷£¬ÇëÏÈ°´ README ×¼±¸ %PY%
+    echo [é”™è¯¯] Python çŽ¯å¢ƒæœªå°±ç»ªï¼Œè¯·å…ˆæŒ‰ README å‡†å¤‡ %PY%
 )
 
-echo === [3/3] Íê³É ===
-echo ³õÊ¼»¯Íê³É£¡ÔËÐÐ start.bat Æô¶¯ÏµÍ³¡£
+echo === [3/3] å®Œæˆ ===
+echo åˆå§‹åŒ–å®Œæˆï¼è¿è¡Œ start.bat å¯åŠ¨ç³»ç»Ÿã€‚
 pause

@@ -7,12 +7,21 @@
 
 # 删除墓碑：某端删掉的会话 id 记入此处（随 sessions.json 的 deleted 字段持久化），
 # 防止另一端旧快照 PUT 时把已删会话"复活"。ts 为毫秒时间戳（与前端 Date.now() 一致）。
-_TOMBSTONE_MAX_AGE_MS = 30 * 86400 * 1000
-_TOMBSTONE_MAX_COUNT = 500
+#
+# 墓碑**不按时间过期**。会话 id 是 's'+Date.now().toString(36)+random，永不复用，
+# 所以保留一条旧墓碑不可能误伤后来的新会话，代价只有每条约 20 字节。
+# 反过来，一旦按 30 天丢弃就会丢数据：某台设备离线超过 30 天后重新上线，
+# 它 PUT 上来的旧快照里那条已删会话既没有墓碑压着、也不在服务端 current 里，
+# 于是被当成"本地独有会话"重新插入，并顺着合并传播到所有设备 —— 用户明明删掉了，
+# 一个月后它带着全部历史自己回来了。
+# 只保留一个硬上限兜住病态增长（正常用量远达不到），超限时淘汰最旧的。
+_TOMBSTONE_MAX_COUNT = 2000
+# 未来时间戳（时钟严重超前的端）依然要丢：它会永久压住同 id 的正常会话
+_TOMBSTONE_FUTURE_SKEW_MS = 86400000
 
 
 def _norm_tombstones(items, now_ms: float) -> dict:
-    """规范化墓碑列表为 {id: ts_ms}：丢弃非法/过期/未来时间戳，重复 id 取较新。"""
+    """规范化墓碑列表为 {id: ts_ms}：丢弃非法与未来时间戳，重复 id 取较新。"""
     out: dict = {}
     for t in items or []:
         if not isinstance(t, dict):
@@ -24,7 +33,7 @@ def _norm_tombstones(items, now_ms: float) -> dict:
             ts = float(ts)
         except (TypeError, ValueError):
             continue
-        if now_ms - ts > _TOMBSTONE_MAX_AGE_MS or ts > now_ms + 86400000:
+        if ts > now_ms + _TOMBSTONE_FUTURE_SKEW_MS:
             continue
         if ts > out.get(sid, 0):
             out[sid] = ts
@@ -168,10 +177,25 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
             if new_wins:
                 by_id[sid] = s
             continue
-        if _is_subsequence(new_hist, old_hist) or _is_subsequence(old_hist, new_hist):
-            # 删除后的剩余序列 → 正常删除语义，updatedAt 新者胜
+        if _is_subsequence(new_hist, old_hist):
+            # 入参是文件的子序列：这一端删过消息 → 正常删除语义，updatedAt 新者胜
             if new_wins:
                 by_id[sid] = s
+            continue
+        if _is_subsequence(old_hist, new_hist) and old_hist:
+            # 入参是文件的**超集**：这一端只是多聊了几条，没有删除。
+            # 原来两个方向合并成一条分支、统一要求 new_wins，于是慢时钟的端
+            # （手机休眠后时钟落后、或从备份恢复）刚发出去的消息会被判成旧快照
+            # 整段丢弃 —— 而这些消息在文件里根本不存在，丢弃就是永久消失。
+            # 收下新历史不会丢任何内容，与两侧时钟无关；其余字段仍以较新的一端为准。
+            host = s if new_wins else old
+            merged_s = dict(host)
+            merged_s["history"] = new_hist
+            merged_s["updatedAt"] = max(_sess_updated_at(s), _sess_updated_at(old))
+            by_id[sid] = merged_s
+            continue
+        if _is_subsequence(old_hist, new_hist):
+            by_id[sid] = s
             continue
         # 分歧：双方各有独有消息 → 消息级合并，双方都不丢
         base, extra = (s, old) if new_wins else (old, s)

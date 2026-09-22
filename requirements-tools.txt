@@ -1,0 +1,14 @@
+# 桌宠素材加工工具 pet_process.py 的依赖（服务端运行不需要，故不进 requirements.txt）
+#
+# 用法（详见 桌面宠素材/README.md）：
+#   "%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" -m pip install -r requirements-tools.txt
+#   "%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" pet_process.py --all
+#
+# 版本按 2026-09-19 在 t2i-tts venv 实测记录（该环境已自带这三个包，
+# 换机器或新建环境时照此安装即可复现）：
+av==18.0.0
+numpy==1.26.4
+onnxruntime==1.28.0
+
+# 抠图模型不算 pip 依赖：首次运行会从 u2net 发布源下载到 ~/.u2net/
+# （isnet-general-use.onnx / u2net.onnx），离线机器需预先拷贝。

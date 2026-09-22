@@ -2,10 +2,13 @@
 """生成公网可下载的部署包 cloud_deploy_public.zip（密钥脱敏版）。
 
 与 pack_cloud.py 的区别：
-- config.json 中所有云端 API 密钥（cloud.api_key / cloud_providers.*.api_key /
-  voice.aliyun.api_key / voice.minimax.api_key / voice.mimo.api_key）置空，保留占位
+- **不含任何 data/**：会话记录、角色记忆、用户上传照片、音色参考音频都是
+  真实个人数据（含真人语音），公网可下载的包一律不带；解压后首次启动会自动
+  建好空的 data/ 目录，用户从零开始自己的数据
+- config.json 中一切凭据字段（access_token / *.api_key 及任意同名叶子）置空，保留占位
 - 不打包 .env（真实密钥只在本地）；打包 .env.example 作为模板
-- 其余内容与 cloud_deploy.zip 一致
+- 不含 deploy/README_*（机主内部部署拓扑）
+- 产出前跑 verify_public_package 自检，任一项泄漏直接构建失败
 
 用法：python deploy/pack_public.py
 下载后需要用户把本地 .env 内容复制到云电脑同名文件，并补 config.json 密钥。
@@ -14,7 +17,15 @@ import json
 import sys
 import zipfile
 from pathlib import Path
-from pack_cloud import ROOT, TOP_FILES, TOP_DIRS, DATA_KEEP, DATA_SKIP, SENSITIVE_PATHS, blank_sensitive, should_skip
+from pack_cloud import (
+    ROOT,
+    TOP_FILES,
+    TOP_DIRS,
+    PUBLIC_DATA_KEEP,
+    blank_sensitive,
+    should_skip,
+    verify_public_package,
+)
 
 OUT = ROOT / "cloud_deploy_public.zip"
 
@@ -26,7 +37,7 @@ def main() -> int:
     with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as zf:
         def add(path: Path):
             nonlocal count
-            if path.is_dir() or should_skip(path):
+            if path.is_dir() or should_skip(path, public=True):
                 return
             zf.write(path, path.relative_to(ROOT).as_posix())
             count += 1
@@ -53,7 +64,9 @@ def main() -> int:
             elif p.is_file():
                 add(p)
 
-        for name in DATA_KEEP:
+        # 公网包不带任何真实数据：PUBLIC_DATA_KEEP 目前为空。
+        # 将来若要放示例数据，必须先确认它是可公开的合成数据。
+        for name in PUBLIC_DATA_KEEP:
             p = ROOT / "data" / name
             if p.is_dir():
                 for f in sorted(p.rglob("*")):
@@ -63,7 +76,8 @@ def main() -> int:
 
     size_mb = OUT.stat().st_size / 1048576
     print(f"脱敏包完成: {OUT.name}  ({size_mb:.1f} MB, {count} 个文件)")
-    print("注意：config.json 密钥已置空，.env 未包含；下载后需补密钥。")
+    verify_public_package(OUT)  # 不通过则 SystemExit，不留下可发布的包
+    print("config.json 凭据已置空，.env 与 data/ 未包含；下载后需自行补密钥与数据。")
     return 0
 
 

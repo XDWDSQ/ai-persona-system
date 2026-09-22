@@ -398,6 +398,18 @@ class StoryManager:
             base["stage_progress"] = 0.0
         return base
 
+    def _rollback(self, cal_backup, state_backup) -> None:
+        """内存与磁盘一起退回快照。
+
+        只回滚内存会留下半完成状态：`not self.save() or not self._save_calendar()`
+        走短路，save() 成功写盘后 _save_calendar() 失败时，state.json 里已经有
+        这条战绩/log，calendar.json 却仍是 pending —— 下次启动同一场会被再记一次，
+        战绩与日志双计。所以先写日历再写状态，且失败时把两份都尽力回写。"""
+        self.cal.data = cal_backup
+        self.state = state_backup
+        self._save_calendar()
+        self.save()
+
     def save(self) -> bool:
         with self._lock:
             return _atomic_write(self.path, self.state)
@@ -507,9 +519,9 @@ class StoryManager:
                     "detail": "首败后的复盘，你和大帅因为指挥权与游戏理解大吵一架。",
                 })
             self._update_stage()
-            if not self.save() or not self._save_calendar():
-                self.cal.data = cal_backup
-                self.state = state_backup
+            # 先日历后状态：日历没写成就等于什么都没提交，回滚干净
+            if not self._save_calendar() or not self.save():
+                self._rollback(cal_backup, state_backup)
                 return {"ok": False, "msg": "战绩保存失败（磁盘可能被占用），请重试"}
             return {"ok": True, "msg": "已记录", "stage": self.state["stage"]}
 
@@ -558,9 +570,8 @@ class StoryManager:
                 "date": _s(self.current_date()), "event": "result_undo",
                 "detail": f"撤销了 {ds} vs {opp} 的比赛结果，战绩已重算。",
             })
-            if not self.save() or not self._save_calendar():
-                self.cal.data = cal_backup
-                self.state = state_backup
+            if not self._save_calendar() or not self.save():
+                self._rollback(cal_backup, state_backup)
                 return {"ok": False, "msg": "撤销保存失败（磁盘可能被占用），请重试"}
             return {"ok": True, "msg": "已撤销并重算战绩"}
 

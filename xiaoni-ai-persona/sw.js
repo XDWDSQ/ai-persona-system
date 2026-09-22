@@ -1,7 +1,9 @@
 /* 小拟 PWA Service Worker —— 应用壳缓存，替代原 APK 的秒开体验。
    策略：导航请求网络优先（更新即时生效，离线回退缓存）；
    静态资源缓存优先 + 后台刷新；API 与上传目录一律不缓存。 */
-var CACHE = 'xiaoni-shell-v9';
+/* 第八轮前端优化（拖拽文件发送/灯箱左右切换+下载/弹窗焦点陷阱/浅色对比度/defer/theme-color）
+   随壳缓存换版：不 bump 的话 SWR 策略要等用户第二次刷新才拿到新文件 */
+var CACHE = 'xiaoni-shell-v17';
 var SHELL = [
   '/pages/chat.html',
   '/pages/story.html',
@@ -9,8 +11,10 @@ var SHELL = [
   '/pages/js/app.js',
   '/pages/pet.js',
   '/pages/favicon.svg',
-  '/pages/bg-ambient.webp',
+  '/pages/bg_ambient_v2.webp',
+  '/pages/avatar_dashuai_256.webp',
   '/pages/avatar_dashuai_64.webp',
+  '/pages/welcome-bg.mp4',
   '/manifest.webmanifest',
   '/icons/icon-192.png',
   '/icons/icon-512.png',

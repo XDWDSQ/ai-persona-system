@@ -9,7 +9,12 @@ import sys
 import zipfile
 from pathlib import Path
 
-from pack_cloud import ROOT, blank_sensitive
+from pack_cloud import (
+    ROOT,
+    PUBLIC_SKIP_PREFIXES,
+    blank_sensitive,
+    verify_public_package,
+)
 
 SRC = ROOT / "update.zip"
 DST = ROOT / "update_public.zip"
@@ -21,16 +26,27 @@ def main() -> int:
         return 1
     if DST.exists():
         DST.unlink()
+    dropped = 0
     with zipfile.ZipFile(SRC) as zin, zipfile.ZipFile(DST, "w", zipfile.ZIP_DEFLATED) as zout:
         for info in zin.infolist():
-            data = zin.read(info.filename)
-            if info.filename == "config.json":
-                cfg = json.loads(data.decode("utf-8"))
-                blank_sensitive(cfg)
-                data = json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
+            name = info.filename
+            # update.zip 是私有包：转公网包时必须剔掉个人数据与内部部署文档
+            if name == "data" or name.startswith("data/") or name.startswith(PUBLIC_SKIP_PREFIXES):
+                dropped += 1
+                continue
+            data = zin.read(name)
+            if name.endswith(".json"):
+                try:
+                    cfg = json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    cfg = None
+                if isinstance(cfg, dict):
+                    blank_sensitive(cfg)
+                    data = json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
             zout.writestr(info, data)
-    print(f"脱敏更新包完成: {DST.name} ({DST.stat().st_size/1048576:.2f} MB)")
-    print("config.json 密钥与访问口令已置空；云上靠 .env 回退，功能不受影响。")
+    print(f"脱敏更新包完成: {DST.name} ({DST.stat().st_size/1048576:.2f} MB)，剔除 {dropped} 个成员")
+    verify_public_package(DST)  # 不通过则 SystemExit，不留下可发布的包
+    print("config.json 凭据已置空；云上靠 .env 回退，功能不受影响。")
     return 0
 
 

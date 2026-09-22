@@ -252,6 +252,7 @@ pet_process.py          桌宠视频 → 透明循环 WebP 批处理工具
 config.example.json     配置模板（复制为 config.json 使用）
 requirements.txt        Python 依赖
 setup.bat / start.bat / restart_service.bat / run_tests.bat   初始化 / 启动 / 重启 / 测试
+requirements.txt / requirements-tools.txt   服务端依赖 / 桌宠素材加工工具（pet_process.py）依赖
 llm/                    llama.cpp 运行时（llm/bin）、模型（llm/models）与启动脚本
 xiaoni-ai-persona/      前端页面源码（pages/ 单页 chat.html + css/chat.css + js/app.js + pet.js + 桌宠素材、pages/story.html 赛程表、PWA manifest/sw）
 deploy/                 打包与部署脚本（pack_cloud / pack_update / webhook 自动部署）
@@ -284,7 +285,7 @@ REM 联网搜索（DuckDuckGo / Bing RSS 解析逻辑）
 REM 附件上传与处理
 "%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_attachments.py
 
-REM 2027 赛季剧情分支（赛程生成/种子确定性/跳转/情感状态机，12 用例）
+REM 2027 赛季剧情分支（赛程生成/种子确定性/跳转/情感状态机，22 用例）
 "%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_story_kpl2027.py
 
 REM 配置读写 API
@@ -292,6 +293,27 @@ REM 配置读写 API
 
 REM TTS 缓存清理策略
 "%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_tts_cache.py
+
+REM MiniMax / MiMo 云端适配层（退避重试、错误分类、thinking 开关解析）
+"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_minimax_llm.py
+
+REM 角色现实动态（新闻卡片清洗/去重/迁移）
+"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_role_news_v2.py
+
+REM 多端会话合并（前缀/子序列/等长分叉/墓碑/占位会话）
+"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_sessions_merge.py
+
+REM 附件回收策略（只删无引用的孤儿，历史消息在用的老照片不删）
+"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_upload_retention.py
+
+REM 公网包脱敏与出厂自检（凭据按叶子名清空；包里带 data/ 就构建失败）
+"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_pack_hygiene.py
+
+REM 会话入库截断方向 + 登录 cookie 派生与 Secure 判定
+"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_auth_sync.py
+
+REM 历史清洗健壮性（畸形 history 条目不得打挂 /api/chat）
+"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_text_hardening.py
 ```
 
 需要真实云端密钥才能运行的脚本：
@@ -302,6 +324,14 @@ REM TTS 缓存清理策略
 端到端链路验证：
 
 - `verify_chain.py`：串联 LLM → TTS 全链路验证，**需服务已在 8000 端口启动**后运行
+- `runtime_smoke.py`：对**正在运行的服务**走完整 HTTP 栈的冒烟（中间件、门禁、路由顺序、
+  序列化、上传去重、会话读写、记忆页、流式）。离线测试直调函数，覆盖不到这些；
+  默认打隔离实例：
+
+  ```bat
+  venv\Scripts\python qa_run.py            REM 另开窗口：隔离实例，127.0.0.1:8010
+  venv\Scripts\python runtime_smoke.py     REM 默认 http://127.0.0.1:8010，可传 base_url
+  ```
 
 ### 测试协议：防止测试会话污染真实前端
 

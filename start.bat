@@ -1,29 +1,43 @@
 @echo off
-REM AI ÄâÈËÏµÍ³ Ò»¼üÆô¶¯
+chcp 65001 >nul
+REM AI æ‹Ÿäººç³»ç»Ÿ ä¸€é”®å¯åŠ¨
 cd /d "%~dp0"
 
 set "PY=%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe"
 
 if not exist "%PY%" (
-    echo [X] Î´ÕÒµ½ TTS ÔËĞĞ»·¾³£¬ÇëÏÈÔËĞĞ setup.bat Íê³É³õÊ¼»¯
+    echo [X] æœªæ‰¾åˆ° TTS è¿è¡Œç¯å¢ƒï¼Œè¯·å…ˆè¿è¡Œ setup.bat å®Œæˆåˆå§‹åŒ–
     pause
     exit /b 1
 )
 
-REM ±£³Ö TTS/ASR ³£×¤£¬±ÜÃâÏĞÖÃºóÖØĞÂ¼ÓÔØÄ£ĞÍ
+REM ä¿æŒ TTS/ASR å¸¸é©»ï¼Œé¿å…é—²ç½®åé‡æ–°åŠ è½½æ¨¡å‹
 set "INTEL_SKILL_DOG_NO_EVICTION=1"
 
-REM ±¾µØ LLM ÒÑ´Ó½çÃæÏÂÏß£¨ÔÆ¶Ë MiniMax ÎªÖ÷ÒıÇæ£©£»ÈçĞè»Ö¸´±¾µØÍÆÀí£¬
-REM ÊÖ¶¯ÔËĞĞ llm\start_llm.bat ²¢ÔÚÉèÖÃÀï°ÑÒıÇæÇĞ»Ø±¾µØ¡£
+REM å·²åœ¨è·‘å°±ç›´æ¥å¼€æµè§ˆå™¨ï¼šä¸åŠ è¿™é“åˆ¤æ–­æ—¶ï¼ŒåŒå‡»ç¬¬äºŒæ¬¡ä¼šå†èµ·ä¸€ä¸ª uvicornï¼Œ
+REM æ–°è¿›ç¨‹å¿…ç„¶å›  8000 è¢«å ç”¨è€Œå´©åœ¨ bind ä¸Šï¼Œçª—å£é‡Œåªå‰©ä¸€å±çœ‹ä¸æ‡‚çš„ traceback
+"%PY%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)" >nul 2>&1
+if not errorlevel 1 (
+    echo.
+    echo  æœåŠ¡å·²åœ¨è¿è¡Œï¼Œç›´æ¥æ‰“å¼€ http://127.0.0.1:8000
+    echo  éœ€è¦åŠ è½½æœ€æ–°ä»£ç è¯·æ”¹è·‘ restart_service.bat
+    echo.
+    start "" http://127.0.0.1:8000
+    pause
+    exit /b 0
+)
 
-REM ÇáÁ¿Ğ£Ñéºó¶ËÒÀÀµ£¨°²×°ÒÑÇ¨ÒÆµ½ setup.bat£©
-"%PY%" -c "import fastapi, uvicorn, httpx, pydantic" || (echo ÒÀÀµÈ±Ê§£¬ÇëÏÈÔËĞĞ setup.bat & exit /b 1)
+REM æœ¬åœ° LLM å·²ä»ç•Œé¢ä¸‹çº¿ï¼ˆäº‘ç«¯ MiniMax ä¸ºä¸»å¼•æ“ï¼‰ï¼›å¦‚éœ€æ¢å¤æœ¬åœ°æ¨ç†ï¼Œ
+REM æ‰‹åŠ¨è¿è¡Œ llm\start_llm.bat å¹¶åœ¨è®¾ç½®é‡ŒæŠŠå¼•æ“åˆ‡å›æœ¬åœ°ã€‚
+
+REM è½»é‡æ ¡éªŒåç«¯ä¾èµ–ï¼ˆå®‰è£…å·²è¿ç§»åˆ° setup.batï¼‰
+"%PY%" -c "import fastapi, uvicorn, httpx, pydantic" || (echo ä¾èµ–ç¼ºå¤±ï¼Œè¯·å…ˆè¿è¡Œ setup.bat & exit /b 1)
 
 echo.
-echo  AI ÄâÈËÏµÍ³ÒÑÆô¶¯£ºhttp://127.0.0.1:8000
-echo  Ô¶³Ì·ÃÎÊ£ºÏÈÆô¶¯ ngrok£¨ngrok http 8000£©£¬µØÖ·¼û data\tunnel_url.txt
-echo  ¹«Íø·ÃÎÊÇ°±ØĞëÅäÖÃ·ÃÎÊ¿ÚÁî£¨config.json ¶¥²ã access_token£©¡£
-echo  ¹Ø±Õ±¾´°¿Ú¼´Í£Ö¹·şÎñ¡£
+echo  AI æ‹Ÿäººç³»ç»Ÿå·²å¯åŠ¨ï¼šhttp://127.0.0.1:8000
+echo  è¿œç¨‹è®¿é—®ï¼šå…ˆå¯åŠ¨ ngrokï¼ˆngrok http 8000ï¼‰ï¼Œåœ°å€è§ data\tunnel_url.txt
+echo  å…¬ç½‘è®¿é—®å‰å¿…é¡»é…ç½®è®¿é—®å£ä»¤ï¼ˆconfig.json é¡¶å±‚ access_tokenï¼‰ã€‚
+echo  å…³é—­æœ¬çª—å£å³åœæ­¢æœåŠ¡ã€‚
 echo.
 start "" http://127.0.0.1:8000
 "%PY%" -m uvicorn server:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 10

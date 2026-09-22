@@ -22,7 +22,7 @@ v3 相对 v2 的改进（画质 / 抠图）：
   python pet_process.py --all --size 512 --quality 90  # 高清档
   python pet_process.py --all --defringe 0 --shrink 0  # 关闭新抠图优化（对比用）
 """
-import argparse, glob, os, sys, time
+import argparse, glob, math, os, sys, time
 import numpy as np
 from PIL import Image, ImageFilter
 import av
@@ -274,11 +274,23 @@ def _process_one_impl(in_path, name, out_dir, session,
     else:
         duration = int(1000 / target_fps)
     t0 = time.time()
-    pil_frames[0].save(
-        out_path, 'WEBP', save_all=True, append_images=pil_frames[1:],
-        duration=duration, loop=0, disposal=2, lossless=False,
-        quality=quality, method=4,   # method=6 编码极慢（324s vs 2s），体积几乎无差
-    )
+    # 先写临时文件再 os.replace：直接覆盖 pages/pet/<state>.webp 时，Ctrl-C /
+    # 磁盘忙（云盘同步会占着文件）会留下半截 webp，而云盘会把这个坏文件同步到
+    # 其它机器；server.py 又以 `max-age=604800, immutable` 发 .webp，客户端会一直缓存坏的。
+    tmp_path = f'{out_path}.{os.getpid()}.tmp'
+    try:
+        pil_frames[0].save(
+            tmp_path, 'WEBP', save_all=True, append_images=pil_frames[1:],
+            duration=duration, loop=0, disposal=2, lossless=False,
+            quality=quality, method=4,   # method=6 编码极慢（324s vs 2s），体积几乎无差
+        )
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
     sz = os.path.getsize(out_path) // 1024
     print(f'  ✓ {len(pil_frames)} 帧, {duration}ms/帧, {sz}KB, 编码 {time.time()-t0:.0f}s → {out_path}', flush=True)
     return out_path
@@ -305,21 +317,23 @@ def main():
     ap.add_argument('--quality', type=int, default=82, help='WebP 质量')
     args = ap.parse_args()
 
-    # 参数范围校验：--fps 0 / --size 0 会除零或崩溃，--margin<1 裁切会越界
-    if args.fps < 1:
-        print('--fps 必须 >= 1'); sys.exit(1)
-    if args.size < 16:
-        print('--size 必须 >= 16'); sys.exit(1)
-    if args.margin <= 0 or args.margin < 1.0:
-        print('--margin 必须 >= 1.0（小于 1 会裁掉人物边缘）'); sys.exit(1)
-    if not (0 < args.quality <= 100):
-        print('--quality 必须在 1..100'); sys.exit(1)
-    if not (0 <= args.defringe <= 4):
-        print('--defringe 必须在 0..4'); sys.exit(1)
-    if args.shrink < 0:
-        print('--shrink 必须 >= 0'); sys.exit(1)
-    if not (0.0 <= args.alpha_lo <= 1.0 and 0.0 <= args.alpha_hi <= 1.0):
-        print('--alpha-lo / --alpha-hi 必须在 0..1'); sys.exit(1)
+    # 参数范围校验：--fps 0 / --size 0 会除零或崩溃，--margin<1 裁切会越界。
+    # 必须先过 math.isfinite：`nan <= 0` 与 `nan < 1.0` 都是 False，
+    # `--margin nan` 能穿过原来的范围判断，直到渲染循环里 int(x*nan) 才炸
+    # （ONNX 第一遍已经跑完，白等几分钟）；`--feather nan` 更糟——
+    # `if feather > 0` 为 False，羽化被静默跳过，产出一张参数不对的素材还报告成功。
+    def _num(v, lo, hi, label):
+        if not math.isfinite(v) or v < lo or v > hi:
+            print(f'{label} 必须是 {lo}..{hi} 之间的有限数值，收到 {v!r}'); sys.exit(1)
+    _num(args.fps, 1, 30, '--fps')
+    _num(args.size, 16, 1024, '--size')
+    _num(args.margin, 1.0, 4.0, '--margin')
+    _num(args.feather, 0.0, 32.0, '--feather')
+    _num(args.quality, 1, 100, '--quality')
+    _num(args.defringe, 0, 4, '--defringe')
+    _num(args.shrink, 0, 32, '--shrink')
+    _num(args.alpha_lo, 0.0, 1.0, '--alpha-lo')
+    _num(args.alpha_hi, 0.0, 1.0, '--alpha-hi')
     if args.alpha_lo >= args.alpha_hi:
         print('--alpha-lo 必须小于 --alpha-hi（否则 alpha 曲线归零，会报"全程没抠到人"）')
         sys.exit(1)

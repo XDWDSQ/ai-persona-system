@@ -33,6 +33,7 @@ UPDATE_FILES = [
     "story_kpl2027.py",
     "server_pkg",
     "requirements.txt",
+    "requirements-tools.txt",
     "config.json",        # 含访问口令；公网模式（--public）随密钥一并脱敏
     "config.example.json",
     ".env.example",
@@ -52,7 +53,7 @@ def main() -> int:
     with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as zf:
         def add(path: Path):
             nonlocal count
-            if path.is_dir() or should_skip(path):
+            if path.is_dir() or should_skip(path, public=PUBLIC):
                 return
             zf.write(path, path.relative_to(ROOT).as_posix())
             count += 1
@@ -60,10 +61,13 @@ def main() -> int:
         for name in UPDATE_FILES:
             p = ROOT / name
             if name == "config.json" and PUBLIC:
-                cfg = json.loads(p.read_text(encoding="utf-8"))
-                blank_sensitive(cfg)
-                zf.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
-                count += 1
+                if p.exists():
+                    cfg = json.loads(p.read_text(encoding="utf-8"))
+                    blank_sensitive(cfg)
+                    zf.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
+                    count += 1
+                else:
+                    print("[!] 本地无 config.json，公网包不含该文件")
             elif p.is_dir():
                 for f in sorted(p.rglob("*")):
                     add(f)
@@ -74,7 +78,8 @@ def main() -> int:
     print(f"更新包完成: {OUT.name} ({size_mb:.1f} MB, {count} 个文件)")
     print("已排除: data/（云上数据唯一真源，不覆盖）、.env、.git、llm/")
     if PUBLIC:
-        print("公网模式：config.json 密钥已脱敏（云端 key 靠云上 .env 提供）")
+        verify_public_package(OUT)  # 不通过则 SystemExit，不留下可发布的包
+        print("公网模式：config.json 凭据已脱敏（云端 key 靠云上 .env 提供）")
     print("传到云电脑后：解压替换 -> 重启服务")
     return 0
 

@@ -22,9 +22,17 @@ python --version
 echo.
 echo  [2/3] Installing dependencies (fastapi uvicorn httpx pydantic multipart) ...
 python -m pip install -r requirements.txt
+if errorlevel 1 (
+    echo  [X] Dependency install failed - service NOT started. Fix pip/network, then re-run.
+    exit /b 1
+)
 
 echo.
 echo  [3/3] Starting service on port 8000 (background, log: data\service.log) ...
+REM Start-Process -RedirectStandardOutput fails outright when the folder is
+REM missing, and a fresh unpack has no data/ yet (server.py creates it on boot,
+REM which happens after this line). Create it first.
+if not exist data mkdir data
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Start-Process -FilePath 'python' -ArgumentList '-m','uvicorn','server:app','--host','0.0.0.0','--port','8000','--timeout-graceful-shutdown','10' -WorkingDirectory (Get-Location) -WindowStyle Hidden -RedirectStandardOutput 'data\service.log' -RedirectStandardError 'data\service_err.log' -PassThru; Start-Sleep -Seconds 3; Write-Host ('Service PID: ' + $p.Id)"
 
 echo.

@@ -172,29 +172,154 @@ def test_fix_addressing():
 
 
 def test_obedience_core():
-    out = server.build_system_content("人设正文", "上下文块", "尾部约定")
+    out = server.build_system_content("人设正文", "稳定约定块", "动态上下文块")
     check("服从铁律带显式标记", "【服从铁律" in out, out[:120])
-    check("铁律紧跟人设", out.index("【服从铁律") > out.index("人设正文")
-          and out.index("【服从铁律") < out.index("上下文块"), out[:160])
-    check("上下文与尾部保留", "上下文块" in out and "尾部约定" in out)
+    check("分段顺序：人设 < 铁律 < 稳定约定 < 动态上下文",
+          out.index("人设正文") < out.index("【服从铁律") < out.index("稳定约定块")
+          < out.index("动态上下文块"), out[:200])
+    check("稳定段与动态段保留", "稳定约定块" in out and "动态上下文块" in out)
     check("铁律声明最高优先级", "最高优先级" in out or "最高指令" in out)
     check("铁律保留安全底线", "违法" in out)
     check("空值容错", server.build_system_content("", "", "") == server._OBEDIENCE_CORE)
-    # 两处组装点必须走统一入口（防分叉）：chat 与 greeting 路由源码里不得再手写拼接
+    # 两处组装点必须走统一入口（防分叉），且共用 stable_hints/dynamic_hints 命名
+    # （前缀缓存友好重排后，chat 与 greeting 的分段结构不得再分叉）
     import pathlib
     src = pathlib.Path(__file__).resolve().parent.joinpath("server.py").read_text(encoding="utf-8")
-    check("chat走统一入口", "build_system_content(\n                  persona, ctx_block,\n"
-          "                  _META_HINT + style_hint + search_hint" in src)
-    check("greeting走统一入口", "_META_HINT + greeting_instruction + style_hint" in src
+    check("chat走统一入口(新分段)",
+          "build_system_content(persona, stable_hints, ctx_block + dynamic_hints)" in src)
+    check("greeting走统一入口(新分段)",
+          "build_system_content(persona, stable_hints,\n                                              greeting_instruction + dynamic_hints)" in src
           and src.count("build_system_content(") >= 3)  # 定义+两处调用
+    check("稳定段含元话语约定", "stable_hints = _META_HINT + style_hint" in src)
+
+
+def test_hint_dedup():
+    """尾部指令去重：上下文块已携带事实时只发引用式指令（不复述事实全文）。"""
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    full = server._time_hint(False)
+    ref = server._time_hint(True)
+    check("时间指令(全量)带日期", today in full, full[:80])
+    check("时间指令(引用式)不重复日期", today not in ref and "【此刻上下文】" in ref, ref[:80])
+    news = "大帅昨天随队抵达上海备战KPL秋季赛，今晚七点首战"
+    n_full = server._role_news_hint(news, False)
+    n_ref = server._role_news_hint(news, True)
+    check("动态指令(全量)复述动态全文", news in n_full)
+    check("动态指令(引用式)不复述全文", news not in n_ref and "【你的现实动态】" in n_ref)
+    check("引用式指令明显更短（省 token）", len(n_ref) < len(n_full) - len(news) + 40)
+    l_full = server._location_hint("成都市高新区", False)
+    l_ref = server._location_hint("成都市高新区", True)
+    check("位置指令(全量)带地点", "成都市高新区" in l_full)
+    check("位置指令(引用式)不带地点", "成都市高新区" not in l_ref and "【用户位置】" in l_ref)
+    w_full = server._weather_hint(False, "晴，气温26度")
+    w_ref = server._weather_hint(True, "晴，气温26度")
+    check("天气指令(全量)带天气文案", "26度" in w_full)
+    check("天气指令(引用式)不带天气文案", "26度" not in w_ref and "【今日天气】" in w_ref)
+    check("无动态时两种模式都为空", server._role_news_hint("", True) == ""
+          and server._role_news_hint("", False) == "")
+    check("无位置时两种模式都为空", server._location_hint("", True) == ""
+          and server._location_hint("", False) == "")
+
+
+def test_postproc_gate():
+    """后处理 LLM 节流：只对短且无信号的寒暄生效，情绪/剧情/约定类一律放行。"""
+    gate = server._is_trivial_exchange
+    # 该跳过的纯寒暄（旧行为：每轮都白发一次标注 LLM）
+    for u, r in [("嗯嗯", "好嘞老公，知道啦"), ("好的", "行，听你的"),
+                 ("哈哈哈", "笑什么呢笨蛋"), ("666", "那必须的"),
+                 ("在吗", "在呢老公"), ("[偷笑]", "调皮")]:
+        check(f"短寒暄被节流({u!r})", gate(u, r), f"u={u!r} r={r!r}")
+    # 绝不能节流：情绪、剧情、约定、偏好、健康/人生大事（哪怕很短）
+    for u, r in [("我喜欢你", "我也喜欢你老公"), ("今天好累", "累了就早点休息"),
+                 ("我们3:1赢了", "干得漂亮"), ("周末陪我", "好，周末陪你"),
+                 ("记得吃饭", "记住了"), ("我发烧了", "严重吗老公"),
+                 ("晚安老公爱你", "爱你，晚安"), ("我辞职了", "想清楚就好"),
+                 ("想吃火锅", "走，带你去")]:
+        check(f"信号轮不节流({u!r})", not gate(u, r), f"u={u!r} r={r!r}")
+    # 回复稍长就不节流（可能有情绪展开/事实，宁可多调一次）
+    check("长回复不节流", not gate("嗯嗯", "好嘞老公，我跟你说今天训练赛那个事啊真是一言难尽"))
+    # 空文本不节流（交给原链路防御逻辑）
+    check("空回复不节流", not gate("在吗", "") and not gate("", "在呢"))
+
+
+def test_usage_recorder():
+    """token 用量记账：合法 usage 累加，脏值忽略。"""
+    before = dict(server._llm_usage_total)
+    server._record_llm_usage("mimo", "mimo-v2.5",
+                             {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150})
+    server._record_llm_usage("mimo", "mimo-v2.5",
+                             {"prompt_tokens": 10})  # 缺 completion：按 prompt+0 计
+    server._record_llm_usage("mimo", "mimo-v2.5", None)
+    server._record_llm_usage("mimo", "mimo-v2.5", {"prompt_tokens": "x"})
+    check("合法 usage 累加 calls=2", server._llm_usage_total["calls"] - before["calls"] == 2)
+    check("prompt 累计 +110", server._llm_usage_total["prompt_tokens"] - before["prompt_tokens"] == 110)
+    check("completion 累计 +50", server._llm_usage_total["completion_tokens"] - before["completion_tokens"] == 50)
+    check("total 累计 +160", server._llm_usage_total["total_tokens"] - before["total_tokens"] == 160)
+
+
+def test_greeting_singleflight():
+    """同角色并发问候只允许一次 LLM 调用（旧行为：两个请求各烧一次完整调用）。"""
+    import asyncio
+    import threading
+    from fastapi.testclient import TestClient
+
+    orig_load = server.load_config
+    orig_chat = server.llm_chat
+    orig_token = server._access_token
+    cfg = {
+        "provider": "cloud", "active_role": "trole", "persona": "测试人设",
+        "cloud": {"base_url": "http://fake/v1", "model": "fake"},
+        "roles": {"trole": {"name": "小测"}},
+        "voice": {}, "role_engine": {"enabled": False},
+    }
+    server.load_config = lambda with_env=True: cfg
+    calls = {"n": 0}
+
+    async def fake_chat(messages, temperature=0.8, max_tokens=768, model=None,
+                        disable_thinking=False, thinking=None, anti_repeat=False, cfg=None):
+        calls["n"] += 1
+        await asyncio.sleep(0.3)  # 放大窗口，保证第二个请求在生成期间进入
+        return "[style:自然]老公，在忙吗"
+
+    server.llm_chat = fake_chat
+    server._access_token = lambda: None
+    server._greeting_inflight.clear()
+    results: list = []
+    errors: list = []
+    try:
+        with TestClient(server.app) as client:
+            def _hit():
+                try:
+                    r = client.post("/api/greeting")
+                    results.append((r.status_code, r.json().get("reply")))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            t1 = threading.Thread(target=_hit)
+            t2 = threading.Thread(target=_hit)
+            t1.start(); t2.start()
+            t1.join(5); t2.join(5)
+        check("并发问候无异常", not errors, str(errors[:1]))
+        check("两个请求都 200 且拿到同一回复",
+              len(results) == 2 and all(code == 200 and reply == "老公，在忙吗" for code, reply in results),
+              str(results))
+        check("并发合并：LLM 只调用 1 次（旧行为为 2 次）", calls["n"] == 1, f"calls={calls['n']}")
+        check("完成后在飞表已清理", not server._greeting_inflight)
+    finally:
+        server.load_config = orig_load
+        server.llm_chat = orig_chat
+        server._access_token = orig_token
+        server._greeting_inflight.clear()
 
 
 def main():
     for t in (test_clean_history, test_degenerate_reply, test_too_similar_to_last,
               test_story_regex_detect, test_time_hint, test_retry_guard,
-              test_login_rate_limit, test_fix_addressing, test_obedience_core):
+              test_login_rate_limit, test_fix_addressing, test_obedience_core,
+              test_hint_dedup, test_postproc_gate, test_usage_recorder,
+              test_greeting_singleflight):
         t()
-    print(f"\n{'=' * 50}\n共 9 组，失败 {_FAIL} 组")
+    print(f"\n{'='*50}\n共 13 组，失败 {_FAIL} 组")
     sys.exit(1 if _FAIL else 0)
 
 

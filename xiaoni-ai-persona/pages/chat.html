@@ -17,6 +17,14 @@
     <link rel="stylesheet" href="css/chat.css">
 </head>
 <body class="min-h-screen font-sans antialiased">
+    <!-- 拖拽文件发送：拖入文件时全屏提示，松手即加入待发送附件 -->
+    <div class="drop-over" id="drop-over" aria-hidden="true">
+      <div class="drop-card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        <span>松手发送文件</span>
+        <small>可同时拖入多个文件（图片 / 文档 / 任意文件）</small>
+      </div>
+    </div>
     <main>
       <div class="app">
         <!-- 移动端抽屉遮罩：点击收起侧边栏（桌面端 display:none） -->
@@ -88,7 +96,7 @@
             </span>
             <!-- 朗读语速移入设置面板：低频参数不再占据顶栏 -->
             <!-- PWA 安装入口：浏览器触发 beforeinstallprompt 时显示（替代已停更的安卓 APK） -->
-            <button class="top-btn install-btn" title="安装到主屏幕" id="btn-install">
+            <button class="top-btn install-btn" title="安装到主屏幕" id="btn-install" aria-label="安装到主屏幕">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             </button>
             <button class="top-btn" title="搜索当前对话" id="btn-msg-search" type="button" aria-label="搜索当前对话">
@@ -114,8 +122,22 @@
           </div>
           <div class="msgs" id="msgs">
             <div class="msgs-inner">
-              <!-- Welcome：内容由 refreshStatus 按当前角色动态填充 -->
+              <!--
+                Welcome Hero（v2 重构）：动态视频背景（seedance 暖夜光影）+ 角色肖像（seedream）。
+                内容仍由 refreshStatus 按当前角色动态填充；有历史消息时整块由 JS 隐藏。
+              -->
               <div class="welcome">
+                <div class="welcome-bg" aria-hidden="true">
+                  <video id="welcome-bg-video" muted loop playsinline preload="none"
+                         poster="bg_ambient_v2.webp" tabindex="-1" aria-hidden="true">
+                    <source src="welcome-bg.mp4" type="video/mp4">
+                  </video>
+                </div>
+                <div class="welcome-hero">
+                  <span class="welcome-ring" aria-hidden="true"></span>
+                  <img class="welcome-avatar" id="welcome-avatar" src="avatar_dashuai_256.webp" fetchpriority="high"
+                       alt="大帅" width="256" height="256" decoding="async">
+                </div>
                 <div class="eyebrow"><span class="pip"></span>正在连接…</div>
                 <h1 id="welcome-title">你好</h1>
                 <p id="welcome-sub">正在获取角色信息…</p>
@@ -149,7 +171,7 @@
                 </button>
               </div>
               <input type="file" id="attach-input" multiple style="display:none">
-              <textarea id="text" placeholder="说点什么吧…（Enter 发送，Shift+Enter 换行）" rows="1" data-dom-id="input-text"></textarea>
+              <textarea id="text" placeholder="说点什么吧…（Enter 发送，Shift+Enter 换行）" rows="1" data-dom-id="input-text" aria-label="编辑并发送消息"></textarea>
               <button class="send-btn" title="发送" data-dom-id="btn-send">
                 <svg class="plane" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/></svg>
                 <i class="spinner" aria-hidden="true"></i>
@@ -159,12 +181,12 @@
         </div>
       </div>
 
-      <!-- 主逻辑：原内联脚本整体迁出，逻辑零改动 -->
-      <script src="js/app.js"></script>
+      <!-- 主逻辑：defer 不阻塞解析（设置等 HTML 在脚本之后），执行顺序 app → pet -->
+      <script src="js/app.js" defer></script>
     </main>
 
     <!-- ===== 设置模态框 ===== -->
-    <div id="settings" role="dialog" aria-label="设置">
+    <div id="settings" role="dialog" aria-modal="true" aria-label="设置">
       <div class="set-panel">
         <div class="set-head">
           <span class="set-title">设置</span>
@@ -173,6 +195,14 @@
           </button>
         </div>
         <div class="set-body">
+          <!-- ===== 陪伴足迹：纯本地聚合的累计数字与近 7 天活跃 ===== -->
+          <div class="set-row" style="align-items:flex-start">
+            <span class="set-label">陪伴足迹</span>
+            <div style="flex:1;min-width:0">
+              <div id="stats-summary" style="font-size:12px;color:var(--muted-foreground);line-height:1.7">读取中…</div>
+              <div id="stats-bars" style="display:flex;align-items:flex-end;gap:4px;height:56px;margin-top:8px"></div>
+            </div>
+          </div>
           <!-- ===== 常用：角色 / 人设 / 朗读 / 问候 ===== -->
           <div class="set-row">
             <span class="set-label">当前角色</span>
@@ -360,11 +390,20 @@
         </div>
       </div>
     </div>
-    <!-- ===== 图片灯箱：点击消息中的图片全屏查看，Esc/点击背景关闭 ===== -->
-    <div id="lightbox" role="dialog" aria-label="图片预览" hidden>
+    <!-- ===== 图片灯箱：点击消息中的图片全屏查看，左右切换/下载，Esc/点击背景关闭 ===== -->
+    <div id="lightbox" role="dialog" aria-modal="true" aria-label="图片预览" tabindex="-1" hidden>
       <img id="lightbox-img" alt="图片预览">
+      <button type="button" class="lb-nav lb-prev" id="lb-prev" aria-label="上一张" title="上一张">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+      </button>
+      <button type="button" class="lb-nav lb-next" id="lb-next" aria-label="下一张" title="下一张">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+      </button>
+      <button type="button" class="lb-download" id="lb-download" aria-label="下载图片" title="下载图片">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      </button>
     </div>
-    <!-- ===== 桌面宠物（大帅） ===== -->
-    <script src="pet.js"></script>
+    <!-- ===== 桌面宠物（大帅），defer 保证在 app.js 之后执行 ===== -->
+    <script src="pet.js" defer></script>
 </body>
 </html>
