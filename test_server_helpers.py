@@ -9,6 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import os as _os
+_os.environ.setdefault("AI_DISABLE_EXTERNAL", "1")  # 直跑本文件也切断后台外部请求（烧 token）
 import server
 from server import _clean_history, _is_degenerate_reply, _too_similar_to_last
 
@@ -185,10 +187,13 @@ def test_obedience_core():
     # （前缀缓存友好重排后，chat 与 greeting 的分段结构不得再分叉）
     import pathlib
     src = pathlib.Path(__file__).resolve().parent.joinpath("server.py").read_text(encoding="utf-8")
+    # 动态段现统一由 _assemble_dynamic_hints 组装（chat/greeting 唯一入口，防分叉）
     check("chat走统一入口(新分段)",
-          "build_system_content(persona, stable_hints, ctx_block + dynamic_hints)" in src)
+          "build_system_content(" in src
+          and "_assemble_dynamic_hints(ctx_block, ctx_layers," in src)
     check("greeting走统一入口(新分段)",
-          "build_system_content(persona, stable_hints,\n                                              greeting_instruction + dynamic_hints)" in src
+          "greeting_instruction" in src
+          and src.count("_assemble_dynamic_hints(ctx_block, ctx_layers,") >= 2  # chat + greeting
           and src.count("build_system_content(") >= 3)  # 定义+两处调用
     check("稳定段含元话语约定", "stable_hints = _META_HINT + style_hint" in src)
 
@@ -243,18 +248,41 @@ def test_postproc_gate():
 
 
 def test_usage_recorder():
-    """token 用量记账：合法 usage 累加，脏值忽略。"""
-    before = dict(server._llm_usage_total)
-    server._record_llm_usage("mimo", "mimo-v2.5",
-                             {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150})
-    server._record_llm_usage("mimo", "mimo-v2.5",
-                             {"prompt_tokens": 10})  # 缺 completion：按 prompt+0 计
-    server._record_llm_usage("mimo", "mimo-v2.5", None)
-    server._record_llm_usage("mimo", "mimo-v2.5", {"prompt_tokens": "x"})
-    check("合法 usage 累加 calls=2", server._llm_usage_total["calls"] - before["calls"] == 2)
-    check("prompt 累计 +110", server._llm_usage_total["prompt_tokens"] - before["prompt_tokens"] == 110)
-    check("completion 累计 +50", server._llm_usage_total["completion_tokens"] - before["completion_tokens"] == 50)
-    check("total 累计 +160", server._llm_usage_total["total_tokens"] - before["total_tokens"] == 160)
+    """token 用量记账：合法 usage 累加，脏值忽略。
+
+    第八轮起记账会节流落盘（data/llm_usage.json）：落盘路径必须重定向到临时目录、
+    计数全局在 finally 恢复，绝不能把测试数值写进真实用量统计。"""
+    import tempfile
+    from pathlib import Path as _P
+    before_total = dict(server._llm_usage_total)
+    before_by_prov = dict(server._llm_usage_by_provider)
+    before_dirty = server._llm_usage_dirty_calls
+    before_flush = server._llm_usage_last_flush
+    orig_path = server._LLM_USAGE_PATH
+    server._LLM_USAGE_PATH = _P(tempfile.mkdtemp(prefix="usage_rec_")) / "llm_usage.json"
+    try:
+        server._record_llm_usage("mimo", "mimo-v2.5",
+                                 {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150})
+        server._record_llm_usage("mimo", "mimo-v2.5",
+                                 {"prompt_tokens": 10})  # 缺 completion：按 prompt+0 计
+        server._record_llm_usage("mimo", "mimo-v2.5", None)
+        server._record_llm_usage("mimo", "mimo-v2.5", {"prompt_tokens": "x"})
+        check("合法 usage 累加 calls=2",
+              server._llm_usage_total["calls"] - before_total["calls"] == 2)
+        check("prompt 累计 +110",
+              server._llm_usage_total["prompt_tokens"] - before_total["prompt_tokens"] == 110)
+        check("completion 累计 +50",
+              server._llm_usage_total["completion_tokens"] - before_total["completion_tokens"] == 50)
+        check("total 累计 +160",
+              server._llm_usage_total["total_tokens"] - before_total["total_tokens"] == 160)
+    finally:
+        server._llm_usage_total.clear()
+        server._llm_usage_total.update(before_total)
+        server._llm_usage_by_provider.clear()
+        server._llm_usage_by_provider.update(before_by_prov)
+        server._llm_usage_dirty_calls = before_dirty
+        server._llm_usage_last_flush = before_flush
+        server._LLM_USAGE_PATH = orig_path
 
 
 def test_greeting_singleflight():
@@ -440,15 +468,33 @@ def test_chat_prompt_structure():
         server._spawn_bg = orig_spawn
 
 
+def test_friendly_llm_http_error():
+    """LLM HTTP 错误友好化：402/429/401 返回可操作中文，不把英文状态与原始 body 抛给用户。
+    实测来源：MiMo 余额不足时 402，旧逻辑直接弹 '402 Payment Required' + JSON。"""
+    m402 = server._friendly_llm_http_error(402, "Insufficient account balance")
+    check("402 提示充值或换模型", "余额" in m402 and "切换其他模型" in m402, m402)
+    check("402 不出现英文/状态码", "Payment Required" not in m402 and "402" not in m402, m402)
+    m429 = server_friendly(429)
+    check("429 提示限流稍候", "限流" in m429 and "稍" in m429, m429)
+    m401 = server_friendly(401)
+    check("401 提示检查 Key", "API Key" in m401, m401)
+    m500 = server._friendly_llm_http_error(500, "boom")
+    check("未命中映射保留状态码与 body", "500" in m500 and "boom" in m500, m500)
+
+
+def server_friendly(code):
+    return server._friendly_llm_http_error(code, "x")
+
+
 def main():
     for t in (test_clean_history, test_degenerate_reply, test_too_similar_to_last,
               test_story_regex_detect, test_time_hint, test_retry_guard,
               test_login_rate_limit, test_fix_addressing, test_obedience_core,
               test_hint_dedup, test_postproc_gate, test_usage_recorder,
               test_greeting_singleflight, test_postprocess_gate_integration,
-              test_chat_prompt_structure):
+              test_chat_prompt_structure, test_friendly_llm_http_error):
         t()
-    print(f"\n{'='*50}\n共 15 组，失败 {_FAIL} 组")
+    print(f"\n{'='*50}\n共 16 组，失败 {_FAIL} 组")
     sys.exit(1 if _FAIL else 0)
 
 

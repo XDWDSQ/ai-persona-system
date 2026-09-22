@@ -24,6 +24,14 @@ from fastapi.staticfiles import StaticFiles
 # ---- 1) 免密门禁 ----
 server._access_token = lambda: None
 
+# ---- 1.5) 禁止任何真实外部调用 ----
+# 下面的路径重定向发生在 import 之后，模块级路径常量（config/weather/role_news
+# 缓存等）仍指向真实数据，而 lifespan 启动预取会读真实 config：若激活角色开了
+# 角色动态自动刷新，QA 实例一启动就会发真实搜索 + 云端总结请求（烧 token）。
+# QA 实例必须完全离线：统一关闭天气与角色动态的自动刷新/巡检/读时触发。
+server._role_news_auto_refresh = lambda *a, **k: False
+server._weather_enabled = lambda *a, **k: False
+
 # ---- 2) 运行时数据隔离 ----
 _qa_tmp = Path(tempfile.mkdtemp(prefix="qa_persona_"))
 server.SESSIONS_PATH = _qa_tmp / "sessions.json"

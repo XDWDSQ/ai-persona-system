@@ -20,6 +20,11 @@ rem ============================================================
 set "PY=%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe"
 cd /d "%~dp0"
 
+rem Offline mode: TestClient 起的是真实 lifespan，若读真实 config 且激活角色开了
+rem 动态自动刷新，启动预取会真实调用搜索+云端 LLM（烧 token）。统一切断服务端
+rem 主动外部调用（用户显式发起的对话/TTS 链路本来就不被离线测试触达）。
+set "AI_DISABLE_EXTERNAL=1"
+
 if not exist "%PY%" (
     echo [ERROR] python not found: %PY%
     exit /b 1

@@ -13,6 +13,8 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import os as _os
+_os.environ.setdefault("AI_DISABLE_EXTERNAL", "1")  # 直跑本文件也切断后台外部请求（烧 token）
 import server  # noqa: E402
 _FAIL = 0
 def check(name: str, cond: bool, detail: str = ""):

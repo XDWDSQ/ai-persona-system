@@ -3,10 +3,16 @@
 直接运行方式相同的最小隔离：路径重定向到临时目录 + 关闭访问门禁），
 保证 `pytest test_config_api.py test_search.py` 也能收集执行。"""
 import json
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# 必须在 import server 之前：TestClient 起真实 lifespan，离线模式切断天气/角色
+# 动态的启动预取与巡检，防止跑测试时真实调用外部搜索/云端 LLM（烧 token）。
+# 直跑模式（python test_xxx.py，run_tests.bat）由同名环境变量覆盖。
+os.environ.setdefault("AI_DISABLE_EXTERNAL", "1")
 
 import pytest
 from fastapi.testclient import TestClient

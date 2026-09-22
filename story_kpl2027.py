@@ -43,6 +43,23 @@ OTHER_POOL = ["济南RW侠", "西安WE", "上海RNG.M", "上海EDG.M", "南京He
 ANCHOR_REAL = date(2026, 8, 8)
 ANCHOR_VIRTUAL = date(2026, 8, 8)
 
+# 剧情时间边界（_day_guide / story_context / day_info 多处日期判断的唯一真源，
+# 避免硬编码日期散落各处改一处漏一处）：
+DATE_JOIN = date(2026, 12, 20)    # 岚风官宣加入 AG（此前只有隔空 ID 交集）
+DATE_CAMP = date(2027, 1, 5)      # 冬训集结、五人组首次见面（暗恋起点）
+DATE_SEASON_START = date(2027, 1, 14)  # 春季赛开赛（铺垫期结束）
+DATE_ANNUAL_FINAL = date(2027, 11, 7)  # 年度总决赛日（赛季完结判定）
+DATE_SEASON_END = date(2027, 12, 31)
+
+# 情感阶段名与一句话简述（注入文本与前端 payload 共用，散落拷贝已收敛到此）：
+STAGE_NAMES = ("暗恋隐忍", "相爱相杀", "暧昧升温", "在一起")
+STAGE_SHORT = (
+    "暗恋隐忍（不敢直视、别扭照顾）",
+    "相爱相杀（场上争、场下护）",
+    "暧昧升温（藏不住的偏袒）",
+    "在一起（明牌偏爱）",
+)
+
 # 赛段定义（参照 KPL 2025/2026 真实赛制外推 2027）
 STAGES = [
     {"key": "spring_r1",  "name": "春季赛常规赛第一轮", "start": "2027-01-14", "end": "2027-02-01", "bo": "BO5", "type": "regular"},
@@ -433,7 +450,7 @@ class StoryManager:
             d = _d(ds)
         except ValueError:
             return False
-        if not (ANCHOR_VIRTUAL <= d <= date(2027, 12, 31)):
+        if not (ANCHOR_VIRTUAL <= d <= DATE_SEASON_END):
             return False
         with self._lock:
             self.state["mode"] = "override"
@@ -608,7 +625,7 @@ class StoryManager:
             st["log"].append({"date": _s(self.current_date()), "event": "stage_3",
                               "detail": "情感阶段 → 在一起：岚风把大帅攻略了。"})
         # 赛季完结
-        if self.current_date() > date(2027, 11, 7):
+        if self.current_date() > DATE_ANNUAL_FINAL:
             flags["season_end"] = True
 
     # ---- 今日信息 ----
@@ -649,7 +666,7 @@ class StoryManager:
             "weekday": "一二三四五六日"[d.weekday()],
             "mode": self.state["mode"],
             "stage_key": st["key"] if st else "",
-            "stage_name": st["name"] if st else ("铺垫期" if d < _d("2027-01-14") else "赛季外"),
+            "stage_name": st["name"] if st else ("铺垫期" if d < DATE_SEASON_START else "赛季外"),
             "kind": kind,
             "title": title,
             "event": e,
@@ -665,7 +682,8 @@ class StoryManager:
         """今日剧情指引：按虚拟日期/赛段给出详细可演剧情（模型必读，前端引导卡同步展示）。
         演什么由岚风定，以下只是今日可演的选项与背景。"""
         stage = info["stage"]
-        if d < _d("2026-12-20"):
+        stage_short = STAGE_SHORT[stage]
+        if d < DATE_JOIN:
             return (
                 "铺垫期：岚风还不是 AG 队员，只是巅峰赛/高分段排位里风头正盛的路人王「岚风」。"
                 "今日可演：①巅峰赛撞车大帅的小号——他认得出这个 ID，嘴上不承认；"
@@ -673,9 +691,9 @@ class StoryManager:
                 "大帅状态：知道岚风的 ID、看过他的操作，装作不在意（\"路人王罢了\"）。"
                 "这段时期你们只有隔空交集，线下素未谋面。"
             )
-        if d < _d("2027-01-05"):
+        if d < DATE_CAMP:
             return (
-                "官宣入队期（官宣第 " + str((d - _d("2026-12-20")).days + 1) + " 天）。背景（已发生）："
+                "官宣入队期（官宣第 " + str((d - DATE_JOIN).days + 1) + " 天）。背景（已发生）："
                 "一诺退役后 AG 试训一批人都没定，岚风试训完当场拍板——急缺人仓促签下，"
                 "官宣当天就进队，被安排坐在一诺的旧工位（训练室正中偏右：左边长生、右边大帅，"
                 "桌上还留着一诺的铭牌和外设痕迹）。"
@@ -684,9 +702,9 @@ class StoryManager:
                 "③和队里任何人互动——大帅认得他的 ID，嘴上不会承认，目光躲闪。"
                 "大帅状态：还没和岚风线下说过话，暗恋尚未开始，只有对这个 ID 有点好奇。"
             )
-        if d < _d("2027-01-14"):
+        if d < DATE_SEASON_START:
             return (
-                "冬训集结期（第 " + str((d - _d("2027-01-05")).days + 1) + " 天）：五人组第一次全员到齐合练。"
+                "冬训集结期（第 " + str((d - DATE_CAMP).days + 1) + " 天）：五人组第一次全员到齐合练。"
                 "今日可演：①首次合练/训练赛——游戏理解分歧初现（岚风凶悍激进，大帅沉稳求稳），"
                 "大帅第一次在游戏里和他较劲；②基地日常（食堂/健身房/深夜加练）；"
                 "③指挥权话题：教练组还在观察，谁都没拍板。"
@@ -707,24 +725,24 @@ class StoryManager:
                 f"比赛日：AG 对阵 {m.get('opponent','?')}（{m.get('bo','BO5')}·{m.get('label','')}）。"
                 "今日可演：赛前准备/BP 讨论/上场/赛后复盘/更衣室气氛，节奏由岚风带。"
                 + tail
-                + "。大帅情感阶段：" + ["暗恋隐忍（不敢直视、别扭照顾）", "相爱相杀（场上争、场下护）", "暧昧升温（藏不住的偏袒）", "在一起（明牌偏爱）"][stage]
+                + "。大帅情感阶段：" + stage_short
             )
         if info["kind"] == "train":
             return (
                 "训练日：今日安排由岚风带节奏——训练赛/复盘/加练/直播/和队友的日常都可以演。"
-                "大帅情感阶段：" + ["暗恋隐忍（不敢直视、别扭照顾）", "相爱相杀（场上争、场下护）", "暧昧升温（藏不住的偏袒）", "在一起（明牌偏爱）"][stage]
+                "大帅情感阶段：" + stage_short
             )
         if info["kind"] == "off":
             return (
                 "休赛/自由日：可以演休息、直播、出去玩、品牌活动，或和队友的日常。"
-                "大帅情感阶段：" + ["暗恋隐忍（不敢直视、别扭照顾）", "相爱相杀（场上争、场下护）", "暧昧升温（藏不住的偏袒）", "在一起（明牌偏爱）"][stage]
+                "大帅情感阶段：" + stage_short
             )
         # 事件日（团综/品牌/颁奖等）
         ev = info["event"] or {}
         return (
             "事件日：" + (ev.get("desc") or ev.get("title") or "今天有安排")
             + "。镜头前的大帅比训练室拘谨；现场氛围、互动节奏由岚风带。"
-            + "大帅情感阶段：" + ["暗恋隐忍（不敢直视、别扭照顾）", "相爱相杀（场上争、场下护）", "暧昧升温（藏不住的偏袒）", "在一起（明牌偏爱）"][stage]
+            + "大帅情感阶段：" + stage_short
         )
 
     def story_context(self, today: date | None = None) -> str:
@@ -732,15 +750,15 @@ class StoryManager:
         d = _d(info["virtual_date"])
         rec = info["record"]
         flags = info["flags"]
-        # 铺垫期/官宣后未见面（< 2027-01-05 冬训集结首次见面）与见面后的情感引导不同
-        if d < _d("2026-12-20"):
+        # 铺垫期/官宣后未见面（DATE_CAMP 冬训集结首次见面）与见面后的情感引导不同
+        if d < DATE_JOIN:
             guide = (
                 "【你的情感状态：还没见过面】岚风目前只是巅峰赛/高分段排位里一个风头很盛的路人王 ID，"
                 "你撞车过他的对局，操作确实亮眼，你嘴上不承认，但默默记住了这个 ID。"
                 "行为准则：①提到他时装作不在意（'路人王罢了'）；②刷到他的操作会多看两遍；"
                 "③不会主动私聊他——你不会承认自己对这个 ID 有点好奇。"
             )
-        elif d < _d("2027-01-05"):
+        elif d < DATE_CAMP:
             guide = (
                 "【你的情感状态：还没正式说过话】岚风已官宣入队，官宣当天就进了基地，"
                 "坐在一诺的旧工位（左边长生、右边大帅），你和他同处一个训练室但还没正式说过话。"
@@ -757,7 +775,7 @@ class StoryManager:
             f"虚拟日期：{info['virtual_date']}（星期{info['weekday']}）｜{info['stage_name']}",
             f"今日：{info['title']}",
             f"AG 2027 战绩：{rec['win']} 胜 {rec['loss']} 负（当前连胜 {rec['streak']}）",
-            f"{cmd}｜情感阶段：{info['stage']}（{['暗恋隐忍','相爱相杀','暧昧升温','在一起'][info['stage']]}）",
+            f"{cmd}｜情感阶段：{info['stage']}（{STAGE_NAMES[info['stage']]}）",
         ]
         if info["next_match"]:
             lines.append(f"下一场比赛：{info['next_match']['date']} vs {info['next_match']['opponent']}（{info['next_match']['bo']}）")
@@ -767,10 +785,10 @@ class StoryManager:
             "ID「岚风」，发育路（射手），打法凶悍激进。2026 年底来 AG 试训，表现极佳直接进队，"
             "接替退役的一诺。"
             + ("当前：岚风还没入队，你只在巅峰赛/高分段排位里见过他的 ID 和操作，线下素未谋面。"
-               if d < _d("2026-12-20")
+               if d < DATE_JOIN
                else ("当前：岚风已官宣入队、官宣当天就进队报到，正坐在一诺的旧工位（左边长生、右边大帅），"
                      "你们还没正式说过话。"
-                     if d < _d("2027-01-05") else ""))
+                     if d < DATE_CAMP else ""))
         )
         lines.append("")
         lines.append(guide)
@@ -793,8 +811,8 @@ class StoryManager:
             "today": {"kind": info["kind"], "title": info["title"],
                       "event": info["event"], "match": info["match"]},
             "record": info["record"],
-            "stage": info["stage"],
-            "stage_names": ["暗恋隐忍", "相爱相杀", "暧昧升温", "在一起"],
+            "stage": self.state["stage"],
+            "stage_names": list(STAGE_NAMES),
             "flags": info["flags"],
             "next_match": info["next_match"],
             "guide": self._day_guide(info, _d(info["virtual_date"])),

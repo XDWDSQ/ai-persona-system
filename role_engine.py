@@ -27,6 +27,11 @@ from pathlib import Path
 
 _log = logging.getLogger("role_engine")
 
+# 剧情节点 flag 枚举的唯一真源：对话后处理标注器（PostProcessor）、剧情 LLM
+# 识别器、剧情 API 的校验全部引用它。第八轮前枚举值在 3 处各写一份，新增
+# flag 时极易改一处漏两处导致识别结果被静默丢弃。
+STORY_FLAGS = ("command_win", "confession")
+
 # ---------------------------------------------------------------- 常量 --------
 DEFAULT_STATE = {
     "version": 1,
@@ -843,7 +848,7 @@ class PostProcessor:
             sr = {"win": sr["win"], "score": str(sr.get("score") or ""),
                   "mvp": str(sr.get("mvp") or "")}
         sf = data.get("story_flag")
-        if sf not in ("command_win", "confession"):
+        if sf not in STORY_FLAGS:
             sf = None
         return {
             "emotion": {"valence": valence, "arousal": arousal},
