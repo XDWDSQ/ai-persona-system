@@ -60,7 +60,8 @@
   "role_engine": {
     "enabled": true,
     "memory_limit": 200,
-    "top_k": 5
+    "top_k": 5,
+    "postproc_gate": true
   },
   "location": {
     "enabled": true,

@@ -103,7 +103,7 @@ def test_cloud_keep_last_full():
 
 
 if __name__ == "__main__":
-    for fn in (test_no_exception_on_malformed, test_good_entries_survived,
+    for fn in (test_no_exception_on_malformed, test_good_entries_survive,
                test_semantics_unchanged, test_cloud_keep_last_full):
         print(f"\n--- {fn.__name__} ---")
         fn()

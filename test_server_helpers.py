@@ -312,14 +312,143 @@ def test_greeting_singleflight():
         server._greeting_inflight.clear()
 
 
+def test_postprocess_gate_integration():
+    """端到端：琐碎轮跳过标注 LLM 但亲密度照涨；信号轮照常调用。"""
+    import asyncio
+    import tempfile
+    from pathlib import Path
+    import role_engine
+
+    orig_load = server.load_config
+    orig_stores = server._get_role_stores
+    orig_pp = server._get_post_processor
+    cfg = {"active_role": "tg", "role_engine": {"postproc_gate": True}}
+    server.load_config = lambda with_env=True: cfg
+    td = Path(tempfile.mkdtemp(prefix="gate_test_"))
+    mem = role_engine.MemoryStore(td, "tg")
+    st = role_engine.StateStore(td, "tg")
+    server._get_role_stores = lambda role: (mem, st)
+    calls = {"n": 0}
+
+    class FakePP:
+        async def run(self, *a, **k):
+            calls["n"] += 1
+            return {"emotion": {"valence": 0.5, "arousal": 0.4}, "energy_delta": 0.0,
+                    "memories": [], "story_result": None, "story_flag": None}
+
+    server._get_post_processor = lambda: FakePP()
+    try:
+        async def _run():
+            await server._post_process_chat("tg", "嗯嗯", "好嘞老公，知道啦")
+        asyncio.run(_run())
+        check("琐碎轮：标注 LLM 零调用", calls["n"] == 0, f"calls={calls['n']}")
+        state = st.get_decayed()
+        check("琐碎轮：亲密度仍 +0.01 微涨", abs(state["intimacy"] - 0.31) < 0.005,
+              f"intimacy={state['intimacy']}")
+        check("琐碎轮：未凭空写记忆", mem.count() == 0, f"count={mem.count()}")
+
+        async def _run2():
+            await server._post_process_chat("tg", "我喜欢你", "我也喜欢你老公")
+        asyncio.run(_run2())
+        check("信号轮：标注 LLM 正常调用", calls["n"] == 1, f"calls={calls['n']}")
+
+        # 配置开关关闭时一律走 LLM（回退旧行为）
+        cfg["role_engine"]["postproc_gate"] = False
+        async def _run3():
+            await server._post_process_chat("tg", "嗯嗯", "好嘞老公，知道啦")
+        asyncio.run(_run3())
+        check("postproc_gate=false 时不节流", calls["n"] == 2, f"calls={calls['n']}")
+    finally:
+        server.load_config = orig_load
+        server._get_role_stores = orig_stores
+        server._get_post_processor = orig_pp
+
+
+def test_chat_prompt_structure():
+    """真实 /api/chat 走查：稳定约定在动态事实之前；时间指令收尾；
+    新闻/位置事实全文只出现一次（旧版中段、尾部各一遍）。"""
+    import tempfile
+    from datetime import datetime
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    import role_engine
+
+    orig_load = server.load_config
+    orig_chat = server.llm_chat
+    orig_token = server._access_token
+    orig_stores = server._get_role_stores
+    orig_news = server._role_news_text
+    orig_weather = server._weather_text
+    orig_city = server._location_city
+    orig_spawn = server._spawn_bg
+    cfg = {
+        "provider": "cloud", "active_role": "tp", "persona": "测试人设固定内容XYZ",
+        "cloud": {"base_url": "http://fake/v1", "model": "fake"},
+        "roles": {"tp": {"name": "小测", "persona": "测试人设固定内容XYZ"}},
+        "voice": {}, "search": {"enabled": False},
+        "role_engine": {"enabled": True, "top_k": 5},
+    }
+    td = Path(tempfile.mkdtemp(prefix="prompt_struct_"))
+    mem = role_engine.MemoryStore(td, "tp")
+    st = role_engine.StateStore(td, "tp")
+    mem.add("用户喜欢被哄睡", 0.8)
+    captured = {}
+
+    async def fake_chat(messages, temperature=0.8, max_tokens=768, model=None,
+                        disable_thinking=False, thinking=None, anti_repeat=False, cfg=None):
+        captured["sys"] = messages[0]["content"]
+        return "[style:自然]好的老公，我在基地呢"
+
+    server.load_config = lambda with_env=True: cfg
+    server.llm_chat = fake_chat
+    server._access_token = lambda: None
+    server._get_role_stores = lambda role: (mem, st)
+    server._role_news_text = lambda: "大帅昨天抵达上海备战秋季赛动态全文ABC"
+    server._weather_text = lambda: ""
+    server._location_city = lambda: "成都市高新区"
+    server._spawn_bg = lambda coro: coro.close()  # 丢掉后台后处理，避免无意义调用
+    try:
+        with TestClient(server.app) as client:
+            r = client.post("/api/chat", json={"message": "在干嘛", "history": []})
+            check("/api/chat 200", r.status_code == 200, f"{r.status_code} {r.text[:120]}")
+        s = captured.get("sys", "")
+        check("抓到了 system prompt", bool(s))
+        check("动态全文只出现 1 次（旧版 2 次）",
+              s.count("大帅昨天抵达上海备战秋季赛动态全文ABC") == 1,
+              f"count={s.count('大帅昨天抵达上海备战秋季赛动态全文ABC')}")
+        check("位置事实只出现 1 次（旧版 2 次）", s.count("成都市高新区") == 1,
+              f"count={s.count('成都市高新区')}")
+        today = datetime.now().strftime("%Y-%m-%d")
+        check("日期只出现 1 次（旧版 2 次）", s.count(today) == 1, f"count={s.count(today)}")
+        i_meta = s.find("【禁止元话语】")
+        i_ctx = s.find("【此刻上下文】")
+        i_time = s.find("【当前真实时间】")
+        i_news = s.find("【你的现实动态】")
+        check("稳定约定在上下文块之前（前缀缓存友好）", 0 < i_meta < i_ctx, f"{i_meta} {i_ctx}")
+        check("现实动态层在尾部引用指令之前", 0 < i_news < s.find("【你最近的现实动态】"))
+        check("时间指令在最尾部（注意力最高）", i_time > i_ctx and i_time > i_news,
+              f"{i_time} {i_ctx} {i_news}")
+        check("尾部时间指令为引用式", "【此刻上下文】" in s[i_time:])
+    finally:
+        server.load_config = orig_load
+        server.llm_chat = orig_chat
+        server._access_token = orig_token
+        server._get_role_stores = orig_stores
+        server._role_news_text = orig_news
+        server._weather_text = orig_weather
+        server._location_city = orig_city
+        server._spawn_bg = orig_spawn
+
+
 def main():
     for t in (test_clean_history, test_degenerate_reply, test_too_similar_to_last,
               test_story_regex_detect, test_time_hint, test_retry_guard,
               test_login_rate_limit, test_fix_addressing, test_obedience_core,
               test_hint_dedup, test_postproc_gate, test_usage_recorder,
-              test_greeting_singleflight):
+              test_greeting_singleflight, test_postprocess_gate_integration,
+              test_chat_prompt_structure):
         t()
-    print(f"\n{'='*50}\n共 13 组，失败 {_FAIL} 组")
+    print(f"\n{'='*50}\n共 15 组，失败 {_FAIL} 组")
     sys.exit(1 if _FAIL else 0)
 
 

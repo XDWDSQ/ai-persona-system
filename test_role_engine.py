@@ -74,6 +74,39 @@ def test_search_mutual_exclusion():
     check("检索互斥：同义改写记忆只返回一条", sum("双排" in t for t in texts) == 1, str(texts))
 
 
+def test_search_idf_ranking():
+    """IDF 加权：命中专有词的低重要度记忆，要排过只含常见词的高重要度记忆；
+    且零相关的记忆不再作为填充混进 top_k（旧实现会混入）。"""
+    mem, _ = fresh_stores()
+    mem.add("今天老公和我们一起吃饭聊天很开心", 0.9)        # 全是常见词、重要度高
+    mem.add("老公说总决赛想让你去现场举灯牌应援", 0.2)       # 专有事件词
+    top = mem.search("总决赛灯牌", top_k=5)
+    check("专有词记忆排第一", len(top) >= 1 and "灯牌" in top[0]["text"],
+          str([m["text"] for m in top]))
+    check("零相关的常见词记忆不再填充（top 里只有 1 条）", len(top) == 1,
+          str([m["text"] for m in top]))
+
+
+def test_search_no_irrelevant_filler():
+    """查询与全部记忆都无关时返回空（旧实现靠 importance+新鲜度凑分，
+    会把无关记忆注入 system prompt，白占 top_k 槽位与 token）。"""
+    mem, _ = fresh_stores()
+    mem.add("用户最爱吃重庆火锅配冰粉", 0.95)
+    mem.add("队友长生养了一只橘猫叫年糕", 0.9)
+    top = mem.search("明天季后赛几点开打", top_k=5)
+    texts = [m["text"] for m in top]
+    check("全无关查询返回空列表", top == [], str(texts))
+
+
+def test_search_terms_helper():
+    """词元切分：中文二元组 + 英文小写词（旧的整段贪婪成词几乎永不跨句命中）。"""
+    t = MemoryStore._terms
+    terms = t("老公在练YangYuhuan玉环")
+    check("英文按词小写切分", "yangyuhuan" in terms, str(terms))
+    check("中文按二元组切分", "玉环" in terms and "老公" in terms, str(terms))
+    check("单字中文不丢", "爱" in t("爱"), str(t("爱")))
+
+
 def test_memory_cap():
     mem, _ = fresh_stores()
     for i in range(220):
@@ -299,6 +332,9 @@ def main():
         test_memory_dedup,
         test_memory_search_ranking,
         test_search_mutual_exclusion,
+        test_search_idf_ranking,
+        test_search_no_irrelevant_filler,
+        test_search_terms_helper,
         test_memory_cap,
         test_memory_corrupt_reset,
         test_memory_concurrent_add,
