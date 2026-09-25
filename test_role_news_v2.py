@@ -9,10 +9,14 @@ import os
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 
 # 让测试可独立导入 server.py 内的纯函数（不启动 FastAPI）
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# 与其它会 import server 的套件一致：离线模式切断启动期的天气/角色动态外部调用。
+os.environ.setdefault("AI_DISABLE_EXTERNAL", "1")
 
 import importlib.util
 
@@ -124,16 +128,29 @@ PASS = 0
 FAIL = 0
 
 def check(name: str, cond: bool, detail: str = ""):
+    """报告一条断言。
+
+    标记一律用 ASCII 的 [PASS]/[FAIL]，与其余 20 个套件一致。这套件曾用 `✓`/`✗`：
+    这两个字符 GBK 编不出，而 stdout 一旦被管道/重定向（CI、日志、`| findstr`、
+    本仓库的 run_tests.bat 包装）就会按 locale=GBK 编码，于是 print 抛
+    UnicodeEncodeError —— 它在第 1 组断言处被 `except Exception` 吞掉，又在失败分支
+    再打一次 `✗` 直接崩掉进程。结果是：整条测试门变红且指向"环境编码问题"，
+    而第 2~8 组断言**从未执行**（产品缺陷被编码故障掩盖）。
+
+    另外**先打印再计数**：旧实现先加计数后打印，打印本身抛错时就会出现
+    "计数 +1 但一条都没输出"的错位，极难诊断。
+    """
     global PASS, FAIL
     if cond:
+        print(f"  [PASS] {name}")
         PASS += 1
-        print(f"  ✓ {name}")
     else:
+        print(f"  [FAIL] {name} {detail}")
         FAIL += 1
-        print(f"  ✗ {name} {detail}")
 
 
 def main():
+    global FAIL  # 末尾的"断言数下限"判定需要自增失败计数
     print("== 角色现实动态 v2 离线测试 ==")
     try:
         mod = _load_real_functions()
@@ -141,6 +158,13 @@ def main():
     except Exception as exc:
         print(f"import server 失败（可能缺依赖）：{exc}")
         mod = _load_functions()
+
+    # 断言数下限：本套件每组都用 hasattr(mod, ...) 守卫，函数一旦被改名/搬走
+    # （本项目正有 server.py 模块化计划），就会**零断言"通过"、门保持全绿** ——
+    # 这比编码崩溃更隐蔽。这里硬性要求实跑数达标，否则判失败。
+    # 真实模块能跑满 23 条；走 exec 提取的降级路径拿不到 ModuleType，第 8 组
+    # （_load_role_news 的 isinstance 守卫）会少 3 条，故下限 20。
+    _min_checks = 23 if isinstance(mod, types.ModuleType) else 20
 
     now = time.time()
     facts = {
@@ -226,7 +250,6 @@ def main():
 
     print("\n--- 8) v1→v2 缓存升级 _load_role_news ---")
     if hasattr(mod, "_load_role_news"):
-        import types
         if isinstance(mod, types.ModuleType):
             tmpdir = Path(tempfile.mkdtemp())
             v1 = {"version": 1, "role": "大帅", "keyword": "kw", "text": "旧版摘要内容", "ts": now - 100}
@@ -246,7 +269,12 @@ def main():
         else:
             print("  - 跳过（非模块）")
 
-    print(f"\n== 结果：{PASS} 通过 / {FAIL} 失败 ==")
+    if PASS + FAIL < _min_checks:
+        FAIL += 1
+        print(f"  [FAIL] 实跑断言数 {PASS + FAIL} 低于预期下限 {_min_checks}"
+              f"（被测函数被改名/搬走时 hasattr 守卫会静默跳过，而门仍是绿的）")
+
+    print(f"\n== 结果：{PASS} 通过 / {FAIL} 失败（下限 {_min_checks}）==")
     sys.exit(1 if FAIL else 0)
 
 

@@ -2,12 +2,27 @@
 """人设 / 提示词 / 剧情注入质量回归（2026-09 第八轮「内容质量」专场）。
 
 运行：python test_prompt_quality.py
-与功能测试不同，本套件锁定的是「内容资产的质量契约」，防的是：
-  - 已修正的错别字/事实错误回流（暖昧、杭州亚运）
-  - 核心履历锚点被手抖删掉（角色会"失忆"）
-  - 互相打架的指令回流（只能叫老公 vs 要求换花样）
-  - chat/greeting 提示词注入顺序漂移（事实在前、时间收尾）
-  - 剧情阶段简述/日期边界常量被改散
+
+本套件混着两类**性质完全不同**的检查，第十轮把它们显式分开：
+
+1. 代码契约（默认必跑、必须绿）：提示词注入顺序、剧情阶段/日期常量、
+   flag 枚举单一真源、标注器按角色裁剪与分桶。这些是代码，回归即缺陷。
+
+2. 人设内容资产契约（**默认不跑**，见下）：错别字/事实错误回流、履历锚点被删、
+   称呼规则自相矛盾。
+
+第 2 类为什么默认不跑：它断言的对象是 `config.json` 里的大帅人设，而那是
+**用户可编辑的私有内容**，且刻意不在仓库里（config.example.json 只有一个占位角色，
+真实人设从不入库）。把这套契约做成默认必过项时，用户在设置页调一次人设就会让整条
+测试门变红 —— 那是把"用户改了内容"误报成"代码回归"，而真正的红灯会被稀释。
+
+所以它是一个**人设 lint**，按需触发：
+
+    set PERSONA_CONTRACT=1 && run_tests.bat
+    REM 或直接（此时会额外跑人设契约）
+    set PERSONA_CONTRACT=1 && venv\\Scripts\\python test_prompt_quality.py
+
+默认情况下它明确报 [SKIP] 并单独计数（不混进 PASS、不伪装绿灯）。
 """
 import asyncio
 import json
@@ -23,6 +38,10 @@ import server  # noqa: E402
 import story_kpl2027 as story  # noqa: E402
 
 _FAIL = 0
+_SKIP = 0
+
+# 人设内容资产契约默认关闭（原因见文件头）。显式设 PERSONA_CONTRACT=1 才跑。
+_PERSONA_CONTRACT = os.environ.get("PERSONA_CONTRACT") == "1"
 
 
 def check(name: str, cond: bool, detail: str = ""):
@@ -32,18 +51,38 @@ def check(name: str, cond: bool, detail: str = ""):
     print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f"  <- {detail}" if detail and not cond else ""))
 
 
+def skip(name: str, why: str = ""):
+    """明确报告一次"没跑"并单独计数 —— 不混进 PASS，避免静默假绿灯。"""
+    global _SKIP
+    _SKIP += 1
+    print(f"[SKIP] {name}" + (f"  <- {why}" if why else ""))
+
+
 ROOT = Path(__file__).resolve().parent
 
 
-def _load_real_config() -> dict:
-    return json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+def _role_persona(role: str) -> str:
+    """读 config.json 里指定角色的 persona；缺失时**显式判失败**并返回空串。
+
+    旧实现直接 `cfg["roles"][role]["persona"]`：角色被删/改名就抛 KeyError 中断
+    整个套件，报出来的错与真实原因（人设没了）毫不相干。"""
+    try:
+        cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        check(f"config.json 可读（{role}）", False, repr(exc))
+        return ""
+    p = ((cfg.get("roles") or {}).get(role) or {}).get("persona") or ""
+    check(f"角色 {role} 的 persona 存在", bool(p),
+          f"config.json 里 roles.{role}.persona 为空或该角色不存在")
+    return p
 
 
 # ------------------------------------------------------------ 大帅人设质量
 def test_dashuai_persona_quality():
-    cfg = _load_real_config()
-    p = cfg["roles"]["dashuai"]["persona"]
-    check("大帅人设存在且长度合理（1000~4500 字，防误删/防灌水）",
+    p = _role_persona("dashuai")
+    if not p:
+        return  # 人设缺失已由 _role_persona 显式判失败，别再往下断言
+    check("大帅人设长度合理（1000~4500 字，防误删/防灌水）",
           1000 <= len(p) <= 4500, f"len={len(p)}")
 
     # —— 已修正的错别字/事实错误不得回流 ——
@@ -84,10 +123,11 @@ def test_dashuai_persona_quality():
 
 
 def test_xiaoni_persona_basic():
-    cfg = _load_real_config()
-    p = cfg["roles"]["xiaoni"]["persona"]
-    check("小拟人设存在且为好友向（不含恋人称呼）",
-          bool(p) and "老公" not in p and "好朋友" in p)
+    p = _role_persona("xiaoni")
+    if not p:
+        return  # 人设缺失已由 _role_persona 显式判失败
+    check("小拟人设为好友向（不含恋人称呼）",
+          "老公" not in p and "好朋友" in p)
 
 
 # ------------------------------------------------------------ 提示词注入顺序契约
@@ -243,17 +283,20 @@ def test_postprocessor_prompt_role_aware():
 
 
 def test_postprocessor_factory_buckets_by_role():
-    # 当前激活角色（dashuai，非剧情）→ 普通标注器
-    if server._story_role():
-        return  # 测试环境恰好是剧情角色时跳过此分支（下面手动覆盖两个方向）
-    pp = server._get_post_processor()
-    check("当前非剧情角色的标注器不含岚风", "岚风" not in pp.system)
+    """按「是否剧情角色」分桶的标注器工厂。
 
+    旧实现在"当前激活角色恰好是剧情角色"时直接 `return` —— 静默跳过断言而门保持
+    全绿（假绿灯）。这里改为**显式**把两个方向都跑一遍，不再依赖运行环境恰好是哪个角色。
+    """
     orig = server._story_role
     try:
+        server._story_role = lambda: False
+        pp = server._get_post_processor()
+        check("非剧情角色的标注器不含岚风", "岚风" not in pp.system)
+
         server._story_role = lambda: True
         pp_story = server._get_post_processor()
-        check("切到剧情角色后标注器含剧情指令", "岚风" in pp_story.system)
+        check("剧情角色的标注器含剧情指令", "岚风" in pp_story.system)
         check("剧情/普通标注器是两个独立实例（运行时切换安全）", pp_story is not pp)
         server._story_role = lambda: False
         check("切回普通角色复用原实例", server._get_post_processor() is pp)
@@ -271,8 +314,15 @@ def test_recognizer_prompt_uses_flag_enum():
 
 
 def main():
-    test_dashuai_persona_quality()
-    test_xiaoni_persona_basic()
+    # 人设"内容资产"契约：默认不跑（原因见文件头）。显式 PERSONA_CONTRACT=1 才跑。
+    if _PERSONA_CONTRACT:
+        test_dashuai_persona_quality()
+        test_xiaoni_persona_basic()
+    else:
+        skip("大帅/小拟人设内容契约",
+             "设 PERSONA_CONTRACT=1 启用（内容属用户可编辑数据，不做默认门）")
+
+    # —— 以下为代码契约，默认必跑 ——
     test_dynamic_hints_assembly_contract()
     test_story_constants_and_guides()
     test_story_day_guide_uses_stage_short()
@@ -280,7 +330,9 @@ def main():
     test_postprocessor_prompt_role_aware()
     test_postprocessor_factory_buckets_by_role()
     test_recognizer_prompt_uses_flag_enum()
-    print(f"\n{'=' * 50}\n人设/提示词质量测试完成，失败 {_FAIL} 项")
+
+    _tail = f"，跳过 {_SKIP} 组" if _SKIP else ""
+    print(f"\n{'=' * 50}\n提示词质量测试完成，失败 {_FAIL} 项{_tail}")
     sys.exit(1 if _FAIL else 0)
 
 

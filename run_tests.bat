@@ -28,6 +28,16 @@ REM  "'matically.' is not recognized as an internal or external command",
 REM  the file lost its CRLF line endings. cmd.exe requires CRLF in .bat;
 REM  an LF-only file gets byte-misparsed around multi-byte comments.
 REM  See .gitattributes - never let an editor rewrite these as LF.
+REM
+REM  Why PYTHONIOENCODING is set below (and chcp 65001 is NOT enough):
+REM  chcp only changes the CONSOLE code page. When a suite's stdout is a
+REM  PIPE or is redirected (CI, log file, `| findstr`, this window's own
+REM  capture), CPython picks locale.getpreferredencoding() = the ANSI code
+REM  page (cp936/GBK here), NOT the console code page. Any suite printing a
+REM  character GBK cannot encode (e.g. U+2713 check marks) then dies with
+REM  UnicodeEncodeError - the gate goes red pointing at "an encoding
+REM  problem" while the assertions never ran. Setting PYTHONIOENCODING=utf-8
+REM  covers every child process at once, console or pipe.
 REM ============================================================
 
 cd /d "%~dp0"
@@ -39,6 +49,9 @@ REM external calls; /api/status provider probing degrades to "not
 REM probed" and sends no HTTP at all.
 set "AI_DISABLE_EXTERNAL=1"
 
+REM stdout encoding for every suite below (console OR pipe) - see header.
+set "PYTHONIOENCODING=utf-8"
+
 call "%~dp0_find_python.bat" pytest
 if not defined PYTHON (
     echo [ERROR] no usable python found.
@@ -48,6 +61,12 @@ if not defined PYTHON (
 )
 echo [INFO] python = %PYTHON%
 
+REM  Suites needing real cloud API keys are skipped by name. Discovery is a
+REM  glob, so this is a BLACKLIST: a NEW suite that needs keys will silently
+REM  join the gate (and really hit the network) until it is added here too.
+REM  test_mimo / test_tts do their httpx calls at MODULE level, so pytest
+REM  importing them for collection is already a real request - pytest.ini
+REM  carries matching --ignore entries for those two.
 set "SKIP_LIST=test_mimo test_tts"
 set PASS_COUNT=0
 set FAIL_COUNT=0
