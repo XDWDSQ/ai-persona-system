@@ -1,6 +1,16 @@
 # Android APK（AI 拟人系统手机端）
 
 > ⚠️ **已停止开发（存档）**：手机端统一改用 **PWA 网页版**（浏览器"添加到主屏幕"，体验对齐原生）。本工程仅作历史存档，不再构建更新；`sync_pages.bat` 与 `data/tunnel_url_apk.txt` 已废弃。以下内容保留供参考。
+>
+> **2026-09 第十轮：`app/src/main/assets/pages/` 里的前端副本已删除。**
+> 原因是它已经严重漂移：那是 2026-09-02 前端拆分**之前**的版本（`chat.html` 仍是 262KB
+> 内联单文件、**没有 `css/` 与 `js/` 目录**，`pet.js` 落后一个版本，`story.html` 没有剧情
+> 时间线与赛果弹层），而仓库里从来没有能保证它同步的 `sync_pages.bat`。留着一份"看起来
+> 是前端、其实早就不对"的副本，比没有更危险。
+> **前端真源只有一处**：`xiaoni-ai-persona/pages/`（PWA 直接部署它）。
+> 附带影响：`LocalServer.kt` 的 `serveAsset(out, "pages/chat.html")`、404 页的「返回对话」
+> 链接、`MainActivity.kt` 的 `CHAT_URL` 现在指向不存在的资源 —— 本工程不再构建，故未改动
+> 这部分 Kotlin 代码（如需复活 APK，先补一个真正的前端同步步骤）。
 
 把 AI 拟人系统打包成 Android 应用：**界面内置在 APK 里（秒开、离线可见），数据接口经 APK 内本地代理转发到远程服务器**（电脑上的服务经 ngrok 隧道 / 云电脑部署）。
 
@@ -24,7 +34,7 @@
 
 ```
 android/
-├── app/src/main/assets/    ← 前端静态资源（从 xiaoni-ai-persona 拷贝，勿手改）
+├── app/                    ← 工程骨架（前端副本 assets/pages/ 已于 2026-09 删除，见顶部说明）
 ├── app/src/main/java/com/xiaoni/persona/
 │   ├── MainActivity.kt     WebView 主界面（文件选择、下载、返回键）
 │   ├── SettingsActivity.kt 设置页（地址+口令、测试连接）
@@ -36,15 +46,13 @@ android/
 └── keystore.properties     release 签名配置（不入库）
 ```
 
-## 打包前端更新
+## 打包前端更新（已失效）
 
-改了 `xiaoni-ai-persona/` 前端后，运行同步脚本（xcopy pages → assets，并检测同步盘冲突副本）：
+原先靠 `sync_pages.bat` 把 `xiaoni-ai-persona/pages/` 拷进 `assets/`。**这个脚本仓库里从来没有过**，
+而人手同步早已漏掉整整一轮前端拆分（详见顶部说明），所以本轮直接删掉了 `assets/pages/` 副本。
 
-```bat
-sync_pages.bat
-```
-
-> 前端已精简为 chat.html 单页 + pet.js + pet 素材（原 index/roles/status/architecture 页与 colors_and_type.css 已删除）。
+**不要再手工往回拷。** 手机端请用 PWA（`xiaoni-ai-persona/pages/` 就是唯一真源）；
+真要复活 APK，正确做法是先写一个**构建前强制同步 + 冲突检测**的步骤，而不是再放一份副本进去。
 
 ## 构建 APK
 

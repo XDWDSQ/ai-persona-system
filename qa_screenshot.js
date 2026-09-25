@@ -3,7 +3,8 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 
-const CHROME = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+/* 浏览器路径可配（与 qa_flow.js 同）：CHROME 环境变量优先，换机/换浏览器都无需改代码 */
+const CHROME = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const BASE = 'http://127.0.0.1:8010';
 const OUT = '_qa_shots';
 const PORT = 9300 + Math.floor(Math.random() * 90);

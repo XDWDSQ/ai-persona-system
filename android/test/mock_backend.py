@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """APK 测试用模拟后端：复刻真实服务的核心端点与鉴权行为。
 
-- POST /api/login        校验 token（默认 520TDJ），种 httponly cookie ai_token（30 天）
+- POST /api/login        校验 token（取环境变量 MOCK_TOKEN，缺省占位值），种 httponly cookie ai_token（30 天）
 - 其余 /api/*、/uploads/* 需 cookie，否则 302 → /login（与 server.py 一致）
 - /api/chat              返回固定回复（模拟 LLM）
 - /api/sync/stream       SSE 推送（含 15s ping 保活）
@@ -12,6 +12,7 @@
 """
 import base64
 import json
+import os
 import re
 import struct
 import sys
@@ -21,7 +22,10 @@ import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-TOKEN = "520TDJ"
+# 访问口令：只从环境变量取，缺省用占位值。
+# 这里曾经写死过一个 6 位真实口令，而本仓库是**公开**的（那段历史无法靠改代码撤回，
+# 该口令必须视为已泄露）。今后任何脚本/文档都不要再出现口令字面值。
+TOKEN = (os.getenv("MOCK_TOKEN") or "").strip() or "change-me"
 COOKIE = "ai_token"
 AUTH_FREE = ("/api/health", "/api/login", "/login")
 

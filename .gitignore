@@ -9,6 +9,11 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+# pytest / ruff 的工作目录（pytest.ini 把 cache 与 basetemp 都指到了项目内，
+# 因为 %TEMP%\pytest-of-* 与 .pytest_cache 在本机 ACL 已损坏、不可用）
+.pytest_tmp/
+.pytest_cache/
+.ruff_cache/
 
 # 运行时数据（会话、音频输出、缓存）
 data/
@@ -71,6 +76,9 @@ release/
 *_冲突文件*
 *.bak
 *.bak_*
+# 形如 start.bat_bak / server_old_bak 这类命名：*.bak / *.bak_* 都覆盖不到
+*_bak*
+*_bak
 *.backup
 *.backup-*
 *.old

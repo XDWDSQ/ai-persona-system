@@ -6,10 +6,14 @@
     set HEIC_TEST_SRC=data\\uploads\\att_xxx.jpg
     python ops\\heic_upload_e2e_test.py
 
-安全说明（2026-09 第九轮修正）：
-  本脚本此前把访问口令 "520TDJ" 明文写死并已提交进公共仓库
-  （GitHub XDWDSQ/ai-persona-system，见 cb34f91 / 041da2f）。口令一律改成
-  从环境变量 / config.json 读取；若该口令仍在使用，请在 config.json 里改掉它。
+安全说明（2026-09 第九轮修正，第十轮补）：
+  本脚本此前把一个 6 位访问口令明文写死，并已随提交进入公共仓库
+  （GitHub XDWDSQ/ai-persona-system，见 cb34f91 / 041da2f）。现在口令一律从
+  环境变量 / config.json 读取。
+  第十轮补充：**连注释与文档里的字面值也一并抹掉** —— 第九轮只改了代码，明文口令
+  仍留在本文件与 docs-specs 的优化记录正文里，而那个仓库是公开的，等于没修。
+  那段历史提交无法靠改代码撤回，所以那个口令必须视为已泄露：若它还在任何环境
+  里使用，请立刻轮换（本项目 config.json 当前的 access_token 已不是它）。
 """
 import http.cookiejar
 import io

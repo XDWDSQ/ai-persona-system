@@ -151,13 +151,13 @@ def parse_name(filename: str) -> str:
 def process_one(in_path, name, out_dir, session,
                 target_size=384, target_fps=10, margin=1.05,
                 alpha_lo=0.40, alpha_hi=0.90, feather=0.9,
-                defringe=2, shrink=1, quality=82):
+                defringe=2, shrink=1, quality=82, max_frames=600):
     """单段处理；任何失败返回 None（批量模式不中断其他段）。"""
     try:
         return _process_one_impl(in_path, name, out_dir, session,
                                  target_size, target_fps, margin,
                                  alpha_lo, alpha_hi, feather,
-                                 defringe, shrink, quality)
+                                 defringe, shrink, quality, max_frames)
     except Exception as exc:  # noqa: BLE001
         print(f'  × [{name}] 处理失败: {exc}', flush=True)
         return None
@@ -166,10 +166,14 @@ def process_one(in_path, name, out_dir, session,
 def _process_one_impl(in_path, name, out_dir, session,
                       target_size=384, target_fps=10, margin=1.05,
                       alpha_lo=0.40, alpha_hi=0.90, feather=0.9,
-                      defringe=2, shrink=1, quality=82):
+                      defringe=2, shrink=1, quality=82, max_frames=600):
     print(f'\n[{name}] 读取: {os.path.basename(in_path)}', flush=True)
 
-    # ---- 第一遍：只保留低分辨率 mask（内存 ~0.4MB/帧），算全局 bbox ----
+    # ---- 第一遍：只保留低分辨率 mask，算全局 bbox ----
+    # 注意这里**不是**"内存恒定"：mask_list 随帧数线性增长
+    # （u2net 320² float32 ≈ 0.41MB/帧，isnet 1024² ≈ 4.2MB/帧）。所以用 max_frames
+    # 兜住上限 —— 3 分钟素材按 10fps 就是 1800 帧，isnet 下光 mask 就要 7GB+，
+    # 结果是进程被杀、几分钟推理全白跑（这是个离线加工工具，OOM 只影响你自己，但很气人）。
     container = av.open(in_path)
     try:
         stream = container.streams.video[0]
@@ -186,6 +190,10 @@ def _process_one_impl(in_path, name, out_dir, session,
             mask_list.append(session.mask(frame.to_image().convert('RGB')))
             kept_ts.append(t)
             k += 1
+            if len(mask_list) >= max_frames:
+                print(f'  ! 已达 --max-frames={max_frames}，后面的帧不再抽取'
+                      f'（素材过长；成品会短于源视频，想要更长请显式调大该值）', flush=True)
+                break
             while next_t <= t + 1e-6:
                 next_t += interval
     finally:
@@ -222,7 +230,9 @@ def _process_one_impl(in_path, name, out_dir, session,
     half = int(max(x1 - x0, y1 - y0) // 2 * margin)
     print(f'  全局 bbox=({x0},{y0})-({x1},{y1}) half={half}', flush=True)
 
-    # ---- 第二遍：重解码，逐帧精修 alpha + defringe + 裁切 + 缩放（内存恒定） ----
+    # ---- 第二遍：重解码，逐帧精修 alpha + defringe + 裁切 + 缩放 ----
+    # 同样不是"内存恒定"：pil_frames 把全部成品帧（384² RGBA ≈ 0.59MB/帧）攒在内存里，
+    # 最后一次性交给 PIL 存动图。帧数由上面的 max_frames 兜住。
     pil_frames = []
     container = av.open(in_path)
     try:
@@ -315,6 +325,8 @@ def main():
                     help='边缘去色边强度 0..4（0=关闭；越大白/绿边消化越彻底，过大会糊发丝）')
     ap.add_argument('--shrink', type=int, default=1, help='alpha 蚀刻 px（0=关闭；收最外层半透明杂边）')
     ap.add_argument('--quality', type=int, default=82, help='WebP 质量')
+    ap.add_argument('--max-frames', type=int, default=600,
+                    help='抽帧上限（防长素材把内存吃爆；超出部分不再抽取）')
     args = ap.parse_args()
 
     # 参数范围校验：--fps 0 / --size 0 会除零或崩溃，--margin<1 裁切会越界。
@@ -334,6 +346,7 @@ def main():
     _num(args.shrink, 0, 32, '--shrink')
     _num(args.alpha_lo, 0.0, 1.0, '--alpha-lo')
     _num(args.alpha_hi, 0.0, 1.0, '--alpha-hi')
+    _num(args.max_frames, 1, 20000, '--max-frames')
     if args.alpha_lo >= args.alpha_hi:
         print('--alpha-lo 必须小于 --alpha-hi（否则 alpha 曲线归零，会报"全程没抠到人"）')
         sys.exit(1)
@@ -365,7 +378,8 @@ def main():
                         target_size=args.size, target_fps=args.fps, margin=args.margin,
                         alpha_lo=args.alpha_lo, alpha_hi=args.alpha_hi,
                         feather=args.feather, defringe=args.defringe,
-                        shrink=args.shrink, quality=args.quality)
+                        shrink=args.shrink, quality=args.quality,
+                        max_frames=args.max_frames)
         if r:
             results.append(r)
     print(f'\n=== 完成 {len(results)}/{len(tasks)} ===', flush=True)

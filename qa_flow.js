@@ -4,7 +4,10 @@
 const { execFile } = require('child_process');
 const fs = require('fs');
 const http = require('http');
-const CHROME = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+/* 浏览器路径可配：旧实现硬编码 C:/Program Files/Google/Chrome/...，换一台机器
+   （Chrome 装在用户目录 / 用 agent-browser 自带的 chrome）整条 QA 直接起不来。
+   优先级：CHROME 环境变量 → 常见安装路径。 */
+const CHROME = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const BASE = 'http://127.0.0.1:8010';
 const OUT = '_qa_shots';
 const PORT = 9300 + Math.floor(Math.random() * 90);
@@ -36,7 +39,17 @@ function check(name, cond, detail) {
     const { execSync, spawn } = require('child_process');
     execSync('powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 8010 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }"', { stdio: 'ignore' });
   } catch (e) {}
-  const PY = process.env.USERPROFILE + '/.openvino/venv/t2i-tts/Scripts/python.exe';
+  /* 解释器探测顺序与 _find_python.bat 保持一致：PYTHON 环境变量 → 项目 venv →
+     项目 .venv → PATH 上的 python。旧实现硬编码
+     %USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe（原开发机的本地 TTS 环境），
+     换机后这条 QA 必然起不来，而且报错与真实原因无关。 */
+  const PY = (function () {
+    const cands = [process.env.PYTHON,
+                   __dirname + '/venv/Scripts/python.exe',
+                   __dirname + '/.venv/Scripts/python.exe'];
+    for (const c of cands) { if (c && fs.existsSync(c)) return c; }
+    return 'python';
+  })();
   const srv = spawn(PY, ['qa_run.py'], { cwd: __dirname, stdio: 'ignore' });
   {
     const t0 = Date.now();
