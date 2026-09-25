@@ -131,13 +131,19 @@ def concurrent_session_writes() -> None:
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    n_dev, n_sess = 8, 6
+    # 规模刻意压小、时间戳用"现在"而不是固定老值：8×6=48 条带固定老时间戳的会话
+    # 曾在真实服务上误报（用户自己的会话都更新，一旦总条数逼近 500 上限，被
+    # "按 updatedAt 倒序取前 500"截掉的正好是这些最老的冒烟会话，断言就把
+    # "合并正确"读成了"会话被吞掉"）。本函数要验的是**并发合并语义**（按 id 并集、
+    # 一个都不丢），与"服务端还剩多少空位"无关，规模小一样覆盖同一条锁路径。
+    n_dev, n_sess = 6, 4
+    base_ts = int(time.time() * 1000)
     payloads = []
     for d in range(n_dev):
         payloads.append([{
             "id": f"t-conc{d}-{i}",
             "title": f"并发{d}-{i}",
-            "updatedAt": 1700000000000 + d * 100 + i,
+            "updatedAt": base_ts + d * 100 + i,
             "history": [{"role": "user", "content": f"dev{d} sess{i}"}],
         } for i in range(n_sess)])
 

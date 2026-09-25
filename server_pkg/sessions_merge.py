@@ -4,6 +4,8 @@
 只依赖传入的参数与本模块常量；墓碑淘汰阈值一并迁移，
 调用方（server.py 会话读写路径）行为不变。
 """
+import math
+
 
 # 删除墓碑：某端删掉的会话 id 记入此处（随 sessions.json 的 deleted 字段持久化），
 # 防止另一端旧快照 PUT 时把已删会话"复活"。ts 为毫秒时间戳（与前端 Date.now() 一致）。
@@ -48,6 +50,46 @@ def _sess_updated_at(s: dict) -> float:
         return 0.0
 
 
+def _sess_order_key(s: dict) -> tuple:
+    """会话列表 / 截断的排序键：置顶优先，其次 updatedAt 倒序。
+
+    为什么置顶必须参与：前端列表是**置顶优先**（见 app.js 的 renderSessions
+    `ordered`），而服务端的入站截断与合并截断此前只看 updatedAt —— 于是会话数一旦
+    触及上限，**先被丢掉的恰恰是置顶的那几条**。用户主动置顶的通常正是最在意的
+    会话，却第一批消失，而且没有任何提示。
+
+    两处排序统一改用本键（单一真源），既与前端语义一致，也杜绝第二份实现漂移。
+    调用方一律配 reverse=True。
+    """
+    if not isinstance(s, dict):
+        return (False, 0.0)
+    return (bool(s.get("pinned")), _sess_updated_at(s))
+
+
+def _sanitize_nonfinite(obj):
+    """递归把非有限浮点（inf / -inf / nan）替换为 None，返回新对象。
+
+    为什么必须做：`json.dumps` 默认 `allow_nan=True`，会把 inf/nan 写成 JSON 字面量
+    `Infinity` / `NaN`。这对 Python 的 json.loads 合法（它默认也允许），但 **RFC 8259
+    不允许**，浏览器的 `JSON.parse` / `Response.json()` 直接抛错。
+
+    而 sessions.json 的内容是客户端 PUT 上来、**原样落盘并长期驻留**的，所以只要有一条
+    `1e400`（语法完全合法的 JSON 数字，解析为 inf）或同步盘回滚出带 `Infinity` 的文件，
+    `GET /api/sessions` 的**响应体本身就永久非法** —— 每台设备的多端同步都在 `r.json()`
+    处失败、重试几次后放弃；而服务端 /api/stats、/api/status 一切正常、日志无痕。用户
+    只能手改文件自愈，手机端还改不了。
+
+    只清洗值、不丢弃键，容器结构保持原样（消息下标对齐不被破坏）。
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_nonfinite(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
 def _is_placeholder_session(s: dict) -> bool:
     """空占位会话：无 history、标题仍是前端默认「新对话」、未置顶未改名。
 
@@ -66,7 +108,13 @@ def _is_placeholder_session(s: dict) -> bool:
     return not title or title == "新对话"
 
 
-def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
+# 会话条数上限：超出部分在合并后被截断，且**不会**随下一次 PUT 回来（永久丢失）。
+# 调用方用 stats 出参拿到截断明细并告警/记审计日志（见 server.py 的 PUT /api/sessions）。
+SESSIONS_CAP = 500
+
+
+def _merge_sessions(current: list, incoming: list, tombstones: dict,
+                    stats: dict | None = None) -> list:
     """多端合并：按 id 归并（updatedAt 新者胜，平手取 incoming），再按墓碑过滤。
 
     竞态防御（防止聊天记录被旧快照整段抹掉）：
@@ -84,7 +132,13 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
 
     空占位会话（_is_placeholder_session）不参与结果，存量垃圾随任意一次 PUT 自动清出。
     会话 updatedAt 新于墓碑时间视为"复活"（保留会话并移除墓碑）；
-    返回按 updatedAt 倒序的前 500 条。会就地修改 tombstones（弹出失效项）。"""
+    返回按 updatedAt 倒序的前 500 条。会就地修改 tombstones（弹出失效项）。
+
+    stats：可选的出参字典。传入时写入 {"total": 合并后总数, "kept": 实际返回数,
+    "dropped": 被上限截断的条数}，供调用方在真的丢数据时告警/归档。
+    第九轮加：此前截断到 500 完全是静默的 —— 超出部分的会话从服务端永久消失，
+    用户看不到任何提示，`_backup_sessions_before_destructive` 的">50% 骤降"
+    阈值也兜不住这种渐进式丢失。"""
 
     def _msg_key(m: dict):
         # 消息指纹：role+content+style+附件。同一文本配不同图片/附件
@@ -223,8 +277,15 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
             tombstones.pop(sid, None)
             out.append(s)
         # 其余：最后更新早于删除时间 → 维持删除状态
-    out.sort(key=_sess_updated_at, reverse=True)
-    return out[:500]
+    out.sort(key=_sess_order_key, reverse=True)
+    if stats is not None:
+        stats["total"] = len(out)
+        stats["kept"] = min(len(out), SESSIONS_CAP)
+        stats["dropped"] = max(0, len(out) - SESSIONS_CAP)
+        # 被截掉的 id 一并给出：调用方落审计日志后能回答"是哪几个会话没了"
+        stats["dropped_ids"] = [s.get("id") for s in out[SESSIONS_CAP:SESSIONS_CAP + 50]
+                                if isinstance(s, dict)]
+    return out[:SESSIONS_CAP]
 
 
 def _sessions_msg_count(sessions: list) -> int:

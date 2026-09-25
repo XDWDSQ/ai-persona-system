@@ -35,6 +35,11 @@ import server  # noqa: E402
 import httpx  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 
+# conftest 与各 sandbox 都会把 server._access_token 换成 `lambda: None`（离线用例不必
+# 登录）。需要验证**真实门禁**的用例（第十轮的 fail-closed）必须拿回原函数，而它一旦被
+# 覆盖就无法按名字取回 —— 所以在模块导入期（fixture 生效之前）先留一份引用。
+_REAL_ACCESS_TOKEN = server._access_token
+
 _FAIL = 0
 
 
@@ -549,6 +554,400 @@ def test_access_token_fail_closed():
         server._last_good_token, server.CONFIG_PATH, server.load_config = saved
 
 
+def test_access_token_failsafe_on_degraded_config(client):
+    """第十轮：config.json 是**非法 JSON** 时门禁必须 fail-closed。
+
+    旧行为只兜住了 load_config() **抛异常** 这一种损坏（第九轮）。而最常见的损坏
+    ——非法 JSON / 读不到——走的是 load_config 的**静默降级**分支：它不抛异常，而是
+    return _default_config，而那份默认配置里没有 access_token 键。于是
+    _access_token() 返回 None → access_gate 判定"用户没配口令"→ **全放行**，
+    而且日志里一个字都没有。触发条件在本项目非常现实：跑在移动云盘同步盘上，
+    config.json 很容易被同步客户端截成半截。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="degraded_cfg_"))
+    saved_path = server.CONFIG_PATH
+    saved_tok = server._last_good_token
+    saved_ok = server._cfg_load_ok
+    saved_fn = server._access_token
+    saved_cfg_cache = dict(server._cfg_cache)
+    saved_stat_cache = dict(server._cfg_stat_cache)
+    saved_env = os.environ.pop("ACCESS_TOKEN", None)
+    try:
+        server.CONFIG_PATH = tmp / "config.json"
+        # 半截 JSON：编辑器写坏 / 云盘同步截断的典型形态
+        server.CONFIG_PATH.write_text('{"provider": "cloud", "roles": {', encoding="utf-8")
+        server._cfg_cache.update(_mtime_ns=0, _value={})
+        server._cfg_stat_cache.update(mtime_ns=0, checked_at_ns=0)
+        server._last_good_token = "known-token-abc"
+        server._cfg_load_ok = True
+
+        cfg = server.load_config()
+        check("非法 JSON 时 load_config 不抛异常（走的是降级分支）",
+              isinstance(cfg, dict), repr(cfg)[:80])
+        check("降级返回的默认配置里没有 access_token（这正是漏洞成因）",
+              not (cfg.get("access_token") or ""), str(sorted(cfg)[:6]))
+        check("降级已被标记（_cfg_load_ok=False）",
+              server._cfg_load_ok is False, repr(server._cfg_load_ok))
+
+        got = server._access_token()
+        check("口令 fail-closed：延续上一次生效口令，不放行匿名",
+              got == "known-token-abc", repr(got))
+
+        # 端点层：恢复真实门禁 —— 未带凭据必须 401（旧实现这里会 200 全放行）
+        server._access_token = _REAL_ACCESS_TOKEN
+        r = client.get("/api/sessions")
+        check("配置损坏时 /api/sessions 必须 401（旧实现 200 全放行）",
+              r.status_code == 401, f"status={r.status_code} body={r.text[:120]}")
+        r2 = client.get("/api/sessions", headers={"Authorization": "Bearer known-token-abc"})
+        check("fail-closed 不误伤本人：带正确口令仍 200", r2.status_code == 200,
+              f"status={r2.status_code}")
+
+        # 反向用例：配置健康且确实没配口令时仍应放行（不破坏本机直连）
+        server.CONFIG_PATH.write_text(json.dumps({"provider": "cloud", "roles": {}}),
+                                      encoding="utf-8")
+        server._cfg_cache.update(_mtime_ns=0, _value={})
+        server._cfg_stat_cache.update(mtime_ns=0, checked_at_ns=0)
+        server._last_good_token = ""
+        check("健康配置且确实未配口令：返回 None（放行本机直连）",
+              server._access_token() is None, repr(server._access_token()))
+    finally:
+        if saved_env is not None:
+            os.environ["ACCESS_TOKEN"] = saved_env
+        server.CONFIG_PATH = saved_path
+        server._last_good_token = saved_tok
+        server._cfg_load_ok = saved_ok
+        server._access_token = saved_fn
+        server._cfg_cache.update(saved_cfg_cache)
+        server._cfg_stat_cache.update(saved_stat_cache)
+
+
+def test_gate_auth_failures_are_counted(client):
+    """第十轮：`/api/*` 上的鉴权失败必须计数/留痕（旧实现是爆破防护的完整绕过口）。
+
+    旧行为：失败计数/锁定/留痕只挂在 `POST /api/login` 上，而**真正守门的是
+    access_gate → _auth_ok()**。攻击者对任意 `/api/*` 逐个换
+    `Authorization: Bearer <猜测>` 就能无限次尝试口令 —— 那套防护完全不参与，
+    不计数、不留痕、不退避，等于形同虚设。
+    """
+    saved_tok = server._access_token
+    saved_max = server._LOGIN_FAIL_MAX
+    saved_backoff = server._LOGIN_BACKOFF_SECONDS
+    saved_track = dict(server._login_track)
+    try:
+        server._access_token = lambda: "secret-gate-token"
+        server._LOGIN_FAIL_MAX = 2
+        server._LOGIN_BACKOFF_SECONDS = 0.0  # 别为测试白等秒级退避
+        server._login_track.clear()
+        ip = "testclient"
+
+        r1 = client.get("/api/sessions", headers={"Authorization": "Bearer wrong-1"})
+        check("错误 Bearer 被拒（401）", r1.status_code == 401, f"status={r1.status_code}")
+        check("失败已被计数（旧实现计数恒为 0）",
+              server._login_track.get(ip, {}).get("fails") == 1, str(server._login_track))
+
+        client.get("/api/sessions", headers={"Authorization": "Bearer wrong-2"})
+        check("第二次失败继续累计",
+              server._login_track.get(ip, {}).get("fails") == 2, str(server._login_track))
+        check("达到阈值即判定锁定（门禁与 /api/login 共用同一阈值）",
+              server._login_locked(ip) is True, str(server._login_track))
+
+        r3 = client.get("/api/sessions", headers={"Authorization": "Bearer secret-gate-token"})
+        check("带正确口令仍 200（不产生假锁定）", r3.status_code == 200, f"status={r3.status_code}")
+
+        before = server._login_track.get(ip, {}).get("fails", 0)
+        client.get("/api/sessions")
+        check("完全无凭据的访问同样计数",
+              server._login_track.get(ip, {}).get("fails", 0) == before + 1,
+              str(server._login_track))
+        check("白名单端点 /api/health 不参与计数（探活必须始终可用）",
+              client.get("/api/health").status_code == 200)
+    finally:
+        server._access_token = saved_tok
+        server._LOGIN_FAIL_MAX = saved_max
+        server._LOGIN_BACKOFF_SECONDS = saved_backoff
+        server._login_track.clear()
+        server._login_track.update(saved_track)
+
+
+# ------------------------------------------------------------ 16. URL 白名单（SSRF）
+def test_url_guard_blocks_internal_targets():
+    """第十轮：用户自填 base_url 不得把服务端变成内网/管理面探测器。
+
+    旧行为：/api/llm-models 在"未传 key + 自填 base_url"时照样带空 Authorization
+    发 GET，填 http://127.0.0.1:4040/api 就能把 ngrok 管理面返回的 JSON 回显出来。
+    """
+    g = server._url_is_blocked_target
+    # 必须拦
+    check("拦 ngrok 管理端口 4040", bool(g("http://127.0.0.1:4040/api")), "not blocked")
+    check("拦 4041", bool(g("http://localhost:4041/api")), "not blocked")
+    check("拦云元数据地址", bool(g("http://169.254.169.254/latest/meta-data")), "not blocked")
+    check("拦 file:// 协议", bool(g("file:///c:/windows/win.ini")), "not blocked")
+    check("拦 gopher:// 协议", bool(g("gopher://x/")), "not blocked")
+    check("拦回环地址（非配置值）", bool(g("http://127.0.0.1:11434/v1")), "not blocked")
+    check("拦 IPv6 回环", bool(g("http://[::1]:8080/v1")), "not blocked")
+    check("缺主机名也拦", bool(g("http://")), "not blocked")
+    # 必须放行（否则会误伤正常用法）
+    check("放行公网 https 网关", not g("https://api.deepseek.com/v1"), "wrongly blocked")
+    check("放行无 scheme 的公网域名", not g("api.deepseek.com/v1"), "wrongly blocked")
+    check("放行局域网自建网关（本地 LLM 场景）", not g("http://192.168.1.50:11434/v1"), "wrongly blocked")
+    check("配置里本来就是该回环地址时放行", not g("http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/v1"),
+          "wrongly blocked")
+    check("空串放行", not g(""), "wrongly blocked")
+
+
+def test_llm_models_ssrf_endpoint(client):
+    """端点层：自填内网地址必须 400 拒绝，且**不能**真的发出请求。"""
+    with sandbox():
+        r = client.post("/api/llm-models", json={"base_url": "http://127.0.0.1:4040/api"})
+        check("自填 ngrok 管理面地址被 400 拒绝", r.status_code == 400, f"status={r.status_code}")
+        check("拒绝原因是 SSRF 防护", "SSRF" in (r.text or "") or "管理端口" in (r.text or ""),
+              r.text[:160])
+        r2 = client.post("/api/llm-models", json={"base_url": "file:///etc/passwd"})
+        check("file:// 协议被 400 拒绝", r2.status_code == 400, f"status={r2.status_code}")
+
+
+def test_llm_quota_ssrf_endpoint(client):
+    """第十轮：/api/llm-quota 必须与 /api/llm-models 走同一道 SSRF 闸。
+
+    旧行为：该端点会按调用方给的 base_url 拼出 quota 端点并**真的发 GET**，却完全
+    没有 _url_is_blocked_target 检查 —— 口令一旦泄露/被绕过，SSRF 靶点就从
+    llm-models 转移到这个端点（可打内网 / 本机 ngrok 管理面 4040）。
+    """
+    with sandbox():
+        r = client.post("/api/llm-quota", json={
+            "base_url": "http://127.0.0.1:4040/api", "api_key": "fake-key",
+            "billing_mode": "token_plan"})
+        check("自填 ngrok 管理面地址被 400 拒绝（旧实现会真的发出请求）",
+              r.status_code == 400, f"status={r.status_code} body={r.text[:160]}")
+        check("拒绝原因是 SSRF 防护",
+              "SSRF" in r.text or "管理端口" in r.text, r.text[:160])
+        r2 = client.post("/api/llm-quota", json={"base_url": "file:///etc/passwd",
+                                                 "api_key": "fake-key"})
+        check("file:// 协议被 400 拒绝", r2.status_code == 400, f"status={r2.status_code}")
+        # 沿用 config 里（非回环）的地址时不应被误拦 —— 未配密钥才是这里的正确报错
+        r3 = client.post("/api/llm-quota", json={
+            "base_url": "https://api.minimaxi.com/v1", "billing_mode": "payg"})
+        check("公网地址不被 SSRF 闸误拦（报错是缺密钥而非 SSRF）",
+              r3.status_code == 400 and "SSRF" not in r3.text, f"status={r3.status_code} {r3.text[:120]}")
+
+
+# ------------------------------------------------------------ 17. 白名单端点按鉴权收敛
+def test_whitelist_endpoints_redact_when_locked(client):
+    """第十轮：配了口令时，/api/health 与 /api/activity 不得对匿名调用方泄露运维细节。
+
+    这两个端点被 access_gate 无条件白名单放行（探活需要），于是只拿到隧道地址的人
+    未登录就能读到磁盘余量、分供应商 token 消耗、SSE 订阅者数，以及"机主此刻正在
+    聊天"的实时时间戳。
+    """
+    saved = (server._access_token, server._auth_ok)
+    try:
+        with sandbox():
+            server._access_token = lambda: "secret-token"
+            server._auth_ok = lambda req, tok: False  # 模拟未登录
+            h = client.get("/api/health")
+            check("匿名 health 仍 200（探活不能坏）", h.status_code == 200, f"status={h.status_code}")
+            d = h.json()
+            check("匿名 health 只回 ok 探活字段", set(d.keys()) == {"ok"} and d["ok"] is True, str(d))
+            a = client.get("/api/activity")
+            check("匿名 activity 仍 200", a.status_code == 200, f"status={a.status_code}")
+            check("匿名 activity 不回传精确时间戳",
+                  "last_chat_ts" not in a.json() and "active" in a.json(), str(a.json()))
+
+            # 已鉴权（无口令模式 / 登录后）仍要拿到完整运维字段，否则设置页与部署脚本失能
+            server._access_token = lambda: None
+            d2 = client.get("/api/health").json()
+            check("无口令模式（本机）health 仍回全部细节",
+                  "disk" in d2 and "llm_usage" in d2, str(sorted(d2)[:8]))
+            d3 = client.get("/api/activity").json()
+            check("无口令模式 activity 仍回时间戳", "last_chat_ts" in d3, str(d3))
+    finally:
+        server._access_token, server._auth_ok = saved
+
+
+# ------------------------------------------------------------ 18. 会话上限截断留痕
+def test_sessions_cap_truncation_reported(client):
+    """第十轮：合并层的 500 上限截断必须带出 stats，且 PUT 时落审计日志。
+
+    截断是**永久**的（超出部分不会随下次 PUT 回来），此前完全静默。
+    """
+    from server_pkg.sessions_merge import SESSIONS_CAP, _merge_sessions
+    check("上限常量导出且为 500", SESSIONS_CAP == 500, str(SESSIONS_CAP))
+    many = [{"id": f"s{i}", "title": f"t{i}", "updatedAt": 1700000000000 + i,
+             "history": [{"role": "user", "content": "x"}]} for i in range(SESSIONS_CAP + 7)]
+    stats: dict = {}
+    out = _merge_sessions([], many, {}, stats=stats)
+    check(f"返回条数被上限截断到 {SESSIONS_CAP}", len(out) == SESSIONS_CAP, f"len={len(out)}")
+    check("stats 报出被丢弃条数", stats.get("dropped") == 7, str(stats))
+    check("stats 给出被丢弃的会话 id", len(stats.get("dropped_ids") or []) == 7, str(stats))
+    # 不传 stats 时行为完全不变（既有调用方零改动）
+    out2 = _merge_sessions([], many, {})
+    check("不传 stats 时返回值不变", len(out2) == len(out))
+
+    # 端点层 · 入口截断：本端一次送来超过上限的会话，超出部分根本不进合并
+    # （这是更早、更彻底的一种静默丢失，只在合并层记账会完全看不到它）
+    with sandbox() as sb:
+        log_path = server.SESSIONS_PATH.parent / "sessions_truncated.log"
+        if log_path.exists():
+            log_path.unlink()
+        r = client.put("/api/sessions?client=cap-test",
+                       json={"sessions": many, "deleted": []})
+        check("超量 PUT 仍成功（不因截断报错）", r.status_code == 200, f"status={r.status_code}")
+        check("入口截断审计日志已落盘", log_path.exists(), str(log_path))
+        if log_path.exists():
+            recs = [json.loads(ln) for ln in
+                    log_path.read_text(encoding="utf-8").strip().splitlines() if ln.strip()]
+            check("审计记录 stage=ingest",
+                  any(x.get("stage") == "ingest" for x in recs), str(recs)[:200])
+            rec = recs[-1]
+            check("审计记录含 dropped/cap/ids",
+                  rec.get("dropped", 0) >= 7 and rec.get("cap") == SESSIONS_CAP
+                  and 0 < len(rec.get("dropped_ids") or []) <= 50, str(rec)[:220])
+            check("入口截断报告的 dropped 与实收条目对得上",
+                  rec.get("total") == len(many), str(rec)[:220])
+
+    # 端点层 · 合并层截断：存量已达上限、来端只送少量新会话
+    with sandbox() as sb2:
+        log_path2 = server.SESSIONS_PATH.parent / "sessions_truncated.log"
+        if log_path2.exists():
+            log_path2.unlink()
+        full = [{"id": f"m{i}", "title": f"m{i}", "updatedAt": 1700000000000 + i,
+                 "history": [{"role": "user", "content": "x"}]} for i in range(SESSIONS_CAP)]
+        sb2.path.write_text(json.dumps({"sessions": full, "deleted": []}, ensure_ascii=False),
+                            encoding="utf-8")
+        server._sess_cache.clear()
+        server._sess_cache.update(_mtime_ns=0, _value={"sessions": [], "deleted": []})
+        r2 = client.put("/api/sessions?client=merge-cap", json={
+            "sessions": [{"id": "newcomer", "title": "新", "updatedAt": time.time() * 1000,
+                          "history": [{"role": "user", "content": "hi"}]}],
+            "deleted": [],
+        })
+        check("存量已满时少量 PUT 仍成功", r2.status_code == 200, f"status={r2.status_code}")
+        recs2 = [json.loads(ln) for ln in
+                 log_path2.read_text(encoding="utf-8").strip().splitlines() if ln.strip()] \
+            if log_path2.exists() else []
+        check("合并层截断留痕且 stage=merge",
+              any(x.get("stage") == "merge" and x.get("dropped") for x in recs2), str(recs2)[:220])
+
+
+# ------------------------------------------------------------ 20. 非有限浮点不污染接口
+def _strict_json(text: str):
+    """按 RFC 8259 严格解析：拒绝 Infinity / -Infinity / NaN。
+
+    浏览器的 JSON.parse / Response.json() 就是这个严格度，而 Python 的 json.loads
+    默认接受这三个字面量 —— 所以用默认 json.loads 断言会漏掉整整一类故障。
+    """
+    def _reject(token):
+        raise ValueError(f"非法 JSON 字面量：{token}")
+    return json.loads(text, parse_constant=_reject)
+
+
+def test_sessions_nonfinite_never_poisons_api(client):
+    """第十轮：inf/nan 落盘后会让 GET /api/sessions 的**响应体本身**非法。
+
+    旧行为：_dump 与 _render_sessions_body 都用默认 allow_nan=True，于是 1e400
+    （语法完全合法的 JSON 数字，解析为 inf）会被写成 `Infinity` 落盘、再原样下发。
+    Python 侧看起来一切正常，但每台设备的 `r.json()` 都抛错、重试几次后放弃 ——
+    多端同步**永久停摆**，服务端日志无痕，只能手改文件自愈（手机端还改不了）。
+    """
+    from server_pkg.sessions_merge import _sanitize_nonfinite
+    # —— 单元层：递归清洗、结构保持 ——
+    got = _sanitize_nonfinite({"a": float("inf"), "b": [1, float("nan"), {"c": float("-inf")}],
+                               "d": "x", "e": None, "f": True})
+    check("清洗后结构不变（键一个不少）",
+          set(got) == {"a", "b", "d", "e", "f"}, str(got))
+    check("inf/nan/-inf 一律变 None",
+          got["a"] is None and got["b"][1] is None and got["b"][2]["c"] is None, str(got))
+    check("正常值原样保留（含 bool/None/str）",
+          got["b"][0] == 1 and got["d"] == "x" and got["e"] is None and got["f"] is True, str(got))
+    check("有限浮点不被误伤", _sanitize_nonfinite(1.5) == 1.5)
+
+    # —— 端点层 · 入站：客户端送 1e400（合法 JSON 数字）—— 
+    with sandbox() as sb:
+        bad_json = ('{"sessions":[{"id":"s-nonfinite","title":"无穷","updatedAt":1e400,'
+                    '"history":[{"role":"user","content":"你好","ts":1e400}]}],'
+                    '"deleted":[]}')
+        r = client.put("/api/sessions?client=nonfinite",
+                       content=bad_json.encode("utf-8"),
+                       headers={"Content-Type": "application/json"})
+        check("含 1e400 的 PUT 仍成功（不因清洗报错）", r.status_code == 200, f"status={r.status_code}")
+        g = client.get("/api/sessions")
+        check("GET /api/sessions 返回 200", g.status_code == 200, f"status={g.status_code}")
+        try:
+            doc = _strict_json(g.content.decode("utf-8"))
+            ok_strict = True
+        except ValueError as exc:
+            ok_strict = False
+            doc = {}
+            check("响应体必须能被严格 JSON 解析（旧实现必失败）", False, repr(exc))
+        if ok_strict:
+            check("响应体可被严格 JSON 解析（旧实现必失败）", True)
+            sess = [s for s in doc.get("sessions", []) if s.get("id") == "s-nonfinite"]
+            check("会话没有被静默丢弃（只清洗值）", len(sess) == 1, str(doc.get("sessions"))[:200])
+            if sess:
+                check("updatedAt 被归一为 null 而不是丢弃",
+                      sess[0].get("updatedAt") is None, str(sess[0].get("updatedAt")))
+            check("磁盘上也不再写出 Infinity（下一次 PUT 已净化）",
+                  "Infinity" not in sb.path.read_text(encoding="utf-8"),
+                  "disk still contains Infinity")
+
+    # —— 端点层 · 存量坏文件自愈：模拟同步盘回滚出来的 Illegal 文件 ——
+    with sandbox() as sb2:
+        sb2.path.write_text(
+            '{"sessions":[{"id":"s-legacy-bad","title":"旧坏文件","updatedAt":1700000000000,'
+            '"history":[{"role":"user","content":"早","ts":Infinity}]}],"deleted":[]}',
+            encoding="utf-8")
+        server._sess_cache.clear()
+        server._sess_cache.update(_mtime_ns=0, _value={"sessions": [], "deleted": []})
+        g2 = client.get("/api/sessions")
+        check("存量含 Infinity 的文件：GET 仍 200（自愈不 500）",
+              g2.status_code == 200, f"status={g2.status_code}")
+        try:
+            doc2 = _strict_json(g2.content.decode("utf-8"))
+            check("存量坏文件读出来的响应体也能被严格解析", True)
+            kept = [s for s in doc2.get("sessions", []) if s.get("id") == "s-legacy-bad"]
+            check("存量坏文件里的会话仍保留（不丢数据）", len(kept) == 1, str(doc2)[:200])
+            if kept:
+                check("坏 ts 被归一为 null",
+                      kept[0]["history"][0].get("ts") is None, str(kept[0]["history"]))
+        except ValueError as exc:
+            check("存量坏文件读出来的响应体也能被严格解析", False, repr(exc))
+
+
+# ------------------------------------------------------------ 21. 截断保置顶
+def test_sessions_truncation_keeps_pinned_first():
+    """第十轮：超出上限时**绝不能先丢置顶会话**。
+
+    前端列表是置顶优先，而服务端入站/合并两处截断此前只看 updatedAt —— 于是先被
+    截掉的恰好是置顶的老会话（用户最在意的那几条），且无任何提示。
+    """
+    from server_pkg.sessions_merge import SESSIONS_CAP, _merge_sessions
+    pinned_old = {"id": "s-pinned-old", "title": "置顶的老会话", "pinned": True,
+                  "updatedAt": 1600000000000, "history": [{"role": "user", "content": "很重要"}]}
+    rest = [{"id": f"n{i}", "title": f"n{i}", "updatedAt": 1700000000000 + i,
+             "history": [{"role": "user", "content": "x"}]} for i in range(SESSIONS_CAP)]
+    stats: dict = {}
+    out = _merge_sessions([], [pinned_old, *rest], {}, stats=stats)
+    ids = [s.get("id") for s in out]
+    check("截断后仍保留置顶会话（旧实现必丢）",
+          "s-pinned-old" in ids, f"pinned dropped; kept={len(ids)}")
+    check("置顶会话排在最前", bool(ids) and ids[0] == "s-pinned-old", str(ids[:3]))
+    check("被截断的是普通会话且只丢了一条", stats.get("dropped") == 1, str(stats))
+    check("置顶会话不在被丢弃名单里",
+          "s-pinned-old" not in (stats.get("dropped_ids") or []), str(stats.get("dropped_ids")))
+
+
+# ------------------------------------------------------------ 19. 启动期剧情引擎预热
+def test_story_manager_prewarmed_on_startup(client):
+    """第十轮：lifespan 必须 **await** 剧情引擎构建完成再对外服务。
+
+    旧写法 _spawn_bg(to_thread(...)) 把构建丢后台，首个剧情请求可能与预热线程抢
+    threading.Lock，而后者正持锁做 mkdir/读 state/生成整季日历/写盘 —— 事件循环
+    同步阻塞，SSE 全卡。TestClient 进入 lifespan 后管理器就必须已就绪。
+    """
+    check("TestClient 的 lifespan 已把剧情管理器构建好（不再靠后台竞态）",
+          server._story_manager is not None, "still None after startup")
+
+
 
 def main():
     from fastapi.testclient import TestClient  # noqa: E402
@@ -567,6 +966,16 @@ def main():
         test_offline_mode_gate()
         test_stats_tolerates_malformed_entries(client)
         test_access_token_fail_closed()
+        test_access_token_failsafe_on_degraded_config(client)
+        test_gate_auth_failures_are_counted(client)
+        test_url_guard_blocks_internal_targets()
+        test_llm_models_ssrf_endpoint(client)
+        test_llm_quota_ssrf_endpoint(client)
+        test_whitelist_endpoints_redact_when_locked(client)
+        test_sessions_cap_truncation_reported(client)
+        test_sessions_nonfinite_never_poisons_api(client)
+        test_sessions_truncation_keeps_pinned_first()
+        test_story_manager_prewarmed_on_startup(client)
         test_probe_never_breaks_status()
         test_re_export_surface()
         test_security_headers_and_request_id(client)

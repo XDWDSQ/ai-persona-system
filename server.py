@@ -54,8 +54,10 @@ import minimax_llm  # MiniMax 云端文字生成适配器（OpenAI 兼容，payg
 # 静默打断它们。ruff 的 F401 在这里全部忽略，不要"顺手清理"。
 from server_pkg.sessions_merge import (  # noqa: F401
     _TOMBSTONE_MAX_COUNT, _is_placeholder_session,
-    _merge_sessions, _norm_tombstones, _sess_updated_at, _sessions_msg_count,
+    _merge_sessions, _norm_tombstones, _sanitize_nonfinite, _sess_order_key,
+    _sess_updated_at, _sessions_msg_count,
 )
+from server_pkg.sessions_merge import SESSIONS_CAP  # 会话条数上限（截断审计用）
 from server_pkg.text_utils import (  # noqa: F401
     _KEY_MASK_PREFIX, _META_LINE_KW_RE, _META_LINE_START_RE, _SEARCH_RE,
     _STYLE_RE, _TEST_SESSION_PREFIX, _TT_PUNCT_TRANS, _TT_RE_NEWLINES,
@@ -133,6 +135,30 @@ _log = logging.getLogger("server")
 
 os.environ.setdefault("INTEL_SKILL_DOG_NO_EVICTION", "1")
 skill_lock = asyncio.Lock()
+
+
+def _atomic_replace(tmp: Path, target: Path, attempts: int = 3) -> None:
+    """把写好的临时文件原子替换到目标路径；遇 Windows 瞬时占用则短暂重试。
+
+    为什么必须重试：本项目跑在移动云盘同步盘上，云盘客户端与杀软会对**刚落盘**的文件
+    短暂持有句柄，此时 `os.replace` 抛 `PermissionError [WinError 5]` —— 文件本身没写坏，
+    几毫秒后重试即可成功。旧实现让这种瞬时占用直接冒成 500（用户看到"保存设置失败"，
+    而配置其实没保存）；更糟的是它看起来像"磁盘坏了"，实际只是同步盘在扫描新文件。
+    story_kpl2027 与 role_engine 的原子写早就各自做了同样的重试，只有 server.py 这几处漏了。
+
+    首次尝试不 sleep，之后 0.05s / 0.1s，总等待约 0.15s；最后一次仍失败就抛出，
+    由调用方按既有 OSError 分支处理（配置/会话各自有 500/400 的明确响应）。
+    注意：本函数含 `time.sleep`，**只能在线程池里调**（await asyncio.to_thread）。
+    """
+    for i in range(attempts):
+        try:
+            tmp.replace(target)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(0.05 * (i + 1))
+
 
 # 离线模式：AI_DISABLE_EXTERNAL=1 时关闭一切「服务端主动发起」的外部调用
 # （天气/角色现实动态的启动预取、读时过期刷新、定时巡检）。供离线测试使用：
@@ -238,7 +264,7 @@ def _flush_llm_usage_now() -> None:
     tmp = _LLM_USAGE_PATH.with_name(f"llm_usage.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(_LLM_USAGE_PATH)
+        _atomic_replace(tmp, _LLM_USAGE_PATH)
     except OSError as exc:
         _log.warning("llm usage flush failed: %s", exc)
         tmp.unlink(missing_ok=True)
@@ -294,6 +320,11 @@ _cfg_cache: dict = {"_mtime_ns": 0, "_value": {}}
 # 只有「外部手改 config.json」最坏延迟 250ms 被发现，完全可接受。
 _CFG_STAT_TTL_NS = 250_000_000
 _cfg_stat_cache: dict = {"mtime_ns": 0, "checked_at_ns": 0}
+# config.json 上一次读取是否**健康**。load_config 遇到"文件不存在 / 读不到 / 非法
+# JSON"时**不抛异常**，而是静默 return _default_config —— 那份默认配置里没有
+# access_token 键，于是 _access_token() 会把它读成"用户没配口令"并放行匿名访问。
+# 这个标志位就是给门禁一个"当前配置不可信"的信号（详见 _access_token）。
+_cfg_load_ok: bool = True
 
 # TTS 缓存 LRU 清理阈值（首次合成后懒触发一次清理，避免每请求都扫描）
 # ponytail: 全局简单 O(n) 扫描足够（万级文件以内不成为瓶颈），升级路径用 sqlite/有序集合
@@ -383,6 +414,40 @@ _last_activity_ts: float = 0.0
 # _sessions_msg_count 已迁入 server_pkg.sessions_merge（顶层 import 重导出）。
 
 
+def _append_truncation_log(stats: dict) -> None:
+    """把「会话被上限截断」写成一行 JSONL 审计记录（失败不影响保存）。
+
+    为什么单独记账：截断是**永久**的（超出部分不会随下次 PUT 回来），而它此前完全
+    静默 —— 用户只会发现"有些会话不见了"，没有任何线索。记录时间、阶段、总数、
+    保留数、被丢弃的会话 id（最多 50 个），事后能直接对上号。
+
+    stage 区分两种截断，排查时含义完全不同：
+      ingest —— 本端一次送来的会话超过上限，超出部分**根本没进合并**；
+      merge  —— 多方会话并集超过上限，被截掉的是"并集里最旧的"。
+    """
+    rec = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "stage": stats.get("stage") or "merge",
+        "total": stats.get("total"),
+        "kept": stats.get("kept"),
+        "dropped": stats.get("dropped"),
+        "cap": SESSIONS_CAP,
+        "dropped_ids": stats.get("dropped_ids") or [],
+    }
+    # 刻意写在 **sessions.json 旁边**（SESSIONS_PATH.parent）而不是模块级 DATA_DIR：
+    # SESSIONS_PATH 可被测试/隔离实例重定向，日志必须跟着它走，否则测试写进了
+    # 真实 data/，而隔离实例的日志又跑到别处（本轮测试就是靠这个断言抓出来的）。
+    try:
+        log_path = SESSIONS_PATH.parent / "sessions_truncated.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # 与 role_news_missing.log 同一套轮转（此前这里漏了，反复截断时该文件会无限增长）
+        _rotate_jsonl_if_needed(log_path, _JSONL_LOG_MAX_BYTES, _JSONL_LOG_KEEP_BYTES)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        _log.warning("write sessions_truncated.log failed: %s", exc)
+
+
 def _backup_sessions_before_destructive(current: list, merged: list) -> None:
     """写盘前检测破坏性合并并备份当前文件。
 
@@ -459,15 +524,23 @@ _bg_tasks: set[asyncio.Task] = set()
 _BG_TASKS_MAX = 200
 
 
-def _spawn_bg(coro) -> None:
+def _spawn_bg(coro) -> "asyncio.Task | None":
+    """启动一个后台任务并纳入 _bg_tasks 托管；返回任务对象（被丢弃时返回 None）。
+
+    返回值是给"永不退出的循环任务"用的：关闭时需要显式 cancel 它们，否则
+    asyncio.wait(timeout=5) 每次重启都白等满 5s，而且它们永远不 done →
+    done 回调永不触发 → 每进一次 lifespan 就往 _bg_tasks 里多攒 2 个死任务。"""
     if len(_bg_tasks) >= _BG_TASKS_MAX:
-        _log.warning("bg task backlog full (%d), dropping task", len(_bg_tasks))
+        # 达到上限后丢弃一切后台任务（含记忆/情绪后处理），后果是静默丢数据，
+        # 所以这里必须是 ERROR 而不是 WARNING —— 默认日志级别下就能看见。
+        _log.error("bg task backlog full (%d), dropping task", len(_bg_tasks))
         # 不 close 会产生 "coroutine was never awaited" 告警，且协程持有的资源不释放
         coro.close()
-        return
+        return None
     task = asyncio.create_task(coro)
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
+    return task
 
 
 def _detach_bg(task: "asyncio.Task | None") -> None:
@@ -491,21 +564,37 @@ _post_processors: dict[bool, PostProcessor] = {}
 # 2027 赛季剧情分支：懒加载 StoryManager（首启生成日历/状态，失败不阻塞主链路）
 _story_manager: story_kpl2027.StoryManager | None = None
 _story_manager_lock = threading.Lock()
+# 构造失败后的冷静期（monotonic 截止时刻）。StoryManager 的首次构造要 mkdir / 读
+# state / 读整季日历（缺失时现场生成并写盘）/ _atomic_write 失败重试，**全程持
+# _story_manager_lock**。而一旦构造抛异常，_story_manager 会永远停在 None ——
+# 于是此后**每一次**剧情角色请求（/api/story/*、剧情角色的 /api/chat 与主动问候）
+# 都会在事件循环里重做一遍这段磁盘 IO，把全场 SSE 一起冻住。
+# 负缓存把"每次都卡"降为"最多每 60s 卡一次"，也是 _get_story_manager 的薄弱点所在。
+_STORY_RETRY_COOLDOWN = 60.0
+_story_retry_after: float = 0.0
 
 
 def _get_story_manager() -> story_kpl2027.StoryManager | None:
-    global _story_manager
+    global _story_manager, _story_retry_after
     if _story_manager is not None:
         return _story_manager
+    # 冷静期内直接放弃：不做磁盘 IO、不抢锁（这才是负缓存的意义）
+    if time.monotonic() < _story_retry_after:
+        return None
     # 双检锁：StoryManager 自带的是实例级 RLock，两个实例之间零互斥。
     # lifespan 的 to_thread 预热与首个聊天请求可能同时看到 None，各建一个实例
     # -> 各自持有独立 state，后写盘的覆盖前者，剧情进度（flag/log）静默丢失。
     with _story_manager_lock:
         if _story_manager is None:
+            if time.monotonic() < _story_retry_after:
+                return None
             try:
                 _story_manager = story_kpl2027.StoryManager(str(DATA_DIR))
             except Exception as exc:  # noqa: BLE001
-                _log.warning("story manager init failed: %s", exc)
+                _story_retry_after = time.monotonic() + _STORY_RETRY_COOLDOWN
+                _log.warning("story manager init failed: %s（%.0fs 内不再重试，"
+                             "避免每个剧情请求都在事件循环里重做这段磁盘 IO）",
+                             exc, _STORY_RETRY_COOLDOWN)
                 return None
     return _story_manager
 
@@ -707,7 +796,13 @@ def _apply_env_overrides(cfg: dict, mtime_ns: int = 0) -> dict:
 
 def load_config(with_env: bool = True) -> dict:
     """读取配置（mtime 失效缓存）。with_env=False 返回磁盘原值，
-    供 update_config/roles_apply 这类「改完要写盘」的路径使用，避免把 env 密钥持久化。"""
+    供 update_config/roles_apply 这类「改完要写盘」的路径使用，避免把 env 密钥持久化。
+
+    注意：本函数在"读不到 / 解析失败"时**不抛异常**，而是返回 _default_config。
+    这种降级对调用方大多无害（用默认值继续），但**对访问门禁是致命的**：默认配置里
+    没有 access_token 键，_access_token() 会把它读成"未配口令"而放行匿名访问。
+    因此降级路径必须同时置 _cfg_load_ok = False，交给门禁做 fail-closed。"""
+    global _cfg_load_ok
     _default_config = {
         "provider": "cloud",
         "local": {"base_url": "http://localhost:11434/v1", "model": "Qwen3.5-4B-Q4_K_M"},
@@ -727,24 +822,31 @@ def load_config(with_env: bool = True) -> dict:
             sc["checked_at_ns"] = now_ns
         except FileNotFoundError:
             _log.warning("load_config: config.json not found, using default config")
+            _cfg_load_ok = False
             return _default_config
         except OSError:
             # stat 失败（文件刚创建/删除中），直接读一次；不写 stat TTL 缓存，下次请求重试
             try:
-                return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                cfg_raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                _cfg_load_ok = True
+                return cfg_raw
             except FileNotFoundError:
                 _log.warning("load_config: config.json not found during fallback read, using default config")
+                _cfg_load_ok = False
                 return _default_config
             except (OSError, json.JSONDecodeError) as exc:
                 _log.warning("load_config fallback read failed: %s, using default config", exc)
+                _cfg_load_ok = False
                 return _default_config
     if mtime != _cfg_cache["_mtime_ns"]:
         try:
             _cfg_cache["_value"] = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             _log.warning("load_config: JSON parse error: %s, using default config", exc)
+            _cfg_load_ok = False
             return _default_config
         _cfg_cache["_mtime_ns"] = mtime
+    _cfg_load_ok = True
     cfg = _cfg_cache["_value"]
     return _apply_env_overrides(cfg, mtime_ns=mtime) if with_env else cfg
 
@@ -759,7 +861,8 @@ async def _save_config_locked(cfg: dict) -> None:
     try:
         # 阻塞 IO 丢进线程池，避免事件循环卡住
         await asyncio.to_thread(tmp.write_text, data, encoding="utf-8")
-        await asyncio.to_thread(tmp.replace, CONFIG_PATH)
+        # 同步盘/杀软会瞬时占用刚落盘的文件，replace 需带重试（见 _atomic_replace）
+        await asyncio.to_thread(_atomic_replace, tmp, CONFIG_PATH)
     except BaseException:
         await asyncio.to_thread(lambda: tmp.unlink(missing_ok=True))
         raise
@@ -1208,7 +1311,8 @@ def _load_weather_cache() -> dict:
             if isinstance(d, dict) and d.get("text"):
                 return d
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-        _log.debug("weather.json load failed: %s", exc)
+        # 降级路径用 WARNING：用户报"天气一直空着"时，日志里必须留得下痕迹
+        _log.warning("weather.json load failed: %s", exc)
     return {"text": "", "ts": 0.0, "city": ""}
 
 
@@ -1217,9 +1321,9 @@ def _save_weather_cache(d: dict) -> None:
         _WEATHER_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _WEATHER_FILE.with_name(f"weather.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(_WEATHER_FILE)
+        _atomic_replace(tmp, _WEATHER_FILE)
     except OSError as exc:
-        _log.debug("weather cache save failed: %s", exc)
+        _log.warning("weather cache save failed: %s", exc)
 
 
 def _weather_snapshot() -> dict:
@@ -1517,7 +1621,7 @@ async def _bg_weather_refresh(force: bool = False) -> str:
                 await asyncio.to_thread(_save_weather_cache, d)
             return text
         except Exception as exc:  # noqa: BLE001
-            _log.debug("bg weather refresh skipped: %s", exc)
+            _log.warning("bg weather refresh skipped: %s", exc)
             return ""
 
 
@@ -1680,34 +1784,48 @@ def _save_role_news(d: dict) -> None:
         # 唯一 tmp 名：人工写入与后台自动刷新是两个写入方，固定名会互相覆盖
         tmp = _ROLE_NEWS_FILE.with_name(f"role_news.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(_ROLE_NEWS_FILE)
+        _atomic_replace(tmp, _ROLE_NEWS_FILE)
         _invalidate_memo(_ROLE_NEWS_FILE)
     except OSError as exc:
-        _log.debug("role_news save failed: %s", exc)
+        _log.warning("role_news save failed: %s", exc)
 
 
-# 缺失日志轮转：搜索长期无结果（关键词太冷/引擎持续不可用）时该 JSONL 会无限增长。
-# 超 1MB 时只保留最后 256KB（按整行边界截断），历史排查价值在最近的记录里。
-_ROLE_NEWS_LOG_MAX_BYTES = 1024 * 1024
-_ROLE_NEWS_LOG_KEEP_BYTES = 256 * 1024
+# 追加式 JSONL 日志的轮转阈值（role_news_missing.log 与 sessions_truncated.log 共用）：
+# 搜索长期无结果 / 会话反复被上限截断时这些日志会无限增长。超 1MB 只保留最后
+# 256KB（按整行边界截断），历史排查价值在最近的记录里。
+_JSONL_LOG_MAX_BYTES = 1024 * 1024
+_JSONL_LOG_KEEP_BYTES = 256 * 1024
+# 旧名保留：测试与既有注释一直引用这两个名字
+_ROLE_NEWS_LOG_MAX_BYTES = _JSONL_LOG_MAX_BYTES
+_ROLE_NEWS_LOG_KEEP_BYTES = _JSONL_LOG_KEEP_BYTES
 
 
-def _rotate_role_news_log_if_needed() -> None:
-    """缺失日志超限时保留尾部（按整行截断，绝不留半行 JSON）。"""
+def _rotate_jsonl_if_needed(path: Path, max_bytes: int, keep_bytes: int) -> None:
+    """JSONL 追加日志超限时只保留尾部（按整行截断，绝不留半行半条 JSON）。
+
+    抽成通用实现的原因：role_news_missing.log 有轮转、sessions_truncated.log 没有 ——
+    同类日志各写一份，"一个有了就等于都有"的错觉会让另一个无声地无限增长。
+    """
     try:
-        if not _ROLE_NEWS_LOG_FILE.exists():
+        if not path.exists():
             return
-        if _ROLE_NEWS_LOG_FILE.stat().st_size <= _ROLE_NEWS_LOG_MAX_BYTES:
+        if path.stat().st_size <= max_bytes:
             return
-        with open(_ROLE_NEWS_LOG_FILE, "rb") as f:
-            f.seek(-_ROLE_NEWS_LOG_KEEP_BYTES, 2)  # 2 = SEEK_END
+        with open(path, "rb") as f:
+            f.seek(-keep_bytes, 2)  # 2 = SEEK_END
             tail = f.read()
         nl = tail.find(b"\n")
         if 0 <= nl < len(tail) - 1:
             tail = tail[nl + 1:]
-        _ROLE_NEWS_LOG_FILE.write_bytes(tail)
+        path.write_bytes(tail)
     except OSError as exc:
-        _log.debug("role_news_missing log rotate failed: %s", exc)
+        # 降级路径用 WARNING：默认日志级别下必须看得见，否则出问题完全无痕
+        _log.warning("jsonl log rotate failed: path=%s err=%s", path, exc)
+
+
+def _rotate_role_news_log_if_needed() -> None:
+    """缺失日志超限时保留尾部（按整行截断，绝不留半行 JSON）。"""
+    _rotate_jsonl_if_needed(_ROLE_NEWS_LOG_FILE, _JSONL_LOG_MAX_BYTES, _JSONL_LOG_KEEP_BYTES)
 
 
 def _log_role_news_missing(reason: str, category: str = "", keyword: str = "") -> None:
@@ -1770,12 +1888,12 @@ def _collect_role_facts(role_cfg: dict, cfg: dict, role: str) -> dict:
                 "date": str(m.get("created_at") or "")[:10],
             })
     except Exception as exc:  # noqa: BLE001
-        _log.debug("role news collect memory failed: %s", exc)
+        _log.warning("role news collect memory failed: %s", exc)
     # 3) 情绪状态
     try:
         facts["state"] = _get_role_stores(role)[1].get_decayed()
     except Exception as exc:  # noqa: BLE001
-        _log.debug("role news collect state failed: %s", exc)
+        _log.warning("role news collect state failed: %s", exc)
     # 4) 位置 + 天气（只读缓存，绝不阻塞）
     facts["location"] = _location_city()
     try:
@@ -1981,7 +2099,7 @@ async def _summarize_role_news(keyword: str, role_name: str, results: list[dict]
             return [], summary
         return cards, summary
     except Exception as exc:  # noqa: BLE001
-        _log.debug("summarize role news failed: %s", exc)
+        _log.warning("summarize role news failed: %s", exc)
         return [], ""
 
 
@@ -2090,7 +2208,7 @@ async def _bg_role_news_refresh(force: bool = False) -> str:
             await asyncio.to_thread(_save_role_news, d)
             return summary
         except Exception as exc:  # noqa: BLE001
-            _log.debug("bg role news refresh skipped: %s", exc)
+            _log.warning("bg role news refresh skipped: %s", exc)
             return ""
 
 
@@ -2112,7 +2230,7 @@ async def _role_news_scheduler() -> None:
                 _log.debug("role news scheduler: cache expired, refresh")
                 _spawn_bg(_bg_role_news_refresh(force=True))
         except Exception as exc:  # noqa: BLE001
-            _log.debug("role news scheduler tick failed: %s", exc)
+            _log.warning("role news scheduler tick failed: %s", exc)
 
 
 def _role_news_text() -> str:
@@ -2717,9 +2835,13 @@ def _scan_expired_uploads(now: float) -> list[Path]:
 
 
 async def _uploads_cleanup_loop() -> None:
-    """后台循环：清理无任何会话引用的过期附件，防止 uploads 目录打满磁盘。"""
+    """后台循环：清理无任何会话引用的过期附件，防止 uploads 目录打满磁盘。
+
+    sleep 必须放在**扫描之后**：旧实现先 `await asyncio.sleep(6h)` 再扫，而
+    restart_service.bat 与自动部署比 6h 更频繁时，这一轮扫描**永远不会发生** ——
+    uploads/ 只增不减 → 云盘盘满 → 会话与配置保存失败（真丢数据）。
+    对照 TTS 缓存清理带了启动首扫（force=True），这里改成首轮立即扫一次。"""
     while True:
-        await asyncio.sleep(_UPLOAD_CLEAN_INTERVAL)
         try:
             expired = await asyncio.to_thread(_scan_expired_uploads, time.time())
             removed = 0
@@ -2733,6 +2855,7 @@ async def _uploads_cleanup_loop() -> None:
                 _log.info("upload cleanup: removed %d orphan attachments", removed)
         except Exception as exc:  # noqa: BLE001
             _log.warning("upload cleanup loop error: %s", exc)
+        await asyncio.sleep(_UPLOAD_CLEAN_INTERVAL)
 
 
 def tts_cache_path(text: str, style: str, cfg: dict) -> Path:
@@ -2778,8 +2901,10 @@ async def lifespan(app: FastAPI):
     _refresh_tts_cache_limits()
     # 启动时后台触发一次 TTS 缓存清理（force 跳过间隔检查，不阻塞启动）
     _spawn_bg(_maybe_cleanup_tts_cache(force=True))
-    # 上传附件没有 LRU，靠后台循环按保留天数清理，防磁盘无限增长
-    _spawn_bg(_uploads_cleanup_loop())
+    # 上传附件没有 LRU，靠后台循环按保留天数清理，防磁盘无限增长。
+    # 两个"永不退出的循环任务"单独留引用，关闭时才能 cancel（见 yield 之后）。
+    _uploads_task = _spawn_bg(_uploads_cleanup_loop())
+    _role_news_task = None
     if not _OFFLINE_MODE:
         # 启动时后台预取一次天气（未配置手动位置时自动跳过，失败静默不影响启动）
         _spawn_bg(_bg_weather_refresh())
@@ -2788,11 +2913,21 @@ async def lifespan(app: FastAPI):
             _spawn_bg(_bg_role_news_refresh())
         # 定时巡检角色现实动态缓存：过期自动后台刷新，保证角色状态随时间自动变化
         # （按需模式 auto_refresh=false 时巡检器内部直接跳过）
-        _spawn_bg(_role_news_scheduler())
+        _role_news_task = _spawn_bg(_role_news_scheduler())
     else:
         _log.info("offline mode (AI_DISABLE_EXTERNAL=1): skip weather/role-news background jobs")
-    # 2027 赛季剧情分支：首启后台生成日历/状态文件（幂等，不阻塞启动）
-    _spawn_bg(asyncio.to_thread(_get_story_manager))
+    # 2027 赛季剧情分支：首启生成日历/状态文件（幂等）。
+    # 第九轮修正：这里必须 **await**，不能 _spawn_bg 后继续 —— lifespan 返回之前
+    # uvicorn 不对外服务，await 一下就把"首个剧情请求与预热线程抢 _story_manager_lock"
+    # 的窗口彻底消掉。旧写法把构建丢进后台任务，而 StoryManager 的首次构造要
+    # mkdir/读 state/生成整季日历/写盘，全程持 threading.Lock；一旦第一个请求
+    # （/api/story/* 或剧情角色的 /api/chat）在预热还没结束时到达，事件循环就会
+    # 同步阻塞在 threading.Lock 上，SSE 全卡。
+    # to_thread 保证这段磁盘 IO 不占事件循环；耗时只在启动阶段、且是幂等的。
+    try:
+        await asyncio.to_thread(_get_story_manager)
+    except Exception as exc:  # noqa: BLE001 剧情引擎不可用不能拖垮整个服务启动
+        _log.warning("story manager prewarm failed: %s", exc)
     yield
     # 关闭：先等后台任务收尾（上限 5s）；本进程产生过真实 LLM 调用时补落一次
     # 用量（节流落盘最长 5min 一次，正常重启不该丢掉这段计数），再关连接池
@@ -2801,6 +2936,15 @@ async def lifespan(app: FastAPI):
             await asyncio.to_thread(_flush_llm_usage_now)
         except Exception as exc:  # noqa: BLE001
             _log.warning("final llm usage flush failed: %s", exc)
+    # 先显式 cancel 两个永不退出的循环任务（uploads 清理 / 角色动态巡检）：
+    # 否则 asyncio.wait(timeout=5) 每次重启都要白等满 5s；而且它们永不 done →
+    # done 回调永不触发 → 每进一次 lifespan 就往 _bg_tasks 里多攒 2 个死任务，
+    # 逼近 _BG_TASKS_MAX 后 _spawn_bg 会丢弃一切后台任务（记忆/情绪写入静默丢失）。
+    _loops = [t for t in (_uploads_task, _role_news_task) if t is not None and not t.done()]
+    for _t in _loops:
+        _t.cancel()
+    if _loops:
+        await asyncio.gather(*_loops, return_exceptions=True)
     if _bg_tasks:
         await asyncio.wait(list(_bg_tasks), timeout=5.0)
     await httpx_client.aclose()
@@ -2853,30 +2997,51 @@ class LoginRequest(BaseModel):
 _last_good_token: str = ""
 
 
+def _token_failsafe(reason: str) -> str | None:
+    """配置不可信时的访问口令兜底：上一次生效口令 → 环境变量 → 都没有才放行。
+
+    为什么必须集中成一处：这是同一条安全策略，而它有两个入口 ——
+    load_config() **抛异常**，以及 load_config() **不抛异常但降级**（返回
+    _default_config）。第九轮只兜住了前者；而后者才是最常见的损坏形态：config.json
+    被云盘同步截成半截 / 编辑器写坏 / 手改漏逗号 → json.JSONDecodeError →
+    load_config 静默 return _default_config，而那份默认配置里没有 access_token，
+    于是门禁读出"未配口令"并全放行，日志里一个字都没有。
+
+    三个分支都打 ERROR 说明原因；**绝不记录口令内容**。"""
+    env_tok = str(os.environ.get("ACCESS_TOKEN") or "").strip()
+    if _last_good_token:
+        _log.error("%s；访问门禁继续要求上一次生效口令，不放行匿名访问", reason)
+        return _last_good_token
+    if env_tok:
+        _log.error("%s；回退到环境变量 ACCESS_TOKEN", reason)
+        return env_tok
+    _log.error("%s 且无历史口令/环境变量：本次按「未配置口令」处理；"
+               "若你确实配了口令，请修复 config.json 后重启服务", reason)
+    return None
+
+
 def _access_token() -> str | None:
     """返回当前生效的访问口令；未配置返回 None（表示不启用保护）。
 
-    第九轮安全加固：配置读取异常时**不得**再静默降级成"未配置口令"。
+    安全要求：**任何"配置不可信"的情形都不得降级成"用户没配口令"**。
     旧实现在这里裸 `except Exception: cfg_tok = ""`，于是只要 config.json 被改坏
     （例如 cloud 节写成数组、voice 节写成字符串，_apply_env_overrides 在解析时抛错），
-    load_config() 异常就会被当成"用户没配口令"，access_gate 全放行 —— ngrok 公网
-    上 /uploads/* 附件、/api/sync/stream 全部未认证可读，而且没有任何日志痕迹。
-    现在改为：异常时回退到上一次成功读到的口令（有过口令就继续要求口令），
-    并打 ERROR 日志；只有"配置读取正常且确实没配口令"才放行。"""
+    异常就被当成"用户没配口令"，access_gate 全放行 —— ngrok 公网上 /uploads/* 附件、
+    /api/sync/stream 全部未认证可读，而且没有任何日志痕迹。
+
+    两类损坏都必须 fail-closed（见 _token_failsafe）：
+      1. load_config() 抛异常（第九轮已兜住）；
+      2. load_config() 不抛异常、而是静默降级返回 _default_config（第十轮补上，
+         由 load_config 置的 _cfg_load_ok 标志识别）—— 这是更常见的一种：
+         config.json 是非法 JSON / 读不到 / stat 失败。
+    只有"配置读取正常且确实没配口令"才放行。"""
     global _last_good_token
     try:
         cfg = load_config()
     except Exception as exc:  # noqa: BLE001
-        env_tok = str(os.environ.get("ACCESS_TOKEN") or "").strip()
-        if _last_good_token:
-            _log.error("load_config 失败（%s）；访问门禁回退到上一次生效口令，不放行匿名访问", exc)
-            return _last_good_token
-        if env_tok:
-            _log.error("load_config 失败（%s）；回退到环境变量 ACCESS_TOKEN", exc)
-            return env_tok
-        _log.error("load_config 失败（%s）且无历史口令/环境变量：本次按「未配置口令」处理；"
-                   "若你确实配了口令，请修复 config.json 后重启服务", exc)
-        return None
+        return _token_failsafe(f"load_config 异常（{exc}）")
+    if not _cfg_load_ok:
+        return _token_failsafe("load_config 降级为默认配置（config.json 读不到或解析失败）")
     cfg_tok = str(cfg.get("access_token") or "").strip()
     if cfg_tok:
         _last_good_token = cfg_tok
@@ -2958,6 +3123,12 @@ async def access_gate(request: Request, call_next):
         return await call_next(request)
     if _auth_ok(request, token):
         return await call_next(request)
+    # 鉴权失败：计数 + 留痕 + 固定退避（见 _record_auth_failure）。
+    # 刻意**不**在这里改状态码（仍是 401/302）：前端的未登录处理认的就是 401
+    # （app.js 见 401 跳 /login），改成 429 会掉进通用错误分支反复重试。
+    # 限流效果由"每失败一秒"的退避提供，足够把在线爆破压到不可行。
+    _record_auth_failure(_client_ip(request), "gate")
+    await asyncio.sleep(_LOGIN_BACKOFF_SECONDS)
     if path.startswith("/api/"):
         return JSONResponse({"detail": "访问口令无效或未登录"}, status_code=401)
     return RedirectResponse("/login", status_code=302)
@@ -3041,6 +3212,8 @@ _LOGIN_LOCK_SECONDS = 600
 # 防内存无限增长：攻击者伪造海量源 IP 时字典只保留最近 1000 项，
 # 每次失败写入时惰性淘汰过期项 + 超限删最旧（FIFO），开销 O(n) 但仅登录路径触发。
 _LOGIN_TRACK_MAX = 1000
+# 失败后的固定退避（秒）：经隧道暴露在公网时显著拖慢在线爆破（把速率压到 ~1 次/秒/IP）
+_LOGIN_BACKOFF_SECONDS = 1.0
 _login_track: dict[str, dict] = {}
 
 
@@ -3064,8 +3237,26 @@ def _login_locked(ip: str) -> bool:
     return rec["fails"] >= _LOGIN_FAIL_MAX
 
 
+def _record_auth_failure(ip: str, source: str) -> int:
+    """记一次鉴权失败（按来源 IP 计数 + 留痕），返回该 IP 的累计失败次数。
+
+    为什么必须共用一处：爆破防护原先只挂在 `POST /api/login` 上，但**真正守门的是
+    access_gate → _auth_ok()**（比对 Bearer / cookie）。攻击者只要对任意 `/api/*`
+    端点逐个换 `Authorization: Bearer <猜测>` 就能无限次尝试口令 —— 不计数、不留痕、
+    不退避，那套限流完全不参与，等于形同虚设。两个入口现在走同一套计数与留痕。
+
+    只记来源 IP 与累计次数，**绝不记录口令内容**。"""
+    now = time.time()
+    rec = _login_track.setdefault(ip, {"fails": 0, "first": now})
+    rec["fails"] += 1
+    _purge_login_track(now)
+    _log.warning("auth failed: ip=%s consecutive_fails=%d/%d source=%s",
+                 ip, rec["fails"], _LOGIN_FAIL_MAX, source)
+    return rec["fails"]
+
+
 def _behind_local_proxy(req: Request) -> bool:
-    """TCP 对端是本机回环/私有网段 => 请求经同机反向代理（ngrok/cloudflared）回源。
+    """TCP 对端是本机回环/私有网段 => 请求经同机反向代理（ngrok）回源。
 
     这是判断「能不能采信 X-Forwarded-* 头」的唯一依据：只有直连我们的那一跳
     是自己人时，它追加的头部才可信；公网直连时任何人都能自己塞这些头。"""
@@ -3075,6 +3266,60 @@ def _behind_local_proxy(req: Request) -> bool:
     except ValueError:
         return False
     return peer.is_loopback or peer.is_private
+
+
+# 本机管理/元数据面：任何"用户自填 URL"都不该被服务端取用。
+# 4040 是 ngrok 自己的管理 API（AGENTS.md 明文记录它的存在，返回 JSON 隧道列表），
+# 169.254.169.254 是云厂商元数据服务；两者都是典型的 SSRF 提权靶点，
+# 且都**不可能是**一个 OpenAI 兼容的对话网关地址，误伤风险为零。
+_URL_BLOCKED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]"})
+_URL_BLOCKED_PORTS = frozenset({4040, 4041})
+_METADATA_HOST = "169.254.169.254"
+
+
+def _url_is_blocked_target(raw: str, cfg_base: str = "") -> str:
+    """用户自填的 base_url 是否指向「不该由服务端访问」的目标；返回拒绝原因（空串=放行）。
+
+    背景（第九轮审计）：/api/llm-models 在「未传 key 且自填 base_url」时仍会带空
+    Authorization 发 GET，等于把服务端当成内网探测器；填 `http://127.0.0.1:4040/api`
+    还能把 ngrok 管理面返回的 JSON 原样回显给调用方。虽然该端点整体在访问门禁之内，
+    但"服务端替用户请求任意外部 URL"本身不该存在。
+
+    设计上刻意**不**一刀切禁私网：本项目支持本地 LLM（ollama/llama.cpp，见 llm/），
+    用户把 cloud.base_url 配成本机地址是正常用法。因此这里只拒绝：
+      1) 非 http(s) 协议（file:// / gopher:// 等）；
+      2) 本机管理面（127.0.0.1 / localhost）—— 本机 LLM 请按第 3 条用局域网 IP，
+         或直接把它配成 config 里的 provider URL；
+      3) 本机管理端口 4040/4041（ngrok 管理 API）；
+      4) 云元数据地址 169.254.169.254。
+    """
+    url = (raw or "").strip()
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "http://" + url
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        return f"API 地址无法解析：{exc}"
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return f"仅支持 http/https 地址（收到 {scheme or '未知'}）"
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return "API 地址缺少主机名"
+    if host == _METADATA_HOST:
+        return "拒绝访问云元数据地址（SSRF 防护）"
+    port = parsed.port
+    if port in _URL_BLOCKED_PORTS:
+        return f"拒绝访问本机管理端口 {port}（ngrok 管理面，SSRF 防护）"
+    # 配置里本来就是这个地址时不额外拦（那是机主自己的选择，且探测早就天天在发）
+    if cfg_base and url.rstrip("/") == cfg_base.rstrip("/"):
+        return ""
+    if host in _URL_BLOCKED_HOSTS or host.startswith("127."):
+        return ("拒绝把服务端指向本机回环地址（SSRF 防护）：请改填 config.json 里的 provider "
+                "地址，或使用局域网 IP")
+    return ""
 
 
 def _cookie_secure(req: Request) -> bool:
@@ -3116,14 +3361,10 @@ async def login_api(req: Request, payload: LoginRequest):
         raise HTTPException(429, "失败次数过多，请 10 分钟后再试")
     token = _access_token()
     if not token or not hmac.compare_digest(payload.token.strip(), token):
-        rec = _login_track.setdefault(ip, {"fails": 0, "first": time.time()})
-        rec["fails"] += 1
-        _purge_login_track(time.time())
-        # 公网爆破留痕：只记来源 IP 与连续失败次数，绝不记口令内容
-        _log.warning("login failed: ip=%s consecutive_fails=%d/%d",
-                     ip, rec["fails"], _LOGIN_FAIL_MAX)
-        # 固定退避：经隧道暴露公网时显著拖慢在线爆破
-        await asyncio.sleep(1.0)
+        # 计数/留痕/退避统一走 _record_auth_failure，与 access_gate 的 Bearer 路径
+        # 共用同一套（否则那条路径是完整绕过口）
+        _record_auth_failure(ip, "login")
+        await asyncio.sleep(_LOGIN_BACKOFF_SECONDS)
         raise HTTPException(401, "访问口令错误")
     _login_track.pop(ip, None)
     resp = JSONResponse({"ok": True})
@@ -4417,6 +4658,12 @@ async def llm_models(req: dict):
             api_key = cfg.get("cloud", {}).get("api_key", "")
     if not base_url:
         raise HTTPException(400, "请先填写云端 API 地址")
+    # SSRF 防护（第九轮）：只有「显式覆盖地址」才需要过闸；沿用 config 的地址不拦，
+    # 那是机主自己的配置，且本地 LLM（ollama/llama.cpp）地址本来就可能是回环。
+    if req_base:
+        blocked = _url_is_blocked_target(req_base, cfg_base)
+        if blocked:
+            raise HTTPException(400, blocked)
     try:
         r = await httpx_client.get(
             f"{base_url}/models",
@@ -4465,6 +4712,13 @@ async def llm_quota(req: QuotaRequest):
     cfg_base = (cfg_cloud.get("base_url") or "").rstrip("/")
     req_base = (req.base_url or "").rstrip("/")
     base_url = req_base or cfg_base
+    # SSRF 防护：与 /api/llm-models 同一道闸。本端点会按调用方给的 base_url 拼出
+    # quota 端点并真的发 GET，此前却漏了这道检查 —— 口令一旦泄露/被绕过，SSRF 靶点
+    # 就从 llm-models 转移到这个端点（可打内网 / 本机 ngrok 管理面 4040）。
+    if req_base:
+        blocked = _url_is_blocked_target(req_base, cfg_base)
+        if blocked:
+            raise HTTPException(400, blocked)
     api_key = req.api_key or ""
     if not api_key:
         if not req_base or req_base == cfg_base:
@@ -4701,18 +4955,21 @@ async def index():
 
 
 # /api/status 的「纯配置片段」脱敏缓存：前端会高频轮询该端点，旧实现每次都
-# deepcopy 整份 config（角色人设可达数千字）再递归脱敏。load_config 在
-# (mtime, env 签名) 不变时返回同一对象，故按 id(cfg) 缓存脱敏结果即可——
-# 配置一变（保存/换角色）对象身份即变，缓存自然失效。音色注册状态是文件
-# exists() 的结果、不在配置里，由路由每次实时组装，不进缓存。
+# deepcopy 整份 config（角色人设可达数千字）再递归脱敏。
+# 缓存键 = config mtime + 相关 env 签名（与 load_config / _apply_env_overrides 同源）；
+# 不用 id(cfg) —— 旧配置对象被 GC 后 id 可能被新对象复用，理论上会误命中。
+# 音色注册状态是文件 exists() 的结果、不在配置里，由路由每次实时组装，不进缓存。
 _status_parts_cache: dict = {"key": None, "value": None}
 
 
 def _status_config_parts(cfg: dict) -> dict:
-    """返回 /api/status 中纯配置来源、已统一脱敏的片段（按配置身份缓存）。
+    """返回 /api/status 中纯配置来源、已统一脱敏的片段（按配置状态缓存）。
 
     缓存键与 load_config/_apply_env_overrides 同源：config mtime + 相关 env
-    签名。不用 id(cfg)——旧配置对象被 GC 后 id 可能被新对象复用，理论上会误命中。"""
+    签名。不用 id(cfg)——旧配置对象被 GC 后 id 可能被新对象复用，理论上会误命中。
+
+    调用方只能**读**，且只可写返回值顶层的新键（如 resp["active_online"]）；
+    改嵌套值（resp["cloud"][...]）会污染缓存本体、影响后续所有请求。"""
     key = (_cfg_cache.get("_mtime_ns"), _env_override_signature())
     c = _status_parts_cache
     if c["key"] == key and c["value"] is not None:
@@ -4771,8 +5028,19 @@ async def status():
 
 
 @app.get("/api/health")
-async def health():
-    """轻量健康检查：只报进程自身状态与缓存概况，不探测外部服务。"""
+async def health(request: Request):
+    """健康检查：探活字段永远返回，运维细节只在「未配口令」或「已通过鉴权」时返回。
+
+    第九轮审计：本端点原被 access_gate 白名单无条件放行，于是一个只拿到 ngrok 地址
+    的人，未登录就能读到磁盘总量/余量、按供应商累计的 token 消耗、缓存文件数、
+    SSE 订阅者数、进程 uptime —— 这些不是密钥，但确实是不该公开的运维面。
+    而 /api/health 又被 start.bat / start_deploy.bat / _run_service_detached.bat
+    当作免登录探活端点使用，所以不能一关了之：探活字段保留，细节字段按鉴权收敛。
+    """
+    token = _access_token()
+    if token and not _auth_ok(request, token):
+        return {"ok": True}
+
     cache_files = await _tts_cache_file_count()
 
     def _disk_usage():
@@ -5434,12 +5702,20 @@ async def role_state_reset():
 
 
 @app.get("/api/activity")
-async def activity():
+async def activity(request: Request):
     """部署机活跃感知：最近 5 分钟内有对话/问候视为活跃（自动部署据此延迟重启，
-    避免 push 部署在聊天进行中打断对话）。仅返回时间戳，无敏感信息。"""
+    避免 push 部署在聊天进行中打断对话）。
+
+    第九轮：白名单放行的端点里不再回传精确时间戳给未登录调用方 —— 那个时间戳等价于
+    "机主现在正在聊天"（作息/在线状态的实时信号）。自动部署只需要 active 布尔值。
+    """
     now_ms = time.time() * 1000
     last = _last_activity_ts
-    return {"last_chat_ts": last, "active": bool(last) and (now_ms - last) < 300_000}
+    active = bool(last) and (now_ms - last) < 300_000
+    token = _access_token()
+    if token and not _auth_ok(request, token):
+        return {"active": active}
+    return {"last_chat_ts": last, "active": active}
 
 
 # greeting 并发合并：页面多开/前端重试可能同时打两个问候请求，两次都是完整 LLM
@@ -5666,11 +5942,16 @@ async def _read_sessions_cached() -> dict:
             data = await asyncio.to_thread(json.loads, raw)
             sessions = data.get("sessions")
             deleted = data.get("deleted")
+            # 非有限浮点清洗（详见 _sanitize_nonfinite 的说明）：存量坏文件在这里就被
+            # 治愈 —— GET /api/sessions 立刻恢复可解析，不必等用户手改 sessions.json
+            # （只读性清洗，不改磁盘；下一次 PUT 才会把干净内容写回去）。
             value = {
-                "sessions": sessions if isinstance(sessions, list) else [],
-                "deleted": deleted if isinstance(deleted, list) else [],
+                "sessions": _sanitize_nonfinite(sessions) if isinstance(sessions, list) else [],
+                "deleted": _sanitize_nonfinite(deleted) if isinstance(deleted, list) else [],
             }
-            fp = _sessions_fp(raw)
+            # sha1 是纯 CPU：5–32MB 文件约 10–120ms，跑在事件循环上会让 SSE 心跳带抖。
+            # 序列化早已走线程池，指纹当时漏了。
+            fp = await asyncio.to_thread(_sessions_fp, raw)
         except (json.JSONDecodeError, OSError, AttributeError):
             # 读/解析失败不动缓存（可能是瞬时故障），本次返回空即可
             return {"sessions": [], "deleted": []}
@@ -5718,7 +5999,15 @@ async def get_sessions(request: Request, include_test: int = 0):
     payload = {"sessions": sessions, "deleted": deleted, "fp": fp}
 
     def _render_sessions_body() -> bytes:
-        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        try:
+            # allow_nan=False：绝不下发 Infinity/NaN —— 它们是 RFC 8259 非法字面量，
+            # 浏览器 Response.json() 直接抛错，等于所有设备的多端同步一起停摆。
+            return json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except ValueError:
+            # 理论上不可达（_sess_cache 里的值都经过 _sanitize_nonfinite）。真出现时
+            # 宁可清洗后照常服务，也绝不让 GET 500 —— 那正是"同步停摆"的症状本身。
+            return json.dumps(_sanitize_nonfinite(payload), ensure_ascii=False,
+                              allow_nan=False).encode("utf-8")
 
     body = await asyncio.to_thread(_render_sessions_body)
     headers = {"ETag": etag, "Cache-Control": "no-cache"} if etag else {}
@@ -5814,14 +6103,16 @@ async def put_sessions(req: SessionsRequest, client: str = ""):
     # 那些消息进不了合并就直接消失在所有设备上。这里显式按时间排序再截断，
     # 不依赖调用方的数组顺序。
     _SESS_INGEST_MAX = 500
-    incoming = sorted(
-        (s for s in req.sessions if isinstance(s, dict)),
-        key=_sess_updated_at,
-        reverse=True,
-    )[:_SESS_INGEST_MAX]
+    # 入参清洗：inf/nan 会在落盘时写成 Infinity/NaN，让 GET 的响应体永久非法
+    # （前端 r.json() 必抛错 → 全设备同步停摆）。这里先归一成 None，再进合并。
+    _incoming_all = [_sanitize_nonfinite(s) for s in req.sessions if isinstance(s, dict)]
+    # 排序与截断用置顶优先键（与 _merge_sessions 同一实现），不再只看 updatedAt
+    incoming = sorted(_incoming_all, key=_sess_order_key, reverse=True)[:_SESS_INGEST_MAX]
 
     def _dump(obj) -> str:
-        return json.dumps(obj, ensure_ascii=False, indent=2)
+        # allow_nan=False：写盘前的最后一道闸（入参已清洗过）。真触发时 ValueError
+        # 会被下方 except (TypeError, ValueError) 转成 400，而不是把非法字面量写进文件。
+        return json.dumps(obj, ensure_ascii=False, indent=2, allow_nan=False)
 
     async with _io_locks["sessions"]:
         current: list = []
@@ -5849,7 +6140,43 @@ async def put_sessions(req: SessionsRequest, client: str = ""):
                 pass  # 文件损坏按空基底处理，本次写入重建
         now_ms = time.time() * 1000
         tombstones = _norm_tombstones([*file_deleted, *req.deleted], now_ms)
-        merged = _merge_sessions(current, incoming, tombstones)
+        # 入口截断：本端**送进来的**会话超过上限时，超出部分根本没进合并。
+        # 这是更早、更彻底的一种"静默丢"：只在合并层记账会完全看不到它。
+        ingest_dropped = max(0, len(_incoming_all) - len(incoming))
+        if ingest_dropped:
+            _kept_ids = {s.get("id") for s in incoming}
+            ingest_stats = {
+                "stage": "ingest",
+                "total": len(_incoming_all),
+                "kept": len(incoming),
+                "dropped": ingest_dropped,
+                "dropped_ids": [s.get("id") for s in _incoming_all
+                                if s.get("id") not in _kept_ids][:50],
+            }
+            _log.warning(
+                "sessions ingest truncated: received=%d kept=%d dropped=%d "
+                "(超出上限的会话不会进入合并，也不会写入 sessions.json)",
+                ingest_stats["total"], ingest_stats["kept"], ingest_dropped,
+            )
+            try:
+                await asyncio.to_thread(_append_truncation_log, ingest_stats)
+            except Exception as exc:  # noqa: BLE001 审计日志失败不能影响保存
+                _log.warning("ingest truncation audit log failed: %s", exc)
+        merge_stats: dict = {}
+        merged = _merge_sessions(current, incoming, tombstones, stats=merge_stats)
+        # 上限截断必须留痕：会话被截掉是**永久**的（超出部分不会随下次 PUT 回来），
+        # 而 merge 层是静默截断。这里告警 + 落一条审计日志，方便事后定位"会话哪去了"。
+        if merge_stats.get("dropped"):
+            merge_stats["stage"] = "merge"
+            _log.warning(
+                "sessions truncated by cap: merged=%d kept=%d dropped=%d "
+                "(超出上限的会话不会写入 sessions.json，请归档/清理旧会话)",
+                merge_stats.get("total", 0), merge_stats.get("kept", 0), merge_stats.get("dropped", 0),
+            )
+            try:
+                await asyncio.to_thread(_append_truncation_log, merge_stats)
+            except Exception as exc:  # noqa: BLE001 审计日志失败不能影响保存
+                _log.warning("truncation audit log failed: %s", exc)
         if len(tombstones) > _TOMBSTONE_MAX_COUNT:
             tombstones = dict(sorted(tombstones.items(), key=lambda kv: kv[1], reverse=True)[:_TOMBSTONE_MAX_COUNT])
 
@@ -5881,7 +6208,7 @@ async def put_sessions(req: SessionsRequest, client: str = ""):
         tmp = SESSIONS_PATH.with_name(f"sessions.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         try:
             await asyncio.to_thread(tmp.write_text, payload_str, encoding="utf-8")
-            await asyncio.to_thread(tmp.replace, SESSIONS_PATH)
+            await asyncio.to_thread(_atomic_replace, tmp, SESSIONS_PATH)
         except OSError as exc:
             # 云盘同步客户端会瞬时锁文件，写失败要把临时文件收掉，
             # 否则每次重试都在 data/ 留一份数十 MB 的 sessions.tmp
@@ -5892,7 +6219,8 @@ async def put_sessions(req: SessionsRequest, client: str = ""):
         except OSError:
             _sess_cache["_mtime_ns"] = 0
         _sess_cache["_value"] = payload_obj
-        _sess_cache["_fp"] = _sessions_fp(payload_str)
+        # 同上：指纹的 sha1 也丢线程池，不在事件循环里算
+        _sess_cache["_fp"] = await asyncio.to_thread(_sessions_fp, payload_str)
     _broadcast_sessions_changed(client)
     return {"ok": True, "fp": _sess_cache.get("_fp", "")}
 
