@@ -1,6 +1,7 @@
 {
   "provider": "cloud",
   "access_token": "",
+  "cors_allow_origins": [],
   "vision": {
     "enabled": true,
     "base_url": "http://127.0.0.1:11435/v1",
