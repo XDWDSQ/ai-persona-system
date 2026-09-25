@@ -79,8 +79,13 @@ self.addEventListener('fetch', function (e) {
     /* 导航：网络优先，成功则回写缓存；离线时回退缓存副本 */
     e.respondWith(
       fetch(req).then(function (res) {
-        /* 只回写 2xx：Cache API 拒绝 5xx/4xx，裸 c.put 会产生未捕获的 reject */
-        if (res && res.status === 200) {
+        /* 只回写 2xx：Cache API 拒绝 5xx/4xx，裸 c.put 会产生未捕获的 reject。
+           还必须排除"被重定向过"的响应：未登录时服务端对页面返回 302 -> /login，
+           fetch 默认跟随重定向，最终拿到的是一个 status 200 的**登录页** —— 若照常
+           回写，它就会冒充聊天页进缓存，用户之后离线启动 PWA 看到的是登录页。 */
+        var samePath = false;
+        try { samePath = !!res && !!res.url && new URL(res.url).pathname === url.pathname; } catch (e) {}
+        if (res && res.status === 200 && !res.redirected && samePath) {
           var copy = res.clone();
           caches.open(CACHE).then(function (c) { return c.put(req, copy); }).catch(function () {});
         }

@@ -621,7 +621,12 @@
         /* ===== Input ===== */
         /* 输入栏层级高于桌宠（#pet z-60）：窄窗口下居中的输入胶囊会被右下角桌宠压住，
            曾导致发送按钮点不到；输入栏抬到 61 后桌宠从输入栏下方滑过，其余区域照常覆盖 */
-        .inputbar{flex:none;padding:10px 22px 20px;position:relative;z-index:61}
+        /* --kb-h：软键盘实际遮挡高度（由 app.js 的 visualViewport 监听写入 px）。
+           只在 iOS 这类"键盘叠加、布局视口不缩"的浏览器上非零 —— 那里 100dvh 不会
+           因为键盘而变小，body 又是 overflow:hidden 无法滚动让位，输入胶囊会被键盘
+           整个盖住（用户看不见自己打的字）。Chromium 走 interactive-widget=
+           resizes-content，这个变量恒为 0，等价于原来的 padding。 */
+        .inputbar{flex:none;padding:10px 22px calc(20px + var(--kb-h,0px));position:relative;z-index:61}
         /* 胶囊输入栏：大圆角 + 悬浮投影，聚焦时珊瑚描边 + 外发光 */
         .inputbar-inner{position:relative;max-width:760px;margin:0 auto;display:flex;gap:10px;align-items:flex-end;border:1px solid var(--border);border-radius:24px;background:color-mix(in srgb,var(--card) 94%,transparent);padding:8px 8px 8px 10px;transition:border-color .18s ease,box-shadow .18s ease;box-shadow:0 10px 34px -20px rgba(0,0,0,.5)}
         .inputbar-inner:focus-within{border-color:color-mix(in srgb,var(--chart-2) 55%,transparent);box-shadow:0 0 0 3px color-mix(in srgb,var(--chart-2) 16%,transparent),0 10px 34px -18px color-mix(in srgb,var(--chart-2) 30%,transparent)}
@@ -671,7 +676,10 @@
         .load-earlier:hover{color:var(--chart-2);background:color-mix(in srgb,var(--chart-2) 12%,transparent);border-color:color-mix(in srgb,var(--chart-2) 65%,transparent)}
 
         /* ===== Toast ===== */
-        .toasts{position:fixed;top:20px;right:20px;z-index:80;display:flex;flex-direction:column;gap:10px;pointer-events:none}
+        /* z-index 必须高于所有遮罩：设置面板 998、确认框 1200、灯箱 1002。
+           旧的 80 会被设置遮罩整块盖住 —— 于是"保存设置失败"的提示用户根本看不见，
+           设置看起来像保存成功了，实际后端配置没变。 */
+        .toasts{position:fixed;top:20px;right:20px;z-index:1300;display:flex;flex-direction:column;gap:10px;pointer-events:none}
         .toast{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 16px;font-size:13px;color:var(--foreground);box-shadow:0 18px 50px -18px rgba(0,0,0,.55);min-width:220px;max-width:360px;display:flex;align-items:flex-start;gap:10px;opacity:0;transform:translateX(16px) translateY(-4px);transition:opacity .22s cubic-bezier(.2,.7,.2,1),transform .22s cubic-bezier(.2,.7,.2,1)}
         .toast.show{opacity:1;transform:none}
         .toast svg{width:16px;height:16px;flex:none;margin-top:1px}
@@ -790,8 +798,9 @@
           .regen-btn{padding:0;width:26px;height:26px;justify-content:center;gap:0;border-radius:50%;flex:none}
           .regen-btn span{display:none}
           .regen-btn svg{width:12px;height:12px}
-          /* 底部安全区（iPhone 横条）+ iOS 输入框 <16px 聚焦会触发页面缩放 */
-          .inputbar{padding:8px 12px calc(8px + env(safe-area-inset-bottom,0px))}
+          /* 底部安全区（iPhone 横条）+ iOS 输入框 <16px 聚焦会触发页面缩放
+             + --kb-h（软键盘遮挡高度，见 app.js 的 visualViewport 监听） */
+          .inputbar{padding:8px 12px calc(8px + env(safe-area-inset-bottom,0px) + var(--kb-h,0px))}
           /* 输入区与左右圆钮同高（36px）平齐，紧凑一条；
              padding 6px 让 16px 文字行在 36px 内光学居中，与圆钮中心对齐 */
           .inputbar-inner{padding:5px 5px 5px 12px;gap:6px;border-radius:20px;align-items:center}

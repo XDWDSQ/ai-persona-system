@@ -145,9 +145,16 @@
             _cfCancel = document.getElementById('cf-cancel');
             return true;
           }
+          /* 重入保护：同一时刻只允许一个确认框存在。
+             同一个按钮连点/移动端双击时，旧实现会向同一个 #confirm-modal 再挂一遍
+             监听并覆盖文案，两个 Promise 被同一次点击同时 resolve —— 用户看到的是
+             第二个问题，回答的却是第一个。已经在开了就直接返回"取消"。 */
+          var _cfBusy = false;
           /* 返回 Promise：resolve(true) 确认 / resolve(false) 取消。message 为文本时自动转义。 */
           function confirmDialog(message, opts) {
             if (!_cfReady()) return Promise.resolve(window.confirm(message || ''));
+            if (_cfBusy) return Promise.resolve(false);
+            _cfBusy = true;
             opts = opts || {};
             return new Promise(function(resolve){
               var cfReturnFocus = document.activeElement;
@@ -158,6 +165,7 @@
                 trapTabIn(_cfModal, e);
               };
               function close() {
+                _cfBusy = false;   /* 必须复位，否则一次确认后所有后续确认框都被吞掉 */
                 _cfModal.classList.remove('show');
                 _cfOk.removeEventListener('click', onOk);
                 _cfCancel.removeEventListener('click', onCancel);
@@ -209,14 +217,16 @@
              这里给所有 api() 调用装 20s 硬超时；调用方自带 signal 时用 AbortSignal.any
              合并（不支持则该浏览器/WebView 保持旧行为，不会更糟）。 */
           var API_TIMEOUT_MS = 20000;
-          function apiTimeoutSignal(outer) {
+          /* ms 省略时用 20s；TTS 合成这类本来就慢的请求传 60000。 */
+          function apiTimeoutSignal(outer, ms) {
+            var budget = ms || API_TIMEOUT_MS;
             var ctl = null;
             try { ctl = new AbortController(); } catch (e) { return { signal: outer || undefined, timedOut: function(){ return false; }, done: function(){} }; }
             var timedOut = false;
             var timer = setTimeout(function(){
               timedOut = true;
               try { ctl.abort(); } catch (e) {}
-            }, API_TIMEOUT_MS);
+            }, budget);
             var signal = ctl.signal;
             if (outer) {
               if (typeof AbortSignal !== 'undefined' && AbortSignal.any) {
@@ -412,7 +422,7 @@
                     if (stickBottom) snapBottom();
                   });
                 } else if (renderer) {
-                  renderer(fullText); /* 帧合并 + 增量追加，渲染频率锁到屏幕刷新率 */
+                  renderer.frame(fullText); /* 帧合并 + 增量追加，渲染频率锁到屏幕刷新率 */
                 }
               }, ctl && ctl.signal);
               hideTyping();
@@ -437,6 +447,11 @@
               s = fresh;
               var aiMsg = { role: 'assistant', content: clean, style: style, narration: res.narration || '', ts: Date.now() };
               s.history.push(aiMsg);
+              /* 先记下本条回复在 history 里的下标（剧情 event 会紧接着再 push 一条，
+                 之后 len-1 就不是它了）。流式气泡此前从不写 dataset.hidx，于是删除它
+                 时只能退回"按内容正序匹配第一条"—— 模型复读同一句话时，删掉的会是
+                 **更早的那条**同文消息。 */
+              var aiIdx = s.history.length - 1;
               /* 剧情推进：本轮触发了剧情事件（赛果记录/阶段推进）时，把系统分隔线也入库，
                  刷新/换设备后仍能看到剧情节点；role=event 不会进模型上下文 */
               var storyEvText = '';
@@ -455,13 +470,19 @@
                   div = addMsg('assistant', clean);
                 } else {
                   var b2 = div.querySelector('.bubble');
-                  /* 以 clean 为准：剥净残留 style/元话语标记；走 setBubbleContent 保留
-                     APK 点字跳播的 .tts-seg 分段（直接 textContent 会销毁分段），
-                     网页端同时做链接化；超长回复顺手折叠 */
-                  setBubbleContent(b2, clean);
+                  /* 以 clean 为准：剥净残留 style/元话语标记；终稿优先走 renderer.finish
+                     （见下），它写纯文本（网页端与增量帧一致，均不经过链接化）。 */
+                  /* 终稿必须走 renderer.finish：它会取消挂起帧并置 finalized，
+                     否则最后一个 delta 排队的 rAF 会把气泡写回未清洗原文/重复尾段
+                     （服务端 clean 还做了 _strip_meta_notes/_fix_addressing/_split_narration，
+                     与客户端 stripStyleTag 不等，相等兜底挡不住）。 */
+                  if (renderer && renderer.finish) renderer.finish(clean);
+                  else setBubbleContent(b2, clean); /* 兜底：无渲染器时保留原链接化/分段行为 */
                   applyClamp(div, clean);
                   b2.classList.remove('no-text');
                 }
+                /* 绑定下标：删除/操作这条气泡时按 hidx 精确定位，不再依赖内容匹配 */
+                div.dataset.hidx = String(aiIdx);
                 var meta = div.querySelector('.msg-meta');
                 var spk = makeSpeakBtn(clean, style, aiMsg, sessionId);
                 meta.appendChild(spk);
@@ -469,7 +490,9 @@
                 meta.appendChild(makeRegenBtn(div));
                 if (storyEvText) addMsg('event', storyEvText); /* 分隔线跟在回复后面，像系统结算 */
                 if (res.story_update) refreshStoryEntry(res.story_update);
-                if (state.soundOn) ttsAndPlay(clean, spk, style, false, aiMsg, sessionId);
+                /* .catch：ttsAndPlay 的前置段（stopAudio 等）在 try 之外，未捕获会变成
+                   控制台 unhandled rejection，污染错误追踪 */
+                if (state.soundOn) ttsAndPlay(clean, spk, style, false, aiMsg, sessionId).catch(function(){});
               }
             } catch (e) {
               hideTyping();
@@ -486,7 +509,10 @@
                   f2.history.push(keptMsg);
                   markSessionActivity(sessionId);
                   if (currentSessionId === sessionId && div && div.querySelector('.bubble')) {
-                    setBubbleContent(div.querySelector('.bubble'), kept);
+                    /* 中断收尾同样要取消挂起帧，否则最后一批增量的 rAF 会在写入
+                       kept 之后再追加一段，屏幕上出现重复尾巴 */
+                    if (renderer && renderer.finish) renderer.finish(kept);
+                    else setBubbleContent(div.querySelector('.bubble'), kept);
                     applyClamp(div, kept);
                     div.classList.remove('no-text');
                     /* 与正常收尾保持同一形态：补挂朗读/重新合成/重新生成，
@@ -581,10 +607,16 @@
             var pending = null;   /* 待渲染的 fullRaw（帧合并缓冲） */
             var rafId = 0;
             var base = '';        /* 已渲染的 clean 文本，作为增量计算的前缀基准 */
+            var finalized = false; /* 收尾已写终稿：之后排队的帧一律只同步 base，绝不碰 DOM */
             function flush() {
               rafId = 0;
               if (pending === null) return;
               var raw = pending; pending = null;
+              /* 收尾竞态防护（第一道）：done 处理会绕过渲染器直接写整段 clean，
+                 此时若还有排队的 rAF flush，按 base 追加增量会把末段重复一遍
+                 （delta 与 done 同帧到达时必现）。finalized 之后终稿已经写好，
+                 排队帧一律直接丢掉，绝不再读写 DOM。 */
+              if (finalized) { return; }
               /* 快速路径：全文没有 style 标记的起始特征时不跑全文正则（长文每帧 O(n) 正则
                  是长回复流式掉帧的根源之一）；indexOf 探测是原生快速操作，标记真出现时再回落 */
               var clean;
@@ -595,9 +627,8 @@
               } else {
                 clean = stripStyleTag(raw);
               }
-              /* 收尾竞态防护：done 处理会绕过渲染器直接写整段文本（b2.textContent = clean），
-                 此时若还有排队的 rAF flush，按 base 追加增量会把末段重复一遍
-                 （delta 与 done 同帧到达时必现）。气泡已等于目标文本 → 只同步 base。 */
+              /* 收尾竞态防护（第二道，兜住"终稿内容恰好等于本帧内容"的良性情况）：
+                 气泡文本已等于本帧 clean 时无需再动 DOM，只同步 base。 */
               if (clean && bubble.textContent === clean) {
                 base = clean;
                 if (onRendered) onRendered();
@@ -619,9 +650,25 @@
               bubble.classList.remove('no-text');
               if (onRendered) onRendered();
             }
-            return function(fullRaw) {
-              pending = fullRaw;
-              if (!rafId) rafId = requestAnimationFrame(flush);
+            /* 收尾固化：写终稿的唯一入口。先取消挂起帧、丢弃缓冲并置位 finalized，
+               再写文本 —— 此后任何已排队的 rAF 回到 flush 都会在第一道守卫直接返回，
+               不可能再按旧 base 追加重复尾段或写回未清洗原文。 */
+            function finish(finalText) {
+              if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+              pending = null;
+              finalized = true;
+              var t = (finalText === undefined || finalText === null) ? '' : String(finalText);
+              base = t;
+              bubble.textContent = t;
+              if (t) bubble.classList.remove('no-text');
+              if (onRendered) onRendered();
+            }
+            return {
+              frame: function(fullRaw) {
+                pending = fullRaw;
+                if (!rafId) rafId = requestAnimationFrame(flush);
+              },
+              finish: finish,
             };
           }
 
@@ -1677,7 +1724,7 @@
             b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg><span class="speak-label">朗读</span>';
             b._msg = msg || null;
             b._sid = sid || null;
-            b.onclick = function(){ ttsAndPlay(text, b, style, false, msg, sid); };
+            b.onclick = function(){ ttsAndPlay(text, b, style, false, msg, sid).catch(function(){}); };
             /* 循环播放开关：开启后该条音频播完自动从头再播。
                偏好持久化进消息（msg.loop，随会话保存）：切会话/重渲染后仍保持。 */
             var lb = document.createElement('button');
@@ -1714,7 +1761,7 @@
             b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg><span class="speak-label">重新合成</span>';
             b._msg = msg || null;
             b._sid = sid || null;
-            b.onclick = function(){ ttsAndPlay(text, b, style, true, msg, sid); };
+            b.onclick = function(){ ttsAndPlay(text, b, style, true, msg, sid).catch(function(){}); };
             return b;
           }
           async function ttsAndPlay(text, btn, style, force, msg, sid) {
@@ -1760,8 +1807,11 @@
               if (!url || force) {
                 // 已持久化到消息的音频 URL（刷新/切会话后仍在）：直接取，免重新合成
                 if (!force && msg && msg.audio) {
+                  /* 读已缓存音频也必须有上限：这条 GET 半开时不设限会让整个朗读流程
+                     永不 settle（按钮停在"正在合成…"），这里超时后自然落到下面的合成兜底 */
+                  var ato = apiTimeoutSignal(null, 20000);
                   try {
-                    var gr = await fetch(msg.audio);
+                    var gr = await fetch(msg.audio, { signal: ato.signal });
                     if (gr.ok) {
                       var gu = URL.createObjectURL(await gr.blob());
                       if (state.audioCache[key]) URL.revokeObjectURL(state.audioCache[key]);
@@ -1769,16 +1819,23 @@
                       url = gu;
                     }
                   } catch (e) { /* 落到下面的合成兜底 */ }
+                  finally { ato.done(); }
                 }
                 if (!url || force) {
                   if (!force && state.ttsInflight[key]) {
                     // 同一句已有合成请求在飞（自动朗读+手动点朗读撞车），直接等它结果，不重复请求
                     url = await state.ttsInflight[key];
                   } else {
+                    /* 硬超时：/api/tts 要真的合成音频（长文/弱网可达数十秒），但半开连接
+                       （ngrok 抖动、切网、后端重启未发 RST）时它会永不 settle —— 而返回的
+                       Promise 又被 state.ttsInflight 缓存，于是"点重试"拿到的是同一个死
+                       Promise，朗读按钮永久停在"正在合成…"，只能刷新页面。给 60s 上限。 */
+                    var tto = apiTimeoutSignal(null, 60000);
                     var job = (async function(){
                       var r = await fetch('/api/tts', {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ text: text, style: style || '', speed: state.speed, force: force }),
+                        signal: tto.signal,
                       });
                       if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
                       if (!r.ok) throw new Error('TTS 失败');
@@ -1807,7 +1864,16 @@
                       return u;
                     })();
                     if (!force) state.ttsInflight[key] = job;
-                    try { url = await job; } finally { if (!force) delete state.ttsInflight[key]; }
+                    try {
+                      url = await job;
+                    } catch (e) {
+                      /* 超时给出可读中文：浏览器原生的 "Failed to fetch"/AbortError 对用户毫无信息量 */
+                      if (tto.timedOut()) throw new Error('语音合成超时，请重试');
+                      throw e;
+                    } finally {
+                      if (!force) delete state.ttsInflight[key];
+                      tto.done();
+                    }
                   }
                 }
               }
@@ -3309,21 +3375,31 @@
              sessions.json 可达数 MB，30s 一次的全量 JSON 拉取+解析在手机端是纯浪费；
              fp 来自上次全量拉取/PUT 响应，为空（首启）时必须全量拉一次打底 */
           var _lastSessionsFp = '';
-          function pollRemoteSync() {
-            fetch('/api/sessions/fingerprint').then(function(r){
+          async function pollRemoteSync() {
+            /* 指纹探测也必须有超时：它每 30s 一发，半开连接挂住会一条条占满同源连接池，
+               把聊天/保存请求一起拖住（浏览器每源并发连接数很有限）。超时按失败处理。 */
+            var fto = apiTimeoutSignal(null, 20000);
+            try {
+              var r = await fetch('/api/sessions/fingerprint', { signal: fto.signal });
               if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
               if (!r.ok) throw new Error('HTTP ' + r.status);
-              return r.json();
-            }).then(function(d){
+              var d = await r.json();
               if (d && d.fp && _lastSessionsFp && d.fp === _lastSessionsFp) return;
+              /* 刻意不 await：这条链有自己的重试与错误处理，await 会让它的失败
+                 冒进本 catch 从而重复触发一次全量拉取（与旧版行为不一致） */
               syncSessionsFromServer();
-            }).catch(function(){
-              /* 探测失败（网络抖动/端点异常）：退回全量拉取，行为与旧版一致 */
+            } catch (e) {
+              /* 探测失败（网络抖动/超时/端点异常）：退回全量拉取，行为与旧版一致 */
               syncSessionsFromServer();
-            });
+            } finally {
+              fto.done();
+            }
           }
           function syncSessionsFromServer() {
-            fetch('/api/sessions').then(function(r){
+            /* 全量会话拉取同样半开即永久挂起（并占住同源连接池）。超时按失败处理，
+               交给下方既有重试（最多 3 次）自愈。 */
+            var sto = apiTimeoutSignal(null, 20000);
+            fetch('/api/sessions', { signal: sto.signal }).then(function(r){
               if (r.status === 401) throw new Error('未登录');  /* 不跳页：首启登录可能未就绪，走重试 */
               return r.ok ? r.json() : null;
             }).then(function(data){
@@ -3451,12 +3527,13 @@
               _syncRetry = 0;  /* 同步成功，重置重试计数 */
             }).catch(function(){
               /* 失败重试：重装/首启时登录可能尚未就绪（预热登录/代理自动重登进行中），
-                 最多重试 3 次，避免会话历史静默丢失（本地只剩"新对话"） */
+                 最多重试 3 次，避免会话历史静默丢失（本地只剩"新对话"）。
+                 超时也走这里：计时器读完全文才清（见 finally），避免半开挂在 r.json() 阶段 */
               if (_syncRetry < 3) {
                 _syncRetry++;
                 setTimeout(function(){ syncSessionsFromServer(); }, 2000);
               }
-            });
+            }).finally(function(){ sto.done(); });
           }
           /* ---------- 多端实时同步：SSE 推送 + 可见性/定时兜底 ---------- */
           function isSyncBusy() {
@@ -3500,6 +3577,41 @@
           window.addEventListener('pagehide', function(){
             try { if (syncES) syncES.close(); } catch (e) {}
           });
+          /* ---------- iOS 软键盘遮挡输入栏（visualViewport） ----------
+             触发条件：iPhone/iPad 上点输入框。iOS 的键盘是**叠加层**：布局视口
+             (innerHeight) 不变、100dvh 不变，而 body 是 overflow:hidden 无法滚动让位，
+             于是输入胶囊整块被键盘盖住，用户看不见自己打的字。
+             Chromium 被 <meta interactive-widget=resizes-content> 救了，所以只在
+             iOS 类浏览器上需要补偿：把"窗口高度 - 可视视口高度"当作键盘遮挡高度写进
+             --kb-h，由 CSS 补到 .inputbar 的 padding-bottom（见 css/chat.css）。
+             只在变化时写 DOM，且用 rAF 合并 resize 风暴。 */
+          (function initKeyboardInset(){
+            var vv = window.visualViewport;
+            if (!vv) return;  /* 不支持的浏览器保持原样（Chromium 本来也不受影响） */
+            var raf = 0;
+            function apply(){
+              raf = 0;
+              var overlap = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+              /* 40px 阈值：地址栏收放/工具栏动画会造成几十像素抖动，不该当成键盘 */
+              var h = overlap > 40 ? overlap : 0;
+              var cur = document.documentElement.style.getPropertyValue('--kb-h');
+              var next = h ? h + 'px' : '0px';
+              if (cur !== next) document.documentElement.style.setProperty('--kb-h', next);
+            }
+            function schedule(){ if (!raf) raf = requestAnimationFrame(apply); }
+            vv.addEventListener('resize', schedule);
+            vv.addEventListener('scroll', schedule);
+            /* 输入框聚焦时键盘动画还没结束，尺寸会陆续变几次；补一次聚焦后的复算 */
+            document.addEventListener('focusin', function(e){
+              var t = e.target;
+              if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT')) {
+                schedule();
+                setTimeout(schedule, 120);
+                setTimeout(schedule, 320);
+              }
+            });
+            apply();
+          })();
           /* bfcache 恢复（iOS/Android 前进后退）：JS 环境复活但原 EventSource 已在
              pagehide 关闭且不会自动重建，实时推送会永久失效——persisted 恢复时重连 */
           window.addEventListener('pageshow', function(e){
@@ -3628,10 +3740,29 @@
                 return false;
               });
             }
+            /* key 里的时间必须**分桶**（分钟粒度），不能用原始 updatedAt：
+               markSessionActivity 每收一条消息就调 renderSessions，而 updatedAt 每次都变
+               -> key 永远不同 -> 整张侧栏（N 个会话 × 3-4 个监听）每条消息重建一次，
+               对已做窗口化的消息区来说这里是漏网的 O(N) 重渲染。
+               分桶到 1 分钟与 timeLabel 的展示粒度一致（<1min 显示"刚刚"，不随秒数变）；
+               分钟刻度跨过时 key 变化、照常重建，所以显示不会过期。 */
             var key = q + '~~' + ordered.map(function(x){
-              return x.id + '|' + (x.pinned ? 1 : 0) + '|' + (x.title || '') + '|' + (x.updatedAt || 0) + '|' + (x.id === currentSessionId ? 1 : 0);
+              return x.id + '|' + (x.pinned ? 1 : 0) + '|' + (x.title || '') + '|'
+                + Math.floor((x.updatedAt || 0) / 60000) + '|' + (x.id === currentSessionId ? 1 : 0);
             }).join('~');
-            if (key === sessionsRenderKey && sessionsBox.childNodes.length) return;
+            if (key === sessionsRenderKey && sessionsBox.childNodes.length) {
+              /* 结构没变时顺便原地刷新已渲染的时间标签（同一分钟内从"刚刚"走到"N 分钟前"
+                 这种跨桶边界的情况由上面的 key 变化兜住，这里只做无副作用的同步） */
+              ordered.forEach(function(session){
+                var node = sessionsBox.querySelector('.session[data-id="' + session.id + '"]');
+                var tEl = node && node.querySelector('.s-time');
+                if (tEl) {
+                  var lbl = timeLabel(session.updatedAt);
+                  if (tEl.textContent !== lbl) tEl.textContent = lbl;
+                }
+              });
+              return;
+            }
             sessionsRenderKey = key;
             sessionsBox.innerHTML = '';
             if (!ordered.length) {
@@ -4628,7 +4759,7 @@
                   s.history.push(gMsg);
                   div.dataset.hidx = String(s.history.length - 1);
                   markSessionActivity(sessionId);
-                  if (state.soundOn && spk) ttsAndPlay(r.reply, spk, r.style, false, gMsg, sessionId);
+                  if (state.soundOn && spk) ttsAndPlay(r.reply, spk, r.style, false, gMsg, sessionId).catch(function(){});
                 }, 1500);
               }
             } catch(e) { /* 静默失败，不影响使用 */ }

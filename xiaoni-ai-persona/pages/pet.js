@@ -279,9 +279,18 @@
       }
     }
   }
-  /* 常驻低频巡检：附件菜单是异步弹/收的，事件驱动可能漏，兜底轮询 */
+  /* 常驻巡检：附件菜单是异步弹/收的，事件驱动可能漏，兜底轮询。
+     两处收敛：① 1.1s 太密 —— dodgeCheck 每轮都要 getBoundingClientRect +
+     getComputedStyle（强制同步布局），流式输出（每帧都在改气泡尺寸）时会造成可见
+     掉帧；② 标签页在后台时白烧电，直接跳过，切回前台立刻补一次。 */
   function startDodgeTimer() {
-    setInterval(dodgeCheck, 1100);
+    setInterval(function(){
+      if (document.visibilityState === 'hidden') return;
+      dodgeCheck();
+    }, 2000);
+    document.addEventListener('visibilitychange', function(){
+      if (document.visibilityState === 'visible') dodgeCheck();
+    });
   }
 
   /* ---------- 注入 CSS ---------- */
