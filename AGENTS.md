@@ -10,44 +10,20 @@
 - **实际运行 / git 仓库根**：`D:\移动云盘同步盘\AI拟人系统\ai-persona-system`（有独立 git 仓库，`origin` 指向 GitHub）
 - 旧路径 `C:\Users\8891QZ_H\Desktop\AI拟人系统` 已不是主工作区，遇到不一致以当前工作区为准。
 
-## 远程访问地址：用 ngrok
+## 运行方式：本机开发、本机启动（2026-09 起）
 
-用户日常用 **ngrok 免费版** 做公网隧道。
+项目**只在本机跑**，不再做远程 / 公网部署。
 
-**真实数据源（唯一真值，不要硬编码）**：
-
-```
-ai-persona-system/data/tunnel_url.txt
-```
-
-ngrok 免费版每次重启会换域名。被问到"服务器地址 / 远程访问链接"时，先读这个文件。
-
-### ngrok 启动约定
-
-- 用 `ngrok http 8000` 启动。
-- 启动后 URL 写入 `ai-persona-system/data/tunnel_url.txt`。
-- ngrok 自带管理界面：<http://127.0.0.1:4040>（看流量、检查状态）。
-- **免费版警告页**：新浏览器/无痕窗口首次访问免费 ngrok 域名必现 `ERR_NGROK_6024` 提示页，需点 "Visit Site" 才进应用。用户报"页面空白/记录不见"时先怀疑此页；本机 `http://127.0.0.1:8000` 与 curl/API 无此问题。
-
-### 检查 / 更新命令
-
-```bat
-REM 查看当前 URL
-type "D:\移动云盘同步盘\AI拟人系统\ai-persona-system\data\tunnel_url.txt"
-
-REM 看 ngrok 是否还在跑
-curl -s http://127.0.0.1:4040/api/tunnels
-
-REM 重启 ngrok（先关掉旧进程）
-taskkill /IM ngrok.exe /F
-ngrok http 8000
-```
+- 启动：`ai-persona-system\start.bat`；改完代码用 `restart_service.bat` 重启加载。服务监听 `http://127.0.0.1:8000`。
+- 被问"服务器地址 / 访问链接"时，答案就是 **`http://127.0.0.1:8000`** —— 不要再去找隧道地址。
+- **ngrok / 隧道流程已退役**：`data/tunnel_url.txt` 不再维护，不要再建议启动隧道、也不要再读那个文件。
+- 因此 `config.json` 的 `access_token` 现在是**可选的本地保护**（配了才生效），不再是公网必需的前置条件。
 
 ## 安全相关
 
-- 远程访问**必须**先在 `config.json` 顶层设 `access_token`（或环境变量 `ACCESS_TOKEN`），否则所有页面/API 裸奔在公网上。
+- `config.json` 顶层的 `access_token`（或环境变量 `ACCESS_TOKEN`）现在是**可选的本地保护**：配了则所有页面/API 都要求口令，不配则本机直连可用。**任何时候要把服务暴露到公网（隧道/局域网）都必须先配上它。**
 - `/api/status` 对密钥**一律脱敏**为 `***+尾4`；前端保存时后端识别掩码值并跳过该字段。
-- ngrok 免费版是公网可访问，无 access_token 等于把服务敞开。
+- 若只想在本机用，可把启动脚本的 host 从 `0.0.0.0` 改成 `127.0.0.1`（这样连局域网都进不来）。
 - **历史泄露口令视为已作废**：曾在公共仓库与旧文档里出现过明文口令，那段历史无法靠改代码撤回。仓库内不得再出现任何口令字面值（含注释与文档正文）。
 
 ## 已废弃 / 不要再引用
