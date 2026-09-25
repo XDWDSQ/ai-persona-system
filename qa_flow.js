@@ -184,6 +184,84 @@ function check(name, cond, detail) {
   const sessDisk = await cdp.eval('fetch("/api/sessions").then(r => r.json()).then(d => ({n: d.sessions.length, msgs: d.sessions[0] ? d.sessions[0].history.length : 0, title: d.sessions[0] ? d.sessions[0].title : ""}))');
   check('服务端会话已持久化（1 会话、主对话标题、消息>3）', sessDisk.n === 1 && sessDisk.msgs >= 3 && /·主对话$/.test(sessDisk.title || ''), JSON.stringify(sessDisk));
 
+  /* ===== 8) 第十轮前端修复复验（真实浏览器） ===== */
+
+  /* 8.1 主题三态可达：旧实现 #theme-tabs 元素在 chat.html 里根本不存在，app.js 的两处
+     绑定落空 —— 「跟随系统」没有任何入口能选中（静默死代码，只有 localStorage 初始化
+     能读到 auto）。 */
+  await cdp.eval('document.querySelector("[data-dom-id=btn-settings]").click(); "ok"');
+  await waitFor('document.getElementById("settings").classList.contains("show")', 3000);
+  const themeTabs = await cdp.eval('document.querySelectorAll("#theme-tabs .set-tab").length');
+  check('#theme-tabs 存在且为三态（旧实现该元素不存在）', themeTabs === 3, '实际=' + themeTabs);
+  await cdp.eval('Array.from(document.querySelectorAll("#theme-tabs .set-tab")).find(b => b.dataset.theme === "auto").click(); "ok"');
+  await sleep(250);
+  const themeState = await cdp.eval('({ saved: localStorage.getItem("xiaoni_theme"), active: (document.querySelector("#theme-tabs .set-tab.active")||{dataset:{}}).dataset.theme })');
+  check('点「跟随系统」后 theme=auto 且按钮进入激活态',
+    themeState.saved === 'auto' && themeState.active === 'auto', JSON.stringify(themeState));
+  await cdp.eval('Array.from(document.querySelectorAll("#theme-tabs .set-tab")).find(b => b.dataset.theme === "dark").click(); "ok"');
+  await sleep(200);
+
+  /* 8.2 设置面板打开时，保存失败的提示必须真的看得见。
+     旧实现 .toasts 的 z-index(80) 低于 #settings(998)，提示被整块盖住 ——
+     「设置看起来保存成功了，实际后端配置没变」。QA 实例故意拦掉 POST /api/config，
+     所以这里点保存必然失败（面板不会关，正是那个 bug 的场景）。
+     判据刻意不用 elementFromPoint：`.toasts` 是 pointer-events:none（提示不该挡住点击），
+     命中测试会跳过它，永远判"看不见"。改为判"已入场(show/opacity) + 矩形确实在视口内
+     + z-index 高于设置遮罩"，这三条正是旧实现会失败的地方。
+     先清掉历史 toast，保证测到的就是本次这条。 */
+  await cdp.eval('Array.from(document.querySelectorAll(".toasts .toast")).forEach(t => t.remove()); "ok"');
+  await cdp.eval('document.getElementById("save-settings").click(); "ok"');
+  const toastShown = await waitFor('!!document.querySelector(".toasts .toast")', 8000);
+  check('保存失败会弹出提示', toastShown, '没有出现 .toasts .toast');
+  if (toastShown) {
+    check('保存失败时设置面板不关闭（确认走的是失败路径，而不是成功）',
+      await cdp.eval('document.getElementById("settings").classList.contains("show")'), '面板被关掉了');
+    await sleep(450);   /* 等入场动画结束，getBoundingClientRect 才是最终位置 */
+    const info = await cdp.eval('(() => { const box = document.querySelector(".toasts"); const t = box.querySelector(".toast"); const r = t.getBoundingClientRect(); const cs = getComputedStyle(t); return { text: (t.querySelector("span")||{}).textContent, shown: t.classList.contains("show"), opacity: cs.opacity, onScreen: r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth, zToast: getComputedStyle(box).zIndex, zSettings: getComputedStyle(document.getElementById("settings")).zIndex }; })()');
+    check('提示确实入场且在视口内可见（旧实现被遮罩盖住）',
+      info.shown && Number(info.opacity) > 0.5 && info.onScreen, JSON.stringify(info));
+    check('提示层级高于设置遮罩（旧实现 80 < 998，必失败）',
+      Number(info.zToast) > Number(info.zSettings), 'zToast=' + info.zToast + ' zSettings=' + info.zSettings);
+    await shot('12-toast-over-settings');
+  }
+  await cdp.eval('document.getElementById("settings").classList.remove("show"); "ok"');
+  await sleep(400);
+
+  /* 8.3 流式回复的气泡必须带 dataset.hidx。
+     旧实现从不写它，于是删除该条时退回「按内容正序匹配第一条」—— 回复文本重复时，
+     删掉的会是**更早那条**同文消息。这里制造两条相同的回复，删掉后一条，然后用消息
+     **顺序**判别（文本一样，只能用顺序区分）。
+     注意不能简单连发两条：应用自身的复读检测会把「新回复与上一条完全相同」判成复读
+     并改写（QA 桩下会落失败气泡）。所以中间用 [fail] 插一条**不同**的回复作间隔，
+     这样 R 与"紧邻的上一条"不同，可以合法出现两次。 */
+  const AI_R = '好，我在。今天训练刚结束，状态还行。';
+  const AI_CUT = '这部分先流出来，';
+  const lastAiReady = '!document.getElementById("typing") && (() => { const as = document.querySelectorAll(".msg.ai"); const last = as[as.length - 1]; return !!last && !!last.querySelector(".msg-meta .speak-btn"); })()';
+  await typeAndSend('复读甲');
+  await waitFor(lastAiReady, 9000);
+  await typeAndSend('[fail] 隔断');
+  await waitFor('!document.getElementById("typing")', 9000);
+  await sleep(400);
+  await typeAndSend('复读乙');
+  await waitFor(lastAiReady, 9000);
+  const hidxPresent = await cdp.eval('(() => { const as = document.querySelectorAll(".msg.ai"); const last = as[as.length - 1]; return !!(last && last.dataset.hidx !== undefined && last.dataset.hidx !== ""); })()');
+  check('流式回复的气泡带 dataset.hidx（旧实现没有）', hidxPresent, 'dataset.hidx 缺失');
+  await dumpMessages('复读就绪');
+  await cdp.eval('(() => { const as = document.querySelectorAll(".msg.ai"); as[as.length - 1].dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 700, clientY: 400 })); return "ok"; })()');
+  await sleep(350);
+  await cdp.eval('Array.from(document.querySelectorAll("#ctx-menu button")).find(b => (b.querySelector("span")||{}).textContent === "删除消息").click(); "ok"');
+  await sleep(700);
+  const tail = await cdp.eval('Array.from(document.querySelectorAll(".msg")).slice(-6).map(m => (m.className.includes("user") ? "user:" : "ai:") + (m.querySelector(".bubble")||{textContent:""}).textContent)');
+  /* 正确：删掉「复读乙」后面的 R，留下「复读甲」后面那条 R（下标未移位）。
+     旧实现：按内容正序命中，删掉的是**更早那条 R** —— 于是 复读甲 后面直接跟 截断，
+     而「复读乙」后面那条 R 反而留着（最后一项因此不会是失败气泡）。
+     末尾那条「上次回复没有生成成功」是应用**有意**补的：history 现在以用户消息结尾，
+     它给出重试入口，不是缺陷。 */
+  check('删除的是被点的那条（同文重复时不再误删更早的消息）',
+    JSON.stringify(tail.slice(0, 5)) === JSON.stringify(['user:复读甲', 'ai:' + AI_R, 'user:[fail] 隔断', 'ai:' + AI_CUT, 'user:复读乙'])
+    && /上次回复没有生成成功/.test(tail[5] || ''),
+    JSON.stringify(tail));
+
   console.log('api log tail:', JSON.stringify(apiLog.slice(-8)));
   console.log('===== 流程验证结果: PASS ' + PASS + ' / FAIL ' + FAIL + ' =====');
   ws.close(); chrome.kill();
