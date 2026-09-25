@@ -46,7 +46,7 @@
             var seg = e.target && e.target.closest ? e.target.closest('.tts-seg') : null;
             if (seg) seekBySeg(seg);
           });
-          var state = { history: [], cloudProviders: {}, soundOn: (function(){ try { return localStorage.getItem('xiaoni_sound_on') !== '0'; } catch(e) { return true; } })(), speed: (function(){ try { return parseFloat(localStorage.getItem('xiaoni_speed') || '1.0') || 1.0; } catch(e) { return 1.0; } })(), provider: 'cloud', voiceProvider: 'local', voiceKey: '', aliyunConfigured: false, minimaxConfigured: false, audioCache: {}, ttsInflight: {}, playing: null, playingBtn: null, playSeq: 0, pendingAttachments: [], attachMenuOpen: false, awaiting: {}, sendingCount: 0, uploading: false, lastSync: null };
+          var state = { history: [], cloudProviders: {}, soundOn: (function(){ try { return localStorage.getItem('xiaoni_sound_on') !== '0'; } catch(e) { return true; } })(), speed: (function(){ try { return parseFloat(localStorage.getItem('xiaoni_speed') || '1.0') || 1.0; } catch(e) { return 1.0; } })(), provider: 'cloud', voiceProvider: 'local', voiceKey: '', aliyunConfigured: false, minimaxConfigured: false, audioCache: {}, ttsInflight: {}, playing: null, playingBtn: null, playSeq: 0, pendingAttachments: [], attachMenuOpen: false, awaiting: {}, sendingCount: 0, uploading: false, lastSync: null, voiceProviderTouched: false };
           /* 当前激活角色 key：同步维护，页面加载即生效（默认与后端 config 一致为大帅），
              避免头像判断依赖异步的 /api/status 返回导致首帧渲染成首字 */
           var currentRoleKey = 'dashuai';
@@ -202,35 +202,74 @@
             }
             return m || '网络异常';
           }
+          /* 统一请求超时：fetch 本身没有超时，半开连接（ngrok 隧道抖动、手机切网、
+             服务重启未发 RST）会让它挂几分钟不 settle。以前只有 chat 流有 180s 兜底，
+             普通 api() 调用可以永久挂住 —— 调用方各自的 finally 因此永远不执行：
+             state.saving / state.uploading 永久 latch，保存与发送整体静默停摆。
+             这里给所有 api() 调用装 20s 硬超时；调用方自带 signal 时用 AbortSignal.any
+             合并（不支持则该浏览器/WebView 保持旧行为，不会更糟）。 */
+          var API_TIMEOUT_MS = 20000;
+          function apiTimeoutSignal(outer) {
+            var ctl = null;
+            try { ctl = new AbortController(); } catch (e) { return { signal: outer || undefined, timedOut: function(){ return false; }, done: function(){} }; }
+            var timedOut = false;
+            var timer = setTimeout(function(){
+              timedOut = true;
+              try { ctl.abort(); } catch (e) {}
+            }, API_TIMEOUT_MS);
+            var signal = ctl.signal;
+            if (outer) {
+              if (typeof AbortSignal !== 'undefined' && AbortSignal.any) {
+                try { signal = AbortSignal.any([ctl.signal, outer]); } catch (e) { signal = ctl.signal; }
+              } else {
+                /* 没有 AbortSignal.any：优先保证超时仍能触发，外部 signal 透传回调用方自行处理 */
+                try { outer.addEventListener('abort', function(){ try { ctl.abort(); } catch (e) {} }); } catch (e) {}
+              }
+            }
+            return { signal: signal, timedOut: function(){ return timedOut; }, done: function(){ clearTimeout(timer); } };
+          }
           async function api(path, opt) {
             var r;
+            var to = apiTimeoutSignal(opt && opt.signal);
+            var opts = Object.assign({}, opt || {}, { signal: to.signal });
             try {
-              r = await fetch(path, opt);
+              r = await fetch(path, opts);
             } catch (e) {
+              to.done();
+              if (to.timedOut()) throw new Error('请求超时（服务或隧道无响应），请稍后重试');
+              /* 调用方自己 abort（如切会话）：原样抛出，由调用方按 __ABORT__ 语义处理 */
+              if (opt && opt.signal && opt.signal.aborted) throw e;
               throw new Error(friendlyNetError(e));
             }
-            if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
-            if (!r.ok) {
-              var m = '请求失败(' + r.status + ')';
-              if (r.status === 404) {
-                /* ngrok 隧道离线时（ERR_NGROK_3200）同样是 404 但 body 是 ngrok 错误页 HTML，
-                   直接报 404 会误导去查接口；先看 body 是否 ngrok 错误页。 */
-                try {
-                  var t404 = await r.text();
-                  if (/ERR_NGROK_3200|endpoint .* is offline/i.test(t404)) {
-                    throw new Error('隧道已离线（ngrok 未运行）：电脑上执行 ngrok http 8000，并用 data/tunnel_url.txt 里最新地址重进');
-                  }
-                  try { m = (JSON.parse(t404)).detail || m; } catch (e2) {}
-                } catch (e2) { if (e2 && /隧道已离线/.test(e2.message)) throw e2; }
+            /* 超时定时器保留到读完 body 再清：只等响应头就清的话，半开连接在
+               r.json()/r.text() 阶段仍可永久挂死（正是要修的那类卡顿）。 */
+            try {
+              if (r.status === 401) { location.href = '/login'; throw new Error('未登录'); }
+              if (!r.ok) {
+                var m = '请求失败(' + r.status + ')';
+                if (r.status === 404) {
+                  /* ngrok 隧道离线时（ERR_NGROK_3200）同样是 404 但 body 是 ngrok 错误页 HTML，
+                     直接报 404 会误导去查接口；先看 body 是否 ngrok 错误页。 */
+                  try {
+                    var t404 = await r.text();
+                    if (/ERR_NGROK_3200|endpoint .* is offline/i.test(t404)) {
+                      throw new Error('隧道已离线（ngrok 未运行）：电脑上执行 ngrok http 8000，并用 data/tunnel_url.txt 里最新地址重进');
+                    }
+                    try { m = (JSON.parse(t404)).detail || m; } catch (e2) {}
+                  } catch (e2) { if (e2 && /隧道已离线/.test(e2.message)) throw e2; }
+                  throw new Error(m);
+                }
+                try { m = (await r.json()).detail || m; } catch (e) {}
                 throw new Error(m);
               }
-              try { m = (await r.json()).detail || m; } catch (e) {}
-              throw new Error(m);
-            }
-            try {
-              return r.status === 200 ? await r.json() : null;
-            } catch (e) {
-              throw new Error(friendlyNetError(e));
+              try {
+                return r.status === 200 ? await r.json() : null;
+              } catch (e) {
+                if (to.timedOut()) throw new Error('请求超时（响应读取中断），请稍后重试');
+                throw new Error(friendlyNetError(e));
+              }
+            } finally {
+              to.done();
             }
           }
 
@@ -2187,6 +2226,10 @@
             var out = [];
             /* 并行上传：串行时多文件耗时线性叠加；后端每请求独立写盘，可安全并发。
                图片先本地压缩再上传（异步并行），失败/不适用时回退原文件 */
+            /* 每个上传自带 60s 上限：api() 的默认 20s 对大图/弱网偏紧，但绝不能不设。
+               没有超时时，任一上传卡住 -> Promise.all 永不 settle -> send() 的 finally
+               永不执行 -> state.uploading 永久为 true，发送/编辑/重新生成/重试四个入口
+               被同一个闸门同时挡死，只能刷新页面才能恢复。 */
             var jobs = state.pendingAttachments.map(async function(p){
               var f = p.file;
               if (f && f.type && f.type.indexOf('image/') === 0) {
@@ -2194,9 +2237,14 @@
               }
               var fd = new FormData();
               fd.append('files', f, (f && f !== p.file && f.name) ? f.name : p.name);
-              return api('/api/upload', { method: 'POST', body: fd }).then(function(r){
-                return (r && r.files && r.files.length) ? r.files[0] : null;
-              });
+              var upCtl = null;
+              try { upCtl = new AbortController(); } catch (e2) { upCtl = null; }
+              var upTimer = upCtl ? setTimeout(function(){ try { upCtl.abort(); } catch (e3) {} }, 60000) : 0;
+              return api('/api/upload', { method: 'POST', body: fd, signal: upCtl ? upCtl.signal : undefined })
+                .then(function(r){
+                  return (r && r.files && r.files.length) ? r.files[0] : null;
+                })
+                .finally(function(){ if (upTimer) clearTimeout(upTimer); });
             });
             var results = await Promise.all(jobs);
             results.forEach(function(x){ if (x) out.push(x); });
@@ -2346,7 +2394,10 @@
           var settingsReturnFocus = null;
           function openSettings(){
             settingsReturnFocus = document.activeElement;
-            var el = document.getElementById('settings'); if (el) { el.classList.add('show'); refreshStatus(); refreshWeather(); refreshRoleNews(); refreshMemories(); }
+            /* 每次打开设置重置「用户是否真的改过语音引擎」：保存时据此决定是否提交
+               voice_provider —— 只改别的字段时不再把 mimo/local 静默改写成 minimax */
+            state.voiceProviderTouched = false;
+            var el = document.getElementById('settings'); if (el) { el.classList.add('show'); refreshStatus(); refreshWeather(); refreshRoleNews(); refreshMemories(); refreshStats(); }
             setTimeout(function(){
               var c = document.querySelector('#settings .set-close');
               if (c) c.focus();
@@ -2598,7 +2649,15 @@
                     cloud_billing_mode: (document.getElementById('cloud_provider_sel').value === 'minimax')
                       ? document.getElementById('cloud_billing_mode').value : '',
                     persona: document.getElementById('persona').value,
-                    voice_provider: document.querySelector('#voice-tabs .set-tab.active').dataset.voice,
+                    /* voice_provider 只在用户本次真的点过语音 tab 时提交：
+                       #voice-tabs 只有 aliyun/minimax 两个 tab，而 config 里的 provider
+                       可能是 mimo/local。旧写法直接取 .active 的 dataset.voice 提交，
+                       于是"打开设置只改个字号然后保存"就会把 MiMo/本地引擎静默改写成
+                       MiniMax，并强制 manual_provider=true 覆盖角色级音色 —— 用户没做错
+                       任何事却丢了配置（后端 server.py:5968 的注释就是这个坑的现场记录）。
+                       提交空串时后端 `upd.voice_provider in (...)` 直接跳过 = 保持原值。 */
+                    voice_provider: state.voiceProviderTouched
+                      ? document.querySelector('#voice-tabs .set-tab.active').dataset.voice : '',
                     aliyun_api_key: document.getElementById('aliyun_api_key').value,
                     aliyun_base_url: document.getElementById('aliyun_base_url').value,
                     aliyun_model: document.getElementById('aliyun_model').value,
@@ -2675,7 +2734,12 @@
               document.getElementById('cloud_model').value = this.value;
             });
             document.querySelectorAll('#voice-tabs .set-tab').forEach(function(b){
-              b.addEventListener('click', function(){ pickVoiceProvider(b.dataset.voice); });
+              b.addEventListener('click', function(){
+                /* 只有用户真的点了 tab 才算改过语音引擎；保存时据此决定是否提交
+                   voice_provider（未点过 = 提交空串保持原值，见保存处的长注释） */
+                state.voiceProviderTouched = true;
+                pickVoiceProvider(b.dataset.voice);
+              });
             });
             /* ---------- 自动朗读开关（与顶栏语音 chip 同一持久化键） ---------- */
             var soundToggle = document.getElementById('sound_toggle');
@@ -3055,12 +3119,24 @@
               state.saving = true;
               state.dirty = false;
               setSyncState('saving');
+              /* 这次 PUT 必须有超时兜底：它没有别的地方会复位 state.saving，
+                 而入口第一行就是 `if (state.saving) return`。半开连接（ngrok 抖动、
+                 移动网切基站、后端重启未发 RST）会让 fetch 几分钟不 settle，于是
+                 「之后每一次保存都早退」——防抖保存、15s 补推、点状态行手动重试
+                 全部走同一条早退路径，表现为永久「同步中…」+ 点击无反应，
+                 只有刷新页面才能恢复。超时按失败处理，交给既有补推机制自愈。 */
+              var putCtl = null, putTimedOut = false, putTimer = 0;
+              try { putCtl = new AbortController(); } catch (e2) { putCtl = null; }
+              if (putCtl) putTimer = setTimeout(function(){ putTimedOut = true; try { putCtl.abort(); } catch (e3) {} }, 20000);
+              var clearPutTimer = function(){ if (putTimer) { clearTimeout(putTimer); putTimer = 0; } };
               try {
                 fetch('/api/sessions?client=' + encodeURIComponent(CLIENT_ID), {
                   method: 'PUT', headers: { 'Content-Type': 'application/json' },
                   body: body,
                   keepalive: keepalive === true, /* 仅关页刷盘时 true（页面存活时发包），平时 false */
+                  signal: putCtl ? putCtl.signal : undefined,
                 }).then(function(r){
+                    clearPutTimer();
                     state.saving = false;
                     if (r && r.status === 401) { location.href = '/login'; return; }
                     if (r && !r.ok) throw new Error('HTTP ' + r.status);
@@ -3076,15 +3152,17 @@
                 }).catch(function(e){
                     /* 保存失败必须可见：服务挂了/网络断时若静默吞错，用户会误以为
                        已保存，重开页面/换设备后聊天记录就"消失"了。限频提示避免刷屏。 */
+                    clearPutTimer();
                     state.saving = false;
                     state.dirty = true;  /* 发送前清过 dirty：失败必须恢复，15s 轮询才会补推 */
-                    setSyncState('error', (e && e.message) || '网络异常');
+                    var emsg = putTimedOut ? '请求超时（20s 无响应）' : ((e && e.message) || '网络异常');
+                    setSyncState('error', emsg);
                     if (!saveSessions._lastErrAt || Date.now() - saveSessions._lastErrAt > 10000) {
                       saveSessions._lastErrAt = Date.now();
-                      try { toast('记录保存失败，仅存本机：' + ((e && e.message) || '网络异常')); } catch (_) {}
+                      try { toast('记录保存失败，仅存本机：' + emsg); } catch (_) {}
                     }
                 });
-              } catch (e) { state.saving = false; state.dirty = true; }
+              } catch (e) { clearPutTimer(); state.saving = false; state.dirty = true; }
             };
             if (immediate) doSave();
             else saveTimer = setTimeout(doSave, 300);

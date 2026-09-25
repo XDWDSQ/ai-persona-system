@@ -16,7 +16,6 @@ status_code=2038（voice clone user forbidden），请在 platform.minimaxi.com
 
 用法：python minimax_clone.py
 """
-import base64
 import ipaddress
 import json
 import os

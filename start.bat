@@ -1,15 +1,23 @@
 @echo off
 chcp 65001 >nul
-REM AI 拟人系统 一键启动
+REM ============================================================
+REM  AI 拟人系统 一键启动
+REM  解释器由 _find_python.bat 统一探测（PYTHON 环境变量 -> 项目
+REM  venv -> PATH）。第九轮修正：此前硬编码
+REM  %USERPROFILE%\.openvino\venv\t2i-tts，换机后本文件直接判"环境未就绪"，
+REM  而项目自带的 venv 就躺在旁边没人用。
+REM ============================================================
 cd /d "%~dp0"
 
-set "PY=%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe"
-
-if not exist "%PY%" (
-    echo [X] 未找到 TTS 运行环境，请先运行 setup.bat 完成初始化
+call "%~dp0_find_python.bat" uvicorn
+if not defined PYTHON (
+    echo [X] 未找到可用的后端解释器
+    echo     %PYTHON_ERR%
+    echo     请先运行 setup.bat 完成初始化，或设置 PYTHON=<python.exe 路径>
     pause
     exit /b 1
 )
+set "PY=%PYTHON%"
 
 REM 保持 TTS/ASR 常驻，避免闲置后重新加载模型
 set "INTEL_SKILL_DOG_NO_EVICTION=1"

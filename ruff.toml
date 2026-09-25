@@ -1,0 +1,34 @@
+# ruff 静态检查基线（2026-09 第九轮新增）
+#
+# 为什么只开这几个规则：这个项目是「功能优先」的单体后端 + 原生前端，
+# 引入全部 ruff 规则会产出上千条风格噪声（本项目大量使用中文长行注释、
+# 有意的私有下划线函数、刻意的重导出），把真正的错误淹掉。
+# 这里只留「一定会出事」的几类：未定义名字、重复定义、未使用变量/导入。
+#
+# 用法：
+#   venv\Scripts\python.exe -m ruff check . --exclude venv,android,data,data-test
+#
+# 历史背景：第一次跑就抓到两个真问题 ——
+#   deploy/pack_update.py 调用 verify_public_package() 但从未 import（F821，
+#   公网打包模式 100% NameError 崩），以及若干未使用局部变量。
+
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = ["F821", "F811", "F841", "F401"]
+ignore = ["F401"]
+
+[lint.per-file-ignores]
+# 入口脚本与测试：为了可读性常保留"为将来准备"的绑定，不视为错误
+"test_*.py" = ["F841"]
+"conftest.py" = ["F841"]
+"_verify_tts_parallel.py" = ["F841"]
+"runtime_smoke.py" = ["F841"]
+"qa_run.py" = ["F841"]
+# server.py 的 server_pkg 重导出块是刻意的公共 API 面（见文件内注释）
+"server.py" = ["F401"]
+
+[format]
+quote-style = "double"
+indent-style = "space"

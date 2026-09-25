@@ -14,6 +14,7 @@
   9. TTS singleflight 在飞上限：达到上限返回 503 而不是无限排队
  10. SSE 同步订阅上限：达到上限返回 503
  11. 安全头与请求 ID：Permissions-Policy 等安全头存在；X-Request-Id 合法回显、非法重生
+ 12. （第九轮补）provider 探测永不把 /api/status 打成 500；server 重导出公共面契约
 """
 import asyncio
 import copy
@@ -31,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("AI_DISABLE_EXTERNAL", "1")
 
 import server  # noqa: E402
+import httpx  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 
 _FAIL = 0
@@ -383,6 +385,51 @@ def test_offline_mode_gate():
           f"weather={w!r} news={n!r}")
 
 
+# ------------------------------------------------------------ 11.5 provider 探测不得 500
+def test_probe_never_breaks_status():
+    """第九轮回归：修前 /api/status 在「共享 httpx client 已关闭」时 500。
+
+    真实触发路径：TestClient 退出 lifespan 会 close 全局 httpx_client，而
+    probe_active_provider 仍去发 /models 探测 -> httpx 抛 RuntimeError。
+    RuntimeError 不是 httpx.HTTPError，旧的 `except httpx.HTTPError` 兜不住，
+    异常直接冒到路由层，GET /api/status 整个 500（真实浏览器表现为设置页转圈
+    然后报「加载配置失败」）。
+    """
+    cfg = {"provider": "local", "local": {"base_url": "http://127.0.0.1:1/v1"}}
+
+    # 1) 离线模式：根本不发请求，明确报「未探测」
+    async def _offline():
+        server._probe_cache.clear()
+        return await server.probe_active_provider(cfg)
+    online, err = asyncio.run(_offline())
+    check("离线模式下 provider 探测短路为未在线", online is False, f"online={online} err={err!r}")
+    check("离线模式下给出明确原因（未探测）", "未探测" in err, repr(err))
+
+    # 2) 非离线 + client 已关闭：必须被兜住，返回 (False, 原因) 而不是抛异常
+    async def _closed():
+        server._probe_cache.clear()
+        server._OFFLINE_MODE = False
+        # 用同一份 AsyncClient 类型造一个"已关闭"的替身：真实崩溃点就在这里
+        closed = httpx.AsyncClient()
+        await closed.aclose()
+        orig = server.httpx_client
+        server.httpx_client = closed
+        try:
+            return await server.probe_active_provider(cfg)
+        finally:
+            server.httpx_client = orig
+            server._OFFLINE_MODE = True
+
+    try:
+        online2, err2 = asyncio.run(_closed())
+        check("client 已关闭时探测降级而非抛异常", online2 is False, f"online={online2} err={err2!r}")
+        check("降级时带回可读原因", bool(err2), repr(err2))
+    except Exception as exc:  # noqa: BLE001
+        check("client 已关闭时探测降级而非抛异常", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        server._OFFLINE_MODE = True
+
+
 # ------------------------------------------------------------ 12. 安全头与请求 ID
 def test_security_headers_and_request_id(client):
     with sandbox():
@@ -408,8 +455,104 @@ def test_security_headers_and_request_id(client):
               bool(rid3) and rid3 != "bad id with spaces!!", rid3)
 
 
+# ------------------------------------------------------------ 13. 重导出公共面
+def test_re_export_surface():
+    """server 对 server_pkg 的重导出是**公共 API 面**，不是"没用的导入"。
+
+    静态检查（ruff F401）会把这一整块标成未使用，很容易被后人"顺手清理"，
+    然后静默打断所有 `server._mask_key(...)` 形式的外部调用与测试。
+    这里把契约钉住：符号必须存在且可调用。
+    """
+    for name in ("_mask_key", "_clean_history", "_merge_sessions", "mask_credentials",
+                 "normalize_tts_text", "parse_style_prefix", "_sessions_fp", "_safe_int"):
+        check(f"server 重导出 {name} 可用", hasattr(server, name), "missing")
+    check("重导出的函数是真函数（不是 None 占位）",
+          callable(getattr(server, "_mask_key", None)), "not callable")
+
+
+# ------------------------------------------------------------ 14. /api/stats 畸形数据
+def test_stats_tolerates_malformed_entries(client):
+    """第九轮回归：/api/stats 必须容忍客户端可控的畸形字段。
+
+    会话经 PUT /api/sessions 原样落盘，所以 history 里的 content/ts 完全是
+    客户端可控且**驻留**的数据。旧实现 `len(m.get("content") or "")` 遇到数字
+    抛 TypeError、`time.localtime(ts/1000)` 遇到 Infinity/1e15 抛 OverflowError /
+    OSError —— 任一坏条目都会让设置页「陪伴足迹」永久 500，且用户无从知道原因
+    （删掉那条会话才能恢复）。
+    """
+    with sandbox() as sb:
+        bad = [
+            {"role": "user", "content": 5, "ts": 1},                     # content 非字符串
+            {"role": "assistant", "content": None, "ts": float("inf")},  # ts 无穷
+            {"role": "user", "content": {"a": 1}, "ts": 1e15},           # ts 越界 + content 非字符串
+            {"role": "assistant", "content": "正常", "ts": float("nan")},
+            {"role": "user", "content": "好", "ts": -1},
+            {"role": "user", "content": "好", "ts": True},
+        ]
+        sb.path.write_text(json.dumps({"sessions": [
+            {"id": "s-bad", "title": "坏数据", "updatedAt": 1700000000000, "history": bad},
+        ], "deleted": []}, ensure_ascii=False), encoding="utf-8")
+        server._sess_cache.clear()
+        server._sess_cache.update(_mtime_ns=0, _value={"sessions": [], "deleted": []})
+        r = client.get("/api/stats")
+        check("/api/stats 遇到畸形 content/ts 仍返回 200",
+              r.status_code == 200, f"status={r.status_code} body={r.text[:200]}")
+        if r.status_code == 200:
+            d = r.json()
+            check("畸形条目仍被计入条数（不静默丢数据）",
+                  d.get("total_messages") == len(bad), f"total={d.get('total_messages')}")
+            check("daily_7d 结构完整（7 天）", len(d.get("daily_7d") or []) == 7)
+            check("total_chars 是整数（非字符串拼接）",
+                  isinstance(d.get("total_chars"), int), repr(d.get("total_chars")))
+
+
+# ------------------------------------------------------------ 15. 访问口令 fail-closed
+def test_access_token_fail_closed():
+    """第九轮安全加固：config 读取异常时**不得**把门禁降级成全放行。
+
+    旧实现 `except Exception: cfg_tok = ""` 会把"配置被改坏"当成"用户没配口令"，
+    access_gate 随即放行 —— ngrok 公网上 /uploads/* 附件与 /api/sync/stream
+    全部未认证可读，且没有任何日志痕迹。
+    """
+    saved = (server._last_good_token, server.CONFIG_PATH, server.load_config)
+    try:
+        # 1) 有过成功读取记录后配置坏掉 -> 继续要求同一口令
+        server._last_good_token = "known-token-abc"
+        def _boom(*a, **k):
+            raise ValueError("config.json 被改坏")
+        server.load_config = _boom
+        got = server._access_token()
+        check("config 异常时回退到上一次生效口令（fail-closed）",
+              got == "known-token-abc", repr(got))
+
+        # 2) 从未成功读取过 + 无环境变量 -> 只能放行，但必须有 ERROR 日志
+        server._last_good_token = ""
+        saved_env = os.environ.pop("ACCESS_TOKEN", None)
+        try:
+            got2 = server._access_token()
+            check("无历史口令且无环境变量时返回 None（明确放行）",
+                  got2 is None, repr(got2))
+        finally:
+            if saved_env is not None:
+                os.environ["ACCESS_TOKEN"] = saved_env
+
+        # 3) 从未成功读取 + 有环境变量 -> 回退到环境变量
+        server._last_good_token = ""
+        os.environ["ACCESS_TOKEN"] = "env-token-xyz"
+        try:
+            got3 = server._access_token()
+            check("config 异常时回退到环境变量 ACCESS_TOKEN",
+                  got3 == "env-token-xyz", repr(got3))
+        finally:
+            os.environ.pop("ACCESS_TOKEN", None)
+    finally:
+        server._last_good_token, server.CONFIG_PATH, server.load_config = saved
+
+
+
 def main():
     from fastapi.testclient import TestClient  # noqa: E402
+
     with TestClient(server.app) as client:
         test_fingerprint_cold_start(client)
         test_sessions_chinese_not_escaped(client)
@@ -422,8 +565,12 @@ def main():
         test_tts_inflight_limit()
         test_sync_subscriber_limit(client)
         test_offline_mode_gate()
+        test_stats_tolerates_malformed_entries(client)
+        test_access_token_fail_closed()
+        test_probe_never_breaks_status()
+        test_re_export_surface()
         test_security_headers_and_request_id(client)
-    print(f"\n{'=' * 50}\n第八轮后端加固测试完成，失败 {_FAIL} 项")
+    print(f"\n{'=' * 50}\n后端加固测试完成，失败 {_FAIL} 项")
     sys.exit(1 if _FAIL else 0)
 
 

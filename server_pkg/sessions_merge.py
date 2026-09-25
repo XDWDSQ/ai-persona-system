@@ -92,6 +92,10 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
         # 注意 audio（TTS 持久化 URL）故意不进指纹：它是任一端事后独立写入的
         # 易变元数据，两端同一条消息一方带 audio 一方不带时若视为不同，
         # 分歧合并会把"同一条"追加两次（相邻双胞胎 bug）。
+        # 入口类型防御：调用方正常都会先过 _hist()，但这里再兜一层，
+        # 任何遗漏的调用点都只会得到"空消息指纹"而不是 AttributeError → 500。
+        if not isinstance(m, dict):
+            return (None, None, "", ())
         atts = m.get("attachments") or []
         try:
             att_sig = tuple(
@@ -144,9 +148,16 @@ def _merge_sessions(current: list, incoming: list, tombstones: dict) -> list:
 
     def _hist(sess: dict) -> list:
         # history 畸形（磁盘损坏/旧客户端写入 dict 等非列表）归一为空列表，
-        # 否则前缀/子序列/并集分支会对字符串 key 调 .get 抛 AttributeError → 500
+        # 否则前缀/子序列/并集分支会对字符串 key 调 .get 抛 AttributeError → 500。
+        # list 里混入非 dict 元素（旧客户端/手改/同步冲突残留）同样致命，而且**粘性**：
+        # 新会话带畸形 history 会被原样落盘，此后任何一端正常 PUT 这个会话都崩在
+        # _msg_key，正常写入路径无法自愈（只能手改 sessions.json）。
+        # 非 dict 元素就地替换成 {} 保持下标对齐（替换而非丢弃，避免前缀/子序列
+        # 判定因为索引错位得出错误结论）。
         h = sess.get("history")
-        return h if isinstance(h, list) else []
+        if not isinstance(h, list):
+            return []
+        return [m if isinstance(m, dict) else {} for m in h]
 
     for s in [*current, *incoming]:
         if not isinstance(s, dict):

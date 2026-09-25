@@ -219,9 +219,16 @@ python minimax_clone.py
 - **日志级别**：可用环境变量 `LOG_LEVEL` 控制（默认 `WARNING`，可设 `INFO` / `DEBUG`），例如 `set LOG_LEVEL=DEBUG` 后启动。
 - **健康检查**：`GET /api/health` 可用于探活与依赖状态检查。
 - **TTS 缓存**：合成音频缓存在 `data/tts_cache/`，清理阈值由 `config.json` 的 `tts_cache` 节配置（`max_files` 代码默认 500、`max_bytes` 默认 8GB、`clean_interval` 默认 3600 秒；`config.example.json` 给出同步盘友好的推荐值 200 / 1GB）。
-- **本地 TTS 依赖的 venv 路径**（硬编码默认值，换机器需按此布局准备，风险已知、暂不可配）：
-  - 本地 TTS：`~/.trae-cn/skills/local-tts`
-  - Python 虚拟环境：`~/.openvino/venv/*`（如 `~/.openvino/venv/t2i-tts`）
+- **Python 解释器**：所有 `.bat` 入口（`setup.bat` / `start.bat` / `restart_service.bat` /
+  `start_test_server.bat` / `start_deploy.bat` / `run_tests.bat`）统一通过
+  `_find_python.bat` 探测，顺序为 `PYTHON` 环境变量 → `venv\`（项目自带）→ `PATH` 上的 python。
+  候选必须能 `import` 所需模块（后端要 `uvicorn`，测试要 `pytest`），否则自动换下一个；
+  全部不可用时报明确原因并以非零码退出。**第九轮前**这里硬编码
+  `%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe`，换机后所有入口形同虚设。
+- **本地 TTS 依赖的 venv 路径**（本地语音克隆才需要，云端合成不受影响）：
+  - 本地 TTS skill：`~/.trae-cn/skills/local-tts`
+  - 本地推理环境：`~/.openvino/venv/*`（如 `~/.openvino/venv/t2i-tts`）
+  - 缺失时 `setup.bat` 会跳过并提示，不影响云端链路
 
 ## API
 
@@ -250,15 +257,19 @@ minimax_llm.py          MiniMax 云端文字生成适配器（OpenAI 兼容，pa
 minimax_clone.py        MiniMax 声音克隆脚本
 pet_process.py          桌宠视频 → 透明循环 WebP 批处理工具
 config.example.json     配置模板（复制为 config.json 使用）
-requirements.txt        Python 依赖
+requirements.txt        Python 依赖（含离线测试门用的 pytest）
+_find_python.bat        解释器探测单一真源（PYTHON 环境变量 → 项目 venv → PATH），供所有 .bat 调用
 setup.bat / start.bat / restart_service.bat / run_tests.bat   初始化 / 启动 / 重启 / 测试
-requirements.txt / requirements-tools.txt   服务端依赖 / 桌宠素材加工工具（pet_process.py）依赖
+requirements-tools.txt  桌宠素材加工工具（pet_process.py）依赖
+pytest.ini              pytest 收集边界（只收根目录 test_*.py；ops/ 等需真实服务的脚本不收）
+ruff.toml               静态检查基线（只开 F821/F811/F841/F401 四类真错误）
+.gitattributes          行尾锁定：*.bat 必须 CRLF（cmd 对 LF 的 .bat 会错位解析）
 llm/                    llama.cpp 运行时（llm/bin）、模型（llm/models）与启动脚本
 xiaoni-ai-persona/      前端页面源码（pages/ 单页 chat.html + css/chat.css + js/app.js + pet.js + 桌宠素材、pages/story.html 赛程表、PWA manifest/sw）
-deploy/                 打包与部署脚本（pack_cloud / pack_update / webhook 自动部署）
+deploy/                 打包与部署脚本（pack_cloud / pack_public / pack_update / make_update_public）
 download_site/          下载引导站
 android/                安卓 APK 工程（已停止开发，仅存档）
-docs-specs/             设计文档（角色引擎设计、大帅2027人设档案）与优化报告
+docs-specs/             设计文档（角色引擎设计、大帅2027人设档案）与各轮优化记录
 data/                   运行时数据（会话、记忆、状态、TTS 缓存、上传，不入库）
 ```
 
@@ -270,50 +281,27 @@ data/                   运行时数据（会话、记忆、状态、TTS 缓存�
 run_tests.bat
 ```
 
-单独运行某个套件（用本地 TTS 的 venv python）：
+单独运行某个套件（先让 `_find_python.bat` 报出可用解释器）：
 
 ```bat
-REM 角色引擎：记忆/状态/时间感知/后处理
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_role_engine.py
+REM 让统一的解释器探测逻辑打印它选中的 python（PYTHON 环境变量 -> 项目 venv -> PATH）
+call _find_python.bat pytest
+echo %PYTHON%
 
-REM 服务端辅助函数（配置读写、路径处理等）
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_server_helpers.py
+REM 然后直接跑某个套件，例如角色引擎 / 服务端辅助函数 / 会话合并
+"%PYTHON%" test_role_engine.py
+"%PYTHON%" test_server_helpers.py
+"%PYTHON%" test_sessions_merge.py
+```
 
-REM 联网搜索（DuckDuckGo / Bing RSS 解析逻辑）
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_search.py
+21 套离线套件全部由 `run_tests.bat` 通配发现（新增 `test_*.py` 自动进测试门）；
+逐条覆盖范围见各测试文件顶部 docstring，不再在此逐一列举（列举必然过期）。
 
-REM 附件上传与处理
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_attachments.py
+也可用 pytest 收集执行（`pytest.ini` 已限定收集边界：只收集根目录 `test_*.py`，
+`ops/` 下需要真实服务/真实密钥的运维脚本一律不收集）：
 
-REM 2027 赛季剧情分支（赛程生成/种子确定性/跳转/情感状态机，22 用例）
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_story_kpl2027.py
-
-REM 配置读写 API
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_config_api.py
-
-REM TTS 缓存清理策略
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_tts_cache.py
-
-REM MiniMax / MiMo 云端适配层（退避重试、错误分类、thinking 开关解析）
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_minimax_llm.py
-
-REM 角色现实动态（新闻卡片清洗/去重/迁移）
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_role_news_v2.py
-
-REM 多端会话合并（前缀/子序列/等长分叉/墓碑/占位会话）
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_sessions_merge.py
-
-REM 附件回收策略（只删无引用的孤儿，历史消息在用的老照片不删）
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_upload_retention.py
-
-REM 公网包脱敏与出厂自检（凭据按叶子名清空；包里带 data/ 就构建失败）
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_pack_hygiene.py
-
-REM 会话入库截断方向 + 登录 cookie 派生与 Secure 判定
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_auth_sync.py
-
-REM 历史清洗健壮性（畸形 history 条目不得打挂 /api/chat）
-"%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe" test_text_hardening.py
+```bat
+venv\Scripts\python -m pytest -q
 ```
 
 需要真实云端密钥才能运行的脚本：
@@ -331,6 +319,9 @@ REM 历史清洗健壮性（畸形 history 条目不得打挂 /api/chat）
   ```bat
   venv\Scripts\python qa_run.py            REM 另开窗口：隔离实例，127.0.0.1:8010
   venv\Scripts\python runtime_smoke.py     REM 默认 http://127.0.0.1:8010，可传 base_url
+  REM 打真实服务必须带口令：服务端开了 access_token 时，不带口令的冒烟会明确报错
+  REM 退出（不会写入任何测试数据），不会伪装成"一堆功能全坏了"：
+  REM venv\Scripts\python runtime_smoke.py http://127.0.0.1:8000 <访问口令>
   ```
 
 ### 测试协议：防止测试会话污染真实前端

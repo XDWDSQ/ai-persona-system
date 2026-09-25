@@ -11,7 +11,6 @@
       data/outputs（试听文件）、.git、__pycache__、.workbuddy
 """
 import json
-import os
 import sys
 import zipfile
 from pathlib import Path

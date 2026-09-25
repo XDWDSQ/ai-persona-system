@@ -8,14 +8,20 @@ REM    %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\
 REM  已在运行的服务会跳过，不会重复启动。
 REM
 REM  可用环境变量覆盖（任务计划/不同机器部署时）：
-REM    AI_PERSONA_PY     后端解释器路径
+REM    AI_PERSONA_PY     后端解释器路径（优先级最高）
 REM    AI_PERSONA_NGROK  ngrok.exe 路径
 REM    AI_PERSONA_URL    ngrok 固定域名（留空则不带 --url 起隧道）
+REM  未指定 AI_PERSONA_PY 时由 _find_python.bat 统一探测（第九轮修正：
+REM  此前硬编码 %USERPROFILE%\.openvino\venv\t2i-tts，换机即静默失败）。
 REM ============================================================
 cd /d "%~dp0"
 
+set "PY="
+set "PYTHON="
 if not "%AI_PERSONA_PY%"=="" set "PY=%AI_PERSONA_PY%"
-if not defined PY set "PY=%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe"
+if not defined PY call "%~dp0_find_python.bat" uvicorn
+if defined PYTHON set "PY=%PYTHON%"
+
 if not "%AI_PERSONA_NGROK%"=="" set "NGROK=%AI_PERSONA_NGROK%"
 if not defined NGROK set "NGROK=%LOCALAPPDATA%\ngrok\ngrok.exe"
 if not defined AI_PERSONA_URL set "AI_PERSONA_URL=https://filling-smirk-sternness.ngrok-free.dev"
@@ -23,8 +29,8 @@ if not defined AI_PERSONA_URL set "AI_PERSONA_URL=https://filling-smirk-sternnes
 REM 解释器缺失必须直接退出：此前只用 errorlevel 判「服务是否在跑」，
 REM python 不存在时 errorlevel=9009 同样 >=1，会被误判成「没在运行」，
 REM 于是拿不存在的解释器去 start，最后还打印"自启完成" —— 任务计划静默失败。
-if not exist "%PY%" (
-    echo [X] 未找到后端解释器：%PY%
+if not defined PY (
+    echo [X] 未找到后端解释器：%PYTHON_ERR%
     echo     用 AI_PERSONA_PY 指定，或先运行 setup.bat
     exit /b 1
 )

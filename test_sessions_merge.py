@@ -112,6 +112,46 @@ def test_malformed_history_not_dict():
     check("畸形 history(dict)：归一为空列表且不丢会话", find(out, "s1") is not None)
 
 
+def test_malformed_history_non_dict_items():
+    """第九轮回归：history 是 list、但**元素不是 dict**。
+
+    旧实现在 _msg_key 里直接 m.get(...)，非 dict 元素抛 AttributeError →
+    PUT /api/sessions 500，而且是**粘性**的：新会话带畸形 history 会被原样落盘，
+    此后任何一端正常 PUT 这个会话都崩在同一行，正常写入路径永远无法自愈
+    （只能手改 sessions.json）。上面那条只覆盖了"history 是 dict"。
+    """
+    now = time.time() * 1000
+    # 1) 畸形元素混在 list 里：前缀/子序列/并集三条分支都不能崩
+    try:
+        out = _merge_sessions(
+            [sess("s1", [msg("user", "a"), msg("assistant", "b")], now)],
+            [{"id": "s1", "title": "坏", "history": ["x", None, 42], "updatedAt": now + 1000}],
+            {},
+        )
+        check("畸形 history(list 含非 dict)：不抛异常", find(out, "s1") is not None)
+    except Exception as exc:  # noqa: BLE001
+        check("畸形 history(list 含非 dict)：不抛异常", False, repr(exc))
+        return
+
+    # 2) 粘性场景：畸形会话已落盘后，正常一端再 PUT 同一会话仍必须成功
+    try:
+        poisoned = [{"id": "s2", "title": "毒", "history": ["x"], "updatedAt": now}]
+        out1 = _merge_sessions([], poisoned, {})
+        out2 = _merge_sessions(out1, [sess("s2", [msg("user", "新")], now + 5000)], {})
+        check("已落盘的畸形会话可被正常写入路径自愈",
+              find(out2, "s2") is not None)
+    except Exception as exc:  # noqa: BLE001
+        check("已落盘的畸形会话可被正常写入路径自愈", False, repr(exc))
+
+    # 3) 嵌套 list 元素同样走 _msg_key 的类型防御（入口兜底）
+    try:
+        _merge_sessions([{"id": "s3", "history": [{"role": "user", "content": "ok"}]}],
+                        [{"id": "s3", "history": [["nested"], {"role": "user", "content": "ok"}]}], {})
+        check("嵌套 list 元素也被兜住", True)
+    except Exception as exc:  # noqa: BLE001
+        check("嵌套 list 元素也被兜住", False, repr(exc))
+
+
 def test_tombstone_filters_deleted():
     now = time.time() * 1000
     current = []
@@ -142,6 +182,7 @@ def main():
         test_diverge_union_keeps_both,
         test_equal_length_diverge,
         test_malformed_history_not_dict,
+        test_malformed_history_non_dict_items,
         test_tombstone_filters_deleted,
         test_placeholder_dropped,
     ]

@@ -3,16 +3,20 @@ chcp 65001 >nul
 REM ============================================================
 REM  重启 AI 拟人系统 8000 端口服务（加载最新代码）
 REM  双击运行即可：自动停掉旧服务 -> 启动新服务
+REM  解释器由 _find_python.bat 统一探测（第九轮修正：此前硬编码
+REM  %USERPROFILE%\.openvino\venv\t2i-tts，换机后直接报"未找到运行环境"）。
 REM ============================================================
 cd /d "%~dp0"
 
-set "PY=%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe"
-
-if not exist "%PY%" (
-    echo [X] 未找到 TTS 运行环境：%PY%
+call "%~dp0_find_python.bat" uvicorn
+if not defined PYTHON (
+    echo [X] 未找到可用的后端解释器
+    echo     %PYTHON_ERR%
+    echo     请先运行 setup.bat 完成初始化，或设置 PYTHON=<python.exe 路径>
     pause
     exit /b 1
 )
+set "PY=%PYTHON%"
 
 REM 找到占用 8000 的旧进程并结束
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8000 " ^| findstr LISTENING') do (

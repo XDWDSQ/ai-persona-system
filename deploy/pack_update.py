@@ -19,7 +19,7 @@ import json
 import sys
 import zipfile
 from pathlib import Path
-from pack_cloud import ROOT, should_skip, blank_sensitive
+from pack_cloud import ROOT, should_skip, blank_sensitive, verify_public_package
 
 # 公网模式：--public 时 config.json 密钥/口令脱敏（用于放到公网链接让云电脑下载）
 PUBLIC = "--public" in sys.argv

@@ -7,7 +7,6 @@
 import json
 import sys
 import zipfile
-from pathlib import Path
 
 from pack_cloud import (
     ROOT,

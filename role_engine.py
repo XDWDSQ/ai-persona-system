@@ -14,7 +14,6 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import math
@@ -22,7 +21,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 _log = logging.getLogger("role_engine")
@@ -168,8 +167,33 @@ def _text2grams(text: str) -> tuple[set[str], set[str]]:
     return big, tri
 
 
+def _bigrams(t: str) -> set[str]:
+    """字符 2-gram 集合；不足 2 字返回空集。"""
+    return {t[i:i + 2] for i in range(len(t) - 1)} if len(t) >= 2 else set()
+
+
 def _dup_sim(a: str, b: str) -> float:
-    """语义相似度：2-gram / 3-gram Jaccard 取 max（对同义改写更鲁棒）。"""
+    """语义相似度：2-gram / 3-gram Jaccard 取 max（对同义改写更鲁棒）。
+
+    短文本（去空白后 <3 字）没有 3-gram，而 `_jaccard(set(), set())` 返回 1.0，
+    于是**任意两个 2 字回复都被判成"完全重复"**——实测 `_dup_sim("在呢","好的") == 1.0`。
+    后果：每轮正常寒暄都触发一次多余的 LLM 重试（server.py 的复读改写链路白烧 token），
+    2 字记忆被当重复丢弃。因此短文本只在**字面完全相同**时给 1.0，否则一律用
+    2-gram 判定（对 2 字文本而言 2-gram 就是精确比较）。
+    """
+    t_a = re.sub(r"\s+", "", a or "")
+    t_b = re.sub(r"\s+", "", b or "")
+    if len(t_a) < 3 or len(t_b) < 3:
+        if not t_a or not t_b:
+            return 0.0
+        if t_a == t_b:
+            return 1.0
+        ga, gb = _bigrams(t_a), _bigrams(t_b)
+        # 单字（或任一侧不足 2 字）没有任何 gram：空集绝不能代表"完全相似"，
+        # 这正是 _jaccard(set(), set()) == 1.0 的坑，在这里显式收口。
+        if not ga or not gb:
+            return 0.0
+        return _jaccard(ga, gb)
     a_big, a_tri = _text2grams(a)
     b_big, b_tri = _text2grams(b)
     return max(_jaccard(a_big, b_big), _jaccard(a_tri, b_tri))
@@ -704,22 +728,51 @@ def format_context_block(ctx: dict) -> str:
 # ---------------------------------------------------------------- 后处理 --------
 class PostProcessor:
     """对话后处理：单次轻量 LLM 调用抽取 {情绪变化, 新事实, 精力变化}。
-    由调用方保证异步、不阻塞主链路；任何失败静默跳过。"""
+    由调用方保证异步、不阻塞主链路；任何失败静默跳过。
 
-    SYSTEM = (
-        "你是对话状态标注器。根据用户消息和角色回复，输出情绪和新事实标注。\n"
-        "只输出一行 JSON，不要任何思考过程和解释：\n"
-        '{"emotion":{"valence":0.0,"arousal":0.0},"energy_delta":0.0,"memories":[],"story_result":null,"story_flag":null}\n'
-        "字段说明：valence(-1难过~1开心)、arousal(0平静~1激动)、energy_delta(-0.1~0.1)、"
-        "memories 只记用户身上稳定重要的事实（用户喜好/约定/经历），以\"用户\"为主语；"
-        "禁止把角色自己说过的回复原文、角色扮演台词或对话寒暄存成记忆，没有就空数组。\n"
+    include_story：是否注入 2027 剧情角色专用的赛果/表白标注指令。只有
+    dashuai2027 这类剧情角色才需要；普通角色（大帅恋人线/小拟）传 False ——
+    每轮标注都带上「岚风/比赛结果/指挥权/表白」既白烧约 1/3 的标注 token，
+    还会把别的角色名塞进模型上下文造成串戏。解析端对 story_* 字段始终容错，
+    所以旧调用方与直接喂 JSON 的测试不受影响。"""
+
+    # 剧情标注段（仅剧情角色）
+    _STORY_SECTION = (
         "story_result：仅当用户消息明确宣布了比赛/对局结果（如\"我们赢了3:1\"\"输了 1:3\""
         "\"那场2:0拿下\"）时输出 {\"win\":true,\"score\":\"3:1\",\"mvp\":\"岚风\"}，否则 null；"
         "预测、假设、提旧赛果不算，不要从角色回复里推断结果，只认用户自己宣布的结果。\n"
         "story_flag：剧情节点，只有两个取值——\"command_win\"（指挥权被明确交给岚风）或 "
         "\"confession\"（明确表白且被接受、正式在一起），其余一律 null。\n"
-        "已有记忆里存在的信息不要重复输出。"
     )
+
+    SYSTEM_BASE = (
+        "你是对话状态标注器。根据用户消息和角色回复，输出情绪和新事实标注。\n"
+        "只输出一行 JSON，不要任何思考过程和解释：\n"
+    )
+    _EXAMPLE_CORE = '{"emotion":{"valence":0.0,"arousal":0.0},"energy_delta":0.0,"memories":[]'
+    _FIELDS_CORE = (
+        "字段说明：valence(-1难过~1开心)、arousal(0平静~1激动)、energy_delta(-0.1~0.1)、"
+        "memories 只记用户身上稳定重要的事实（用户喜好/约定/经历），以\"用户\"为主语；"
+        "禁止把角色自己说过的回复原文、角色扮演台词或对话寒暄存成记忆，没有就空数组。\n"
+    )
+    _TAIL = "已有记忆里存在的信息不要重复输出。"
+
+    # _EXAMPLE_CORE 自身已含开头 { 与末尾 ]，这里只补剧情字段与收尾 }
+    SYSTEM = (
+        SYSTEM_BASE
+        + _EXAMPLE_CORE + ',"story_result":null,"story_flag":null}\n'
+        + _FIELDS_CORE
+        + _STORY_SECTION
+        + _TAIL
+    )
+
+    @classmethod
+    def build_system(cls, include_story: bool = True) -> str:
+        """按角色类型构造标注系统提示词；非剧情角色不含任何剧情字段与指令。"""
+        example = (cls._EXAMPLE_CORE + ',"story_result":null,"story_flag":null}') \
+            if include_story else (cls._EXAMPLE_CORE + "}")
+        return (cls.SYSTEM_BASE + example + "\n" + cls._FIELDS_CORE
+                + (cls._STORY_SECTION if include_story else "") + cls._TAIL)
 
     PROMPT_TPL = (
         "已有记忆：\n{existing}\n\n"
@@ -727,10 +780,12 @@ class PostProcessor:
         "输出JSON："
     )
 
-    def __init__(self, llm_chat_callable, temperature: float = 0.3, max_tokens: int = 300):
+    def __init__(self, llm_chat_callable, temperature: float = 0.3,
+                 max_tokens: int = 300, include_story: bool = True):
         self._llm = llm_chat_callable
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.system = self.build_system(include_story)
 
     async def run(self, user_msg: str, reply: str, emotion: dict,
                   existing_memories: list[str] | None = None) -> dict | None:
@@ -748,7 +803,7 @@ class PostProcessor:
                 existing=existing_block,
             )
             raw = await self._llm([
-                {"role": "system", "content": self.SYSTEM},
+                {"role": "system", "content": self.system},
                 {"role": "user", "content": prompt},
             ])
             return self._parse(raw)

@@ -1,0 +1,40 @@
+# 行尾与文本属性（2026-09 第九轮新增）
+#
+# 为什么必须有这个文件：Windows 的 cmd.exe 解析 .bat 时**要求 CRLF**。
+# 一个只有 LF 的 .bat 会在多字节（中文）注释附近错位解析 —— 症状是
+# 窗口里出现 "'matically.' is not recognized as an internal or external command"
+# 之类的碎片，随后 set/if 整段失效。run_tests.bat 就曾在提交后变成 LF，
+# 结果测试门在别的机器上直接空转。编辑器/工具（含某些格式化器、
+# 云盘同步端的文本归一化）会悄悄改写行尾，所以在这里锁死。
+
+# 批处理与 Windows 脚本：必须 CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# PowerShell 脚本：CRLF 更安全（Windows PowerShell 5.1 对 LF 容错较差）
+*.ps1   text eol=crlf
+
+# 其余文本：一律 LF，避免跨平台 diff 噪声
+*.py    text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.ini   text eol=lf
+
+# 二进制：禁止任何行尾/编码转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.webp  binary
+*.gif   binary
+*.ico   binary
+*.wav   binary
+*.mp3   binary
+*.mp4   binary
+*.zip   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary

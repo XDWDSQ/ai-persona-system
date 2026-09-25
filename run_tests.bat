@@ -2,33 +2,51 @@
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 
-rem ============================================================
-rem  AI RenXing System - offline test runner (unified entry)
-rem  Runs all offline suites with the t2i-tts venv python,
-rem  prints per-suite PASS/FAIL, exits non-zero if any fails.
-rem
-rem  Suites are DISCOVERED by glob so a newly added test_*.py runs
-rem  in the gate automatically. Only suites that need real cloud API
-rem  keys are skipped explicitly (SKIP_LIST) -- a hand-maintained
-rem  allow list is how suites end up never running.
-rem
-rem  NOT covered here:
-rem    - test_mimo.py / test_tts.py : need real cloud API keys
-rem    - verify_chain.py / runtime_smoke.py : need a running service
-rem ============================================================
+REM ============================================================
+REM  AI RenXing System - offline test runner (unified entry)
+REM
+REM  Runs every offline suite (test_*.py in this folder) and prints
+REM  per-suite PASS/FAIL. Exits non-zero if any suite fails.
+REM
+REM  Suites are DISCOVERED by glob, so a newly added test_*.py joins
+REM  the gate automatically. Only suites needing real cloud API keys
+REM  are skipped explicitly (SKIP_LIST) - a hand-maintained allow
+REM  list is how suites end up never running.
+REM
+REM  NOT covered here:
+REM    - test_mimo.py / test_tts.py : need real cloud API keys
+REM    - ops/heic_upload_e2e_test.py : needs a live service on :8000
+REM    - verify_chain.py / runtime_smoke.py : need a live service
+REM
+REM  The interpreter is located by _find_python.bat (PYTHON env var ->
+REM  project venv -> PATH). Ninth round fix: this file used to
+REM  hardcode %USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe,
+REM  so on any other machine the whole gate was a no-op.
+REM
+REM  If this script mysteriously dies with things like
+REM  "'matically.' is not recognized as an internal or external command",
+REM  the file lost its CRLF line endings. cmd.exe requires CRLF in .bat;
+REM  an LF-only file gets byte-misparsed around multi-byte comments.
+REM  See .gitattributes - never let an editor rewrite these as LF.
+REM ============================================================
 
-set "PY=%USERPROFILE%\.openvino\venv\t2i-tts\Scripts\python.exe"
 cd /d "%~dp0"
 
-rem Offline mode: TestClient 起的是真实 lifespan，若读真实 config 且激活角色开了
-rem 动态自动刷新，启动预取会真实调用搜索+云端 LLM（烧 token）。统一切断服务端
-rem 主动外部调用（用户显式发起的对话/TTS 链路本来就不被离线测试触达）。
+REM Offline mode: TestClient starts the real lifespan, and with a real
+REM config an active role with auto-refresh would really call search +
+REM cloud LLM on startup (burning tokens). Cut all server-initiated
+REM external calls; /api/status provider probing degrades to "not
+REM probed" and sends no HTTP at all.
 set "AI_DISABLE_EXTERNAL=1"
 
-if not exist "%PY%" (
-    echo [ERROR] python not found: %PY%
+call "%~dp0_find_python.bat" pytest
+if not defined PYTHON (
+    echo [ERROR] no usable python found.
+    echo         %PYTHON_ERR%
+    echo         fix: run setup.bat, or set PYTHON=^<path to python.exe^>
     exit /b 1
 )
+echo [INFO] python = %PYTHON%
 
 set "SKIP_LIST=test_mimo test_tts"
 set PASS_COUNT=0
@@ -36,9 +54,9 @@ set FAIL_COUNT=0
 set SKIP_COUNT=0
 set FAIL_LIST=
 
-rem NOTE: the loop body lives in a :run_one subroutine on purpose.
-rem A nested if/else inside a for-block (three levels of parentheses)
-rem breaks cmd's parser with "else was unexpected at this time".
+REM NOTE: the loop body lives in a :run_one subroutine on purpose.
+REM A nested if/else inside a for-block (three levels of parentheses)
+REM breaks cmd's parser with "else was unexpected at this time".
 for %%F in (test_*.py) do call :run_one "%%~nF" "%%F"
 
 echo.
@@ -64,7 +82,7 @@ for %%S in (%SKIP_LIST%) do if /I "%%S"=="!N!" (
 )
 echo.
 echo ==================== !N! ====================
-"%PY%" "%~2"
+"%PYTHON%" "%~2"
 if errorlevel 1 (
     set /a FAIL_COUNT+=1
     set "FAIL_LIST=!FAIL_LIST! !N!"

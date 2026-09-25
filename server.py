@@ -22,7 +22,6 @@ import re
 import shutil
 import struct
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -50,11 +49,14 @@ import minimax_llm  # MiniMax 云端文字生成适配器（OpenAI 兼容，payg
 # 后端拆分（2026-09）：无状态纯函数下沉到 server_pkg，server.py 只保留
 # FastAPI 装配与有状态逻辑（config/会话/TTS/LLM/路由）。以下重导出保证
 # `import server` 的旧引用（含全部离线测试与外部脚本）零改动可用。
-from server_pkg.sessions_merge import (
+# 本块是**刻意的公共 API 面**，不是"未使用的导入"：外部脚本/测试按
+# `server._mask_key(...)` / `server._clean_history(...)` 调用，逐个删掉会
+# 静默打断它们。ruff 的 F401 在这里全部忽略，不要"顺手清理"。
+from server_pkg.sessions_merge import (  # noqa: F401
     _TOMBSTONE_MAX_COUNT, _is_placeholder_session,
     _merge_sessions, _norm_tombstones, _sess_updated_at, _sessions_msg_count,
 )
-from server_pkg.text_utils import (
+from server_pkg.text_utils import (  # noqa: F401
     _KEY_MASK_PREFIX, _META_LINE_KW_RE, _META_LINE_START_RE, _SEARCH_RE,
     _STYLE_RE, _TEST_SESSION_PREFIX, _TT_PUNCT_TRANS, _TT_RE_NEWLINES,
     _TT_RE_PUNCT_DUP, _TT_RE_PUNCT_LSTRIP, _TT_RE_PUNCT_RSTRIP,
@@ -482,7 +484,9 @@ def _detach_bg(task: "asyncio.Task | None") -> None:
 # 角色引擎：按 active_role 懒创建 (MemoryStore, StateStore) 缓存，切角色即换存储
 _role_stores: dict[str, tuple[MemoryStore, StateStore]] = {}
 _ROLE_STORES_MAX = 64  # 角色数量级远小于此，上限只为兜住用户可控的 role 入参
-_post_processor: PostProcessor | None = None
+# 标注器按「是否剧情角色」各持一个单例：角色可运行时切换（dashuai ↔
+# dashuai2027），标注系统提示词必须随角色类型切换，不能一个实例用到底
+_post_processors: dict[bool, PostProcessor] = {}
 
 # 2027 赛季剧情分支：懒加载 StoryManager（首启生成日历/状态，失败不阻塞主链路）
 _story_manager: story_kpl2027.StoryManager | None = None
@@ -561,22 +565,27 @@ def _get_role_stores(role: str) -> tuple[MemoryStore, StateStore]:
 
 
 def _get_post_processor() -> PostProcessor:
-    """后处理器单例：复用 llm_chat（同 provider），但低温、短输出。"""
-    global _post_processor
-    if _post_processor is None:
-        async def _post_llm(messages: list[dict]) -> str:
-            # 后处理直接关 thinking，让模型输出正文（JSON）；不再切 deepseek-chat，
-            # 该模型名在当前 DeepSeek 账号里已不可用（实际可用 deepseek-v4-flash/pro）
-            for attempt in range(2):
-                try:
-                    return await llm_chat(messages, temperature=0.5, max_tokens=300, disable_thinking=True)
-                except HTTPException as exc:
-                    if exc.status_code == 502 and attempt == 0:
-                        continue
-                    raise
-            return ""
-        _post_processor = PostProcessor(_post_llm)
-    return _post_processor
+    """后处理器单例（按当前角色是否剧情角色分桶）：复用 llm_chat，低温、短输出。"""
+    include_story = bool(_story_role())
+    pp = _post_processors.get(include_story)
+    if pp is not None:
+        return pp
+
+    async def _post_llm(messages: list[dict]) -> str:
+        # 后处理直接关 thinking，让模型输出正文（JSON）；不再切 deepseek-chat，
+        # 该模型名在当前 DeepSeek 账号里已不可用（实际可用 deepseek-v4-flash/pro）
+        for attempt in range(2):
+            try:
+                return await llm_chat(messages, temperature=0.5, max_tokens=300, disable_thinking=True)
+            except HTTPException as exc:
+                if exc.status_code == 502 and attempt == 0:
+                    continue
+                raise
+        return ""
+
+    pp = PostProcessor(_post_llm, include_story=include_story)
+    _post_processors[include_story] = pp
+    return pp
 
 # 文字模型供应商对应的 .env 密钥名；DASHSCOPE_API_KEY 作为 ALIYUN_API_KEY 的兼容别名
 _CLOUD_PROVIDER_ENV = {
@@ -807,6 +816,13 @@ async def probe_active_provider(cfg: dict) -> tuple[bool, str]:
     if not base_url:
         _probe_cache_put(ck, (now, False, "未配置 API 地址"))
         return False, "未配置 API 地址"
+    # 离线模式（AI_DISABLE_EXTERNAL=1）：不发起任何外部请求，直接报「未探测」。
+    # 除了避免无谓流量，更重要的是修一个真实崩溃：TestClient 退出 lifespan 后共享
+    # httpx_client 已 close，仍去探测会抛 RuntimeError（不是 httpx.HTTPError），
+    # 不在下面 except 覆盖范围内 —— 会把 GET /api/status 整个 500 掉。
+    if _OFFLINE_MODE:
+        _probe_cache_put(ck, (now, False, "离线模式：未探测"))
+        return False, "离线模式：未探测"
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
         r = await httpx_client.get(f"{base_url}/models", headers=headers, timeout=3.5)
@@ -816,6 +832,11 @@ async def probe_active_provider(cfg: dict) -> tuple[bool, str]:
     except httpx.HTTPError as exc:
         _probe_cache_put(ck, (now, False, str(exc)))
         return False, str(exc)
+    except Exception as exc:  # noqa: BLE001
+        # 探测失败绝不能把 /api/status 打挂：client 已关闭、事件循环关闭、
+        # 非法 URL 等异常都不是 httpx.HTTPError，统一降级为「离线 + 原因」。
+        _probe_cache_put(ck, (now, False, str(exc) or exc.__class__.__name__))
+        return False, str(exc) or exc.__class__.__name__
 
 
 # 风格标记解析：LLM 在回复开头用 [style:xxx] 标注朗读风格，让 TTS 按情绪动态合成。
@@ -1782,7 +1803,6 @@ def _emotion_text(st: dict | None) -> str:
         return ""
     emo = st.get("emotion") or {}
     v = _safe_float(emo.get("valence"), 0.5)
-    a = _safe_float(emo.get("arousal"), 0.3)
     mood = ("低落" if v < 0.35 else "不错" if v > 0.65 else "平稳")
     energy = ("有些疲惫" if _safe_float(st.get("energy"), 0.7) < 0.4 else "精力充沛" if _safe_float(st.get("energy"), 0.7) > 0.8 else "精力正常")
     return f"情绪{mood}、{energy}（角色引擎状态）"
@@ -2276,6 +2296,7 @@ def _story_result_regex_handle(user_msg: str) -> bool:
         return False
 
 
+# flag 名从 role_engine.STORY_FLAGS 插值：枚举改名时本提示词自动跟随，不可能漂移
 _STORY_RECOGNIZER_SYSTEM = (
     "你是「大帅·2027」赛季剧情的事件裁判。根据用户（岚风）的消息判断以下事件是否真实发生，"
     "只输出一行 JSON，不要解释：\n"
@@ -2283,8 +2304,8 @@ _STORY_RECOGNIZER_SYSTEM = (
     "story_result：用户明确宣布了 AG 一场正式比赛的结果（如'赢了 3:1'、'输了 1:3'、"
     "'2:0拿下'，或没报比分的输赢）→ {\"win\":true/false,\"score\":\"3:1 或空\",\"mvp\":\"选手名或空\"}；"
     "预测、假设、复述旧赛果、未说明是正式比赛的训练赛/巅峰赛/排位一律 null。\n"
-    "story_flag：只有两个取值——'command_win'（局内指挥权被明确确认交给岚风）或 "
-    "'confession'（一方明确表白且另一方明确接受、正式在一起）；"
+    f"story_flag：只有两个取值——'{role_engine.STORY_FLAGS[0]}'（局内指挥权被明确确认交给岚风）或 "
+    f"'{role_engine.STORY_FLAGS[1]}'（一方明确表白且另一方明确接受、正式在一起）；"
     "暧昧暗示、讨论话题、开玩笑都不算，一律 null。\n"
     "不要过度推断：没有明确宣布的都输出 null。"
 )
@@ -2827,13 +2848,38 @@ class LoginRequest(BaseModel):
     token: str
 
 
+# 上一次成功读到的访问口令：config 读取异常时继续要求同一口令（fail-closed），
+# 而不是降级成"未配置口令"把公网门禁全开。见 _access_token()。
+_last_good_token: str = ""
+
+
 def _access_token() -> str | None:
-    """返回当前生效的访问口令；未配置返回 None（表示不启用保护）。"""
+    """返回当前生效的访问口令；未配置返回 None（表示不启用保护）。
+
+    第九轮安全加固：配置读取异常时**不得**再静默降级成"未配置口令"。
+    旧实现在这里裸 `except Exception: cfg_tok = ""`，于是只要 config.json 被改坏
+    （例如 cloud 节写成数组、voice 节写成字符串，_apply_env_overrides 在解析时抛错），
+    load_config() 异常就会被当成"用户没配口令"，access_gate 全放行 —— ngrok 公网
+    上 /uploads/* 附件、/api/sync/stream 全部未认证可读，而且没有任何日志痕迹。
+    现在改为：异常时回退到上一次成功读到的口令（有过口令就继续要求口令），
+    并打 ERROR 日志；只有"配置读取正常且确实没配口令"才放行。"""
+    global _last_good_token
     try:
-        cfg_tok = str(load_config().get("access_token") or "").strip()
-    except Exception:
-        cfg_tok = ""
+        cfg = load_config()
+    except Exception as exc:  # noqa: BLE001
+        env_tok = str(os.environ.get("ACCESS_TOKEN") or "").strip()
+        if _last_good_token:
+            _log.error("load_config 失败（%s）；访问门禁回退到上一次生效口令，不放行匿名访问", exc)
+            return _last_good_token
+        if env_tok:
+            _log.error("load_config 失败（%s）；回退到环境变量 ACCESS_TOKEN", exc)
+            return env_tok
+        _log.error("load_config 失败（%s）且无历史口令/环境变量：本次按「未配置口令」处理；"
+                   "若你确实配了口令，请修复 config.json 后重启服务", exc)
+        return None
+    cfg_tok = str(cfg.get("access_token") or "").strip()
     if cfg_tok:
+        _last_good_token = cfg_tok
         return cfg_tok
     env_tok = str(os.environ.get("ACCESS_TOKEN") or "").strip()
     return env_tok or None
@@ -4233,7 +4279,7 @@ async def mimo_tts_synthesize(text: str, style: str = "", cfg: dict | None = Non
         raise HTTPException(502, f"MiMo TTS 响应解析失败: {exc}")
     try:
         audio_data = data["choices"][0]["message"]["audio"]["data"]
-    except (KeyError, IndexError, TypeError) as exc:
+    except (KeyError, IndexError, TypeError):
         raise HTTPException(502, f"MiMo TTS 响应缺少音频: {str(data)[:300]}")
     try:
         # 音频可达数 MB：base64 解码是纯 CPU，丢线程池避免冻住事件循环
@@ -4783,7 +4829,14 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
     story_task：与生成并行的剧情事件识别任务；收尾时短等它出结果，
     超时不阻塞（识别继续在后台跑完，赛果照常入库，只是本轮不弹剧情通知）。"""
 
+    # story_task 是否已由本函数等出结果（settled）：
+    # 只有等待成功才说明它已结束、无需再托管；其余一切提前退出路径
+    # （视觉分支 return、客户端断流、异常）都必须 _detach_bg，否则局部引用
+    # 释放后任务可能被 GC 中途回收，赛果/flag 静默丢失且无任何日志。
+    story_task_settled = False
+
     async def _finish_story_update() -> dict | None:
+        nonlocal story_task_settled
         if story_task is None:
             return None
         try:
@@ -4792,6 +4845,7 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
             # 超时后任务仍在跑：交给后台托管，保证赛果识别照常入库
             _detach_bg(story_task)
             return None
+        story_task_settled = True
         return _story_update_payload(events or [])
 
     vision_used = False
@@ -4804,145 +4858,165 @@ async def _chat_stream_events(system: dict, history: list[dict], user_content: s
     # 有图片附件时走视觉模型（云端多模态/本地 VL 均不支持逐字流，一次性给出），
     # 全部不可用则回退文本流式，并注入「看不到图片内容」指令防止模型编造
     if req.attachments:
-        raw = await _try_vision_chat(system, history, req, cfg)
-        if raw:
-            vision_used = True
-            raw = _strip_search_markers(raw)
-            full = raw
-            yield ev({"d": raw})
-            # 视觉回复已完整给出：立即收尾返回。此前此处缺 return，会继续执行下方文本
-            # 流式主循环，把同一问题再交给文本模型生成一遍（用户看到双份回答）。
-            clean = _STYLE_RE.sub("", full).strip()
-            clean = _strip_meta_notes(clean)
-            if active_role == "dashuai":
-                clean = _fix_addressing(clean)
-            narration = ""
-            if active_role == _NARRATION_TAG:
-                narration, clean = _split_narration(clean)
-            style, _ = parse_style_prefix(full)
-            yield ev({"done": True, "clean": clean, "narration": narration, "style": style,
-                      "searched": False, "vision_used": True,
-                      "story_update": await _finish_story_update()})
-            return
-        if any(a.get("kind") == "image" for a in req.attachments):
-            user_content = user_content + _VISION_FALLBACK_HINT
+        try:
+            raw = await _try_vision_chat(system, history, req, cfg)
+            if raw:
+                vision_used = True
+                raw = _strip_search_markers(raw)
+                full = raw
+                yield ev({"d": raw})
+                # 视觉回复已完整给出：立即收尾返回。此前此处缺 return，会继续执行下方文本
+                # 流式主循环，把同一问题再交给文本模型生成一遍（用户看到双份回答）。
+                clean = _STYLE_RE.sub("", full).strip()
+                clean = _strip_meta_notes(clean)
+                if active_role == "dashuai":
+                    clean = _fix_addressing(clean)
+                narration = ""
+                if active_role == _NARRATION_TAG:
+                    narration, clean = _split_narration(clean)
+                style, _ = parse_style_prefix(full)
+                yield ev({"done": True, "clean": clean, "narration": narration, "style": style,
+                          "searched": False, "vision_used": True,
+                          "story_update": await _finish_story_update()})
+                return
+            if any(a.get("kind") == "image" for a in req.attachments):
+                user_content = user_content + _VISION_FALLBACK_HINT
+        finally:
+            # 视觉分支提前 return 同样要让 story_task 有主（见下方主循环 finally 的说明）
+            if not story_task_settled:
+                _detach_bg(story_task)
 
-    # 文本流式主循环（含搜索探测与长文续写）
-    search_cfg = cfg.get("search") or {}
+    # ---------------------------------------------------------------
+    # 文本流式主循环（含搜索探测与长文续写）+ 视觉分支之外的统一收尾，
+    # 全部包在 try/finally 里。
+    #
+    # 为什么必须 finally：这是 async generator，客户端断流时框架会关闭它，
+    # 生成器帧随之释放 —— story_task 就失去了唯一强引用，可能被 GC 中途回收，
+    # 表现是赛果/表白 flag 静默丢失 + "Task was destroyed but it is pending"。
+    # 旧实现只在 `except HTTPException` 里 _detach_bg，正常收尾与断流路径都没兜住。
+    # ---------------------------------------------------------------
     try:
-        max_rounds = int(search_cfg.get("max_rounds", 2) or 2)
-    except (TypeError, ValueError):
-        max_rounds = 2
-    messages = [dict(system)] + [dict(m) for m in history] + [{"role": "user", "content": user_content}]
-    round_no = 0
-    while True:
-        round_buf = ""
-        query = None
-        buf_d = ""  # SSE 攒批缓冲：合并高频小 delta，把事件频率压到 ~60Hz（帧率上限），前端不卡、移动端省电
-        last_flush = time.monotonic()
+        # 文本流式主循环（含搜索探测与长文续写）
+        search_cfg = cfg.get("search") or {}
         try:
-            async for piece in llm_chat_stream(
-                messages, max_tokens=out_tokens, thinking=chat_thinking, cfg=cfg,
-            ):
-                round_buf += piece
-                if round_no == 0:
-                    m = _SEARCH_RE.search(round_buf)
-                    if m:
-                        query = m.group(1).strip()
-                        break  # 第一轮命中 [search:...]，中断本轮（不 emit 标记片段）
-                full += piece
-                buf_d += piece
-                # 攒够 ~12 字符或 ~16ms 一帧才发射；逐 token 直发可达数百 Hz，是渲染卡顿的主因
-                now = time.monotonic()
-                if len(buf_d) >= 12 or now - last_flush >= 0.016:
+            max_rounds = int(search_cfg.get("max_rounds", 2) or 2)
+        except (TypeError, ValueError):
+            max_rounds = 2
+        messages = [dict(system)] + [dict(m) for m in history] + [{"role": "user", "content": user_content}]
+        round_no = 0
+        while True:
+            round_buf = ""
+            query = None
+            buf_d = ""  # SSE 攒批缓冲：合并高频小 delta，把事件频率压到 ~60Hz（帧率上限），前端不卡、移动端省电
+            last_flush = time.monotonic()
+            try:
+                async for piece in llm_chat_stream(
+                    messages, max_tokens=out_tokens, thinking=chat_thinking, cfg=cfg,
+                ):
+                    round_buf += piece
+                    if round_no == 0:
+                        m = _SEARCH_RE.search(round_buf)
+                        if m:
+                            query = m.group(1).strip()
+                            break  # 第一轮命中 [search:...]，中断本轮（不 emit 标记片段）
+                    full += piece
+                    buf_d += piece
+                    # 攒够 ~12 字符或 ~16ms 一帧才发射；逐 token 直发可达数百 Hz，是渲染卡顿的主因
+                    now = time.monotonic()
+                    if len(buf_d) >= 12 or now - last_flush >= 0.016:
+                        yield ev({"d": buf_d})
+                        buf_d = ""
+                        last_flush = now
+                if buf_d:  # 本轮自然结束，不足一帧的残余一并发出（搜索 break 场景除外，前端会 reset）
                     yield ev({"d": buf_d})
-                    buf_d = ""
-                    last_flush = now
-            if buf_d:  # 本轮自然结束，不足一帧的残余一并发出（搜索 break 场景除外，前端会 reset）
-                yield ev({"d": buf_d})
-        except HTTPException as exc:
-            # 生成器提前返回：story_task 仍在并行跑，交给后台托管，
-            # 否则局部变量释放后任务被 GC 中途回收，赛果/表白识别静默丢失
-            _detach_bg(story_task)
-            yield ev({"err": f"生成失败：{exc.detail}"})
-            return
-        if query is None:
-            break
-        # 进入搜索轮：清空前端已显示内容，把搜索结果回填后第二轮全量流式
-        searched = True
-        yield ev({"reset": True})
-        full = ""
-        try:
-            results = await web_search(query, cfg)
-        except HTTPException as exc:
-            _detach_bg(story_task)
-            yield ev({"err": f"搜索失败：{exc.detail}"})
-            return
-        messages = messages + [
-            {"role": "assistant", "content": round_buf},
-            {"role": "user", "content": _format_search_feedback(query, results)},
-        ]
-        round_no += 1
-        if round_no > max_rounds:
-            break
+            except HTTPException as exc:
+                # 生成器提前返回：story_task 仍在并行跑，交给后台托管，
+                # 否则局部变量释放后任务被 GC 中途回收，赛果/表白识别静默丢失
+                _detach_bg(story_task)
+                yield ev({"err": f"生成失败：{exc.detail}"})
+                return
+            if query is None:
+                break
+            # 进入搜索轮：清空前端已显示内容，把搜索结果回填后第二轮全量流式
+            searched = True
+            yield ev({"reset": True})
+            full = ""
+            try:
+                results = await web_search(query, cfg)
+            except HTTPException as exc:
+                _detach_bg(story_task)
+                yield ev({"err": f"搜索失败：{exc.detail}"})
+                return
+            messages = messages + [
+                {"role": "assistant", "content": round_buf},
+                {"role": "user", "content": _format_search_feedback(query, results)},
+            ]
+            round_no += 1
+            if round_no > max_rounds:
+                break
 
-    # 长文续写：离目标字数还远时继续流式补写（每轮续写段同样逐块 emit）
-    if not vision_used and out_tokens > _DEFAULT_MAX_TOKENS:
-        target = _requested_char_count((req.message or ""))
-        if target >= 400:
-            for _ in range(_MAX_CONTINUE_ROUNDS):
-                _, body = parse_style_prefix(full)
-                if len(body) >= target:
-                    break
-                cont_msgs = (
-                    [dict(system)] + [dict(m) for m in history]
-                    + [
-                        {"role": "user", "content": user_content},
-                        {"role": "assistant", "content": body},
-                        {"role": "user", "content": (
-                            f"上面才写了{len(body)}字，还没到要求的{int(target)}字。"
-                            "从上文结尾处自然地接着往下写，不要重复已写内容，不要另起开头，"
-                            "不要总结收尾，继续展开细节和情节，把剩下的篇幅写满。"
-                        )},
-                    ]
-                )
-                chunk_len = 0
-                cbuf_d = ""  # 续写段同样攒批发射，与主循环一致的帧率上限
-                cbuf_t = time.monotonic()
-                try:
-                    async for piece in llm_chat_stream(
-                        cont_msgs, max_tokens=out_tokens, thinking=False, cfg=cfg,
-                    ):
-                        chunk_len += len(piece)
-                        full += piece
-                        cbuf_d += piece
-                        now = time.monotonic()
-                        if len(cbuf_d) >= 12 or now - cbuf_t >= 0.016:
+        # 长文续写：离目标字数还远时继续流式补写（每轮续写段同样逐块 emit）
+        if not vision_used and out_tokens > _DEFAULT_MAX_TOKENS:
+            target = _requested_char_count((req.message or ""))
+            if target >= 400:
+                for _ in range(_MAX_CONTINUE_ROUNDS):
+                    _, body = parse_style_prefix(full)
+                    if len(body) >= target:
+                        break
+                    cont_msgs = (
+                        [dict(system)] + [dict(m) for m in history]
+                        + [
+                            {"role": "user", "content": user_content},
+                            {"role": "assistant", "content": body},
+                            {"role": "user", "content": (
+                                f"上面才写了{len(body)}字，还没到要求的{int(target)}字。"
+                                "从上文结尾处自然地接着往下写，不要重复已写内容，不要另起开头，"
+                                "不要总结收尾，继续展开细节和情节，把剩下的篇幅写满。"
+                            )},
+                        ]
+                    )
+                    chunk_len = 0
+                    cbuf_d = ""  # 续写段同样攒批发射，与主循环一致的帧率上限
+                    cbuf_t = time.monotonic()
+                    try:
+                        async for piece in llm_chat_stream(
+                            cont_msgs, max_tokens=out_tokens, thinking=False, cfg=cfg,
+                        ):
+                            chunk_len += len(piece)
+                            full += piece
+                            cbuf_d += piece
+                            now = time.monotonic()
+                            if len(cbuf_d) >= 12 or now - cbuf_t >= 0.016:
+                                yield ev({"d": cbuf_d})
+                                cbuf_d = ""
+                                cbuf_t = now
+                        if cbuf_d:
                             yield ev({"d": cbuf_d})
-                            cbuf_d = ""
-                            cbuf_t = now
-                    if cbuf_d:
-                        yield ev({"d": cbuf_d})
-                except HTTPException as exc:
-                    _log.warning("stream long-form continuation aborted: %s", exc)
-                    break
-                if chunk_len < 80:  # 模型不肯续写、只回了一句收尾话，就此打住
-                    break
+                    except HTTPException as exc:
+                        _log.warning("stream long-form continuation aborted: %s", exc)
+                        break
+                    if chunk_len < 80:  # 模型不肯续写、只回了一句收尾话，就此打住
+                        break
 
-    # 收尾：剥离全部 style 标记与元话语，交给前端入库展示
-    # （第二轮及以后若模型又输出 [search:xxx] 标记，这里一并剥掉，避免残留进正文）
-    clean = _STYLE_RE.sub("", _strip_search_markers(full)).strip()
-    clean = _strip_meta_notes(clean)
-    # 称呼纠错仅对大帅角色生效（自称老婆/称用户老公/男性自称），其他角色会误伤
-    if active_role == "dashuai":
-        clean = _fix_addressing(clean)
-    narration = ""
-    if active_role == _NARRATION_TAG:
-        narration, clean = _split_narration(clean)
-    style, _ = parse_style_prefix(full)
-    yield ev({"done": True, "clean": clean, "narration": narration, "style": style,
-              "searched": searched, "vision_used": vision_used,
-              "story_update": await _finish_story_update()})
+        # 收尾：剥离全部 style 标记与元话语，交给前端入库展示
+        # （第二轮及以后若模型又输出 [search:xxx] 标记，这里一并剥掉，避免残留进正文）
+        clean = _STYLE_RE.sub("", _strip_search_markers(full)).strip()
+        clean = _strip_meta_notes(clean)
+        # 称呼纠错仅对大帅角色生效（自称老婆/称用户老公/男性自称），其他角色会误伤
+        if active_role == "dashuai":
+            clean = _fix_addressing(clean)
+        narration = ""
+        if active_role == _NARRATION_TAG:
+            narration, clean = _split_narration(clean)
+        style, _ = parse_style_prefix(full)
+        yield ev({"done": True, "clean": clean, "narration": narration, "style": style,
+                  "searched": searched, "vision_used": vision_used,
+                  "story_update": await _finish_story_update()})
+    finally:
+        # 幂等：_detach_bg 内部对 done / 已在 _bg_tasks 的任务直接返回，
+        # 所以这里无条件调用是安全的（等待成功的任务会被它忽略）。
+        if not story_task_settled:
+            _detach_bg(story_task)
 
 
 # SSE 心跳间隔：底层流静默超过该秒数就发一行 ": ping" 注释，证明连接还活着。
@@ -5678,16 +5752,26 @@ async def chat_stats():
                 user_n += 1
             elif role == "assistant":
                 ai_n += 1
-            chars += len(m.get("content") or "")
+            raw_content = m.get("content")
+            # 客户端可控字段：content 可能是数字/None/对象（会话经 PUT 原样落盘），
+            # len(5) 直接 TypeError → 设置页「陪伴足迹」永久 500
+            chars += len(raw_content) if isinstance(raw_content, str) else len(str(raw_content or ""))
             for a in (m.get("attachments") or []):
                 if isinstance(a, dict) and a.get("kind") == "image":
                     images += 1
             ts = m.get("ts")
-            if isinstance(ts, (int, float)) and ts > 0:
+            # ts 同样客户端可控且驻留落盘：Infinity / 1e15 / 极端值会让 localtime 抛
+            # OverflowError 或 OSError，必须连同取值一起兜住
+            if (isinstance(ts, (int, float)) and not isinstance(ts, bool)
+                    and ts > 0 and ts < 4e12):
                 if first_ts is None or ts < first_ts:
                     first_ts = ts
-                day = time.strftime("%Y-%m-%d", time.localtime(ts / 1000))
-                day_counts[day] = day_counts.get(day, 0) + 1
+                try:
+                    day = time.strftime("%Y-%m-%d", time.localtime(ts / 1000))
+                except (OverflowError, OSError, ValueError):
+                    day = ""
+                if day:
+                    day_counts[day] = day_counts.get(day, 0) + 1
         # 最早活动时间用会话 updatedAt 兜底（老会话消息无 ts 也能给出起点）
         uts = s.get("updatedAt")
         if isinstance(uts, (int, float)) and uts > 0 and (first_ts is None or uts < first_ts):

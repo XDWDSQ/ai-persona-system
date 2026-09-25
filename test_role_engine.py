@@ -327,6 +327,30 @@ def test_postprocessor_string_braces():
           str(parsed2))
 
 
+def test_dup_sim_short_text():
+    """第九轮回归：短文本（<3 字）的相似度判定。
+
+    旧实现里 `_dup_sim("在呢","好的") == 1.0` —— 因为双方都取不到 3-gram，
+    `_jaccard(set(), set())` 约定返回 1.0，于是「任意两个 2 字回复都算完全重复」。
+    后果不是洁癖：server.py 的复读检测会因此对每轮正常寒暄触发一次额外的 LLM
+    改写调用（白烧 token），role_engine 里 2 字记忆也会被当重复丢弃。
+    """
+    check("两个不同的 2 字回复不算重复", role_engine._dup_sim("在呢", "好的") < 0.5,
+          str(role_engine._dup_sim("在呢", "好的")))
+    check("两个不同的单字不算重复", role_engine._dup_sim("嗯", "哦") < 0.5,
+          str(role_engine._dup_sim("嗯", "哦")))
+    check("完全相同的短文本仍是 1.0", role_engine._dup_sim("在呢", "在呢") == 1.0)
+    check("完全相同的单字仍是 1.0", role_engine._dup_sim("嗯", "嗯") == 1.0)
+    check("空串不与任何文本算重复", role_engine._dup_sim("", "在呢") == 0.0
+          and role_engine._dup_sim("", "") == 0.0)
+    # 长文本行为不能因为短文本收口而改变
+    check("长文本近似改写仍是高相似", role_engine._dup_sim("今天天气真不错啊", "今天天气真不错呀") >= 0.5,
+          str(role_engine._dup_sim("今天天气真不错啊", "今天天气真不错呀")))
+    check("长文本无关内容仍是低相似", role_engine._dup_sim("今天天气真不错啊", "明天要去打比赛") < 0.5,
+          str(role_engine._dup_sim("今天天气真不错啊", "明天要去打比赛")))
+
+
+
 def main():
     tests = [
         test_memory_dedup,
@@ -348,6 +372,7 @@ def main():
         test_postprocessor_story_parse,
         test_postprocessor_string_braces,
         test_context_block,
+        test_dup_sim_short_text,
     ]
     for t in tests:
         t()

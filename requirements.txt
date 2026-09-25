@@ -7,3 +7,8 @@ python-multipart==0.0.32
 # HEIC/AVIF 图片转 JPEG（iPhone 照片默认 HEIC，云端视觉模型只认 bmp/gif/png/jpeg/webp）
 pillow==12.3.0
 pillow-heif==1.5.0
+
+# 离线测试门（run_tests.bat / conftest.py 的 TestClient）——此前只在开发机全局装了，
+# requirements 里没写，换机跑 run_tests.bat 直接 "No module named pytest"。
+# TestClient 由 fastapi 自带（底层 httpx，已在上面）。
+pytest==9.1.1
