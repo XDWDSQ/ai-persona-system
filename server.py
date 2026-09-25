@@ -20,6 +20,7 @@ import mimetypes
 import os
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import threading
@@ -2951,13 +2952,33 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI 拟人系统", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    # 跨域放开仅在配置访问口令时安全（见下方 access_gate 中间件）；
-    # 无口令模式下 access_gate 会拒绝带跨源 Origin 的请求兜底。
-    allow_origins=["*"],
-    allow_methods=["*"], allow_headers=["*"],
+
+# ------------------------------------------------------------ 跨源策略 --------
+# 第十一轮：原先这里是无条件 `allow_origins=["*"]`，理由是"有口令保护就够了"。
+# 但**登录端点本身在口令校验之前**，于是跨源放开给出的是一个口令 oracle：
+#     · 恶意页面 fetch POST /api/login，凭 ACAO:* 读懂返回 200 还是 401；
+#     · 每个访客浏览器都是一个不同出口 IP，按 IP 计数的爆破锁定（8 次/10 分钟）
+#       完全跟不上分布式猜测，锁定形同虚设。
+# 而本项目的页面与 API **同源**（chat.html 由本服务自己发，所有 fetch 都是相对
+# 路径），压根不需要跨源 —— 所以默认不给任何 CORS 头，并有 access_gate 在
+# 两种模式下统一拒绝跨源请求（返回 403，而不是"浏览器自己看着办"）。
+#
+# 确实需要跨源的（例如自己写的外部面板）在 config.json 里显式列出来：
+#     "cors_allow_origins": ["http://192.168.1.9:5173"]
+# 只有列进去的来源才会拿到 CORS 头；改完需重启服务（中间件在导入期注册）。
+_CORS_ALLOW_ORIGINS = frozenset(
+    o.strip().lower()
+    for o in (load_config().get("cors_allow_origins") or [])
+    if isinstance(o, str) and o.strip()
 )
+if _CORS_ALLOW_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=sorted(_CORS_ALLOW_ORIGINS),
+        # 既已显式点名来源，就允许带上 cookie（跨源面板用口令登录的场景）
+        allow_credentials=True,
+        allow_methods=["*"], allow_headers=["*"],
+    )
 
 
 @app.exception_handler(Exception)
@@ -3070,6 +3091,53 @@ def _auth_ok(request: Request, token: str) -> bool:
     return bool(cookie) and hmac.compare_digest(cookie, _cookie_value(token))
 
 
+_DEFAULT_PORTS = {"http": "80", "https": "443"}
+
+
+def _split_hostport(netloc: str) -> tuple[str, str]:
+    """netloc → (host, port)；无端口时 port 为空串。IPv6 字面量保持方括号形式。
+
+    尾部点（`example.com.` 的 FQDN 绝对写法）在 host 分量上去掉 —— 直接对 netloc
+    rstrip 只能盖住"没带端口"的那种，`example.com.:8000` 的点在中间，会漏。"""
+    netloc = (netloc or "").strip().lower()
+    if netloc.startswith("["):
+        host, _, rest = netloc.partition("]")
+        return host + "]", rest.lstrip(":")
+    host, sep, port = netloc.rpartition(":")
+    if not sep or ":" in host:
+        return netloc.rstrip("."), ""  # 无冒号（无端口），或裸 IPv6（多个冒号，非端口）
+    return host.rstrip("."), port
+
+
+def _origin_is_trusted(req: Request, origin: str) -> bool:
+    """跨源判定：Origin 与本次请求的 Host 同源，或落在显式白名单里。
+
+    为什么要自己比 Host 而不是写死几个来源：本项目常在 127.0.0.1 / localhost /
+    局域网 IP / 隧道域名之间切，写死任何一组都会在换访问方式时误伤自己。
+    比 Host 的语义是「浏览器实际访问的站点 == 发起请求的站点」。
+    `Origin: null`（sandbox iframe / file: 页面 / 跨源重定向）一律不可信：
+    urlparse("null").netloc 是空串，不特判就会和空 Host 比出"相等"。
+    注：DNS rebinding（攻击者域名解析到本机，此时 Origin 与 Host 真的一致）
+    躲不过这一步，属已知残余风险，见 docs-specs 第十一轮记录。"""
+    low = origin.strip().lower()
+    if low == "null" or not low:
+        return False
+    if low in _CORS_ALLOW_ORIGINS:
+        return True
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    o_host, o_port = _split_hostport(parsed.netloc)
+    h_host, h_port = _split_hostport(req.headers.get("host", ""))
+    scheme = (parsed.scheme or "").lower()
+    if o_port == _DEFAULT_PORTS.get(scheme):
+        o_port = ""
+    if h_port == _DEFAULT_PORTS.get((req.url.scheme or "").lower()):
+        h_port = ""
+    return bool(o_host) and o_host == h_host and o_port == h_port
+
+
 @app.middleware("http")
 async def access_gate(request: Request, call_next):
     """全局访问门禁：配置了口令时，除健康检查与登录页外均需通过校验。"""
@@ -3092,21 +3160,22 @@ async def access_gate(request: Request, call_next):
     elif request.method not in ("GET", "HEAD", "OPTIONS") and not is_multipart:
         return JSONResponse({"detail": "请求必须携带 Content-Length"}, status_code=411)
     token = _access_token()
+    # 跨源闸（第十一轮）：**两种模式都要过**。旧实现在配了口令时把这件事完全交给
+    # `allow_origins=["*"]` 的 CORS 中间件，等于对本机全部 API（含口令校验之前的
+    # /api/login）放开跨源读写；未配口令时才在这里兜底比 Origin。现在统一在这里判，
+    # 跨源请求一律 403 —— 不做"少给几个响应头让浏览器自己拦"，因为那对非浏览器
+    # 调用方（脚本/httpx）毫无约束，而登录端点的爆破 oracle 正是被非浏览器放大最多。
+    # 无 Origin 头（同源简单 GET、curl、PWA 原生请求、SSE）不受影响。
+    origin = (request.headers.get("origin") or "").strip()
+    if origin and not _origin_is_trusted(request, origin):
+        _log.warning("cross-origin rejected: origin=%s host=%s path=%s",
+                     origin, request.headers.get("host", "-"), request.url.path)
+        return JSONResponse({"detail": "禁止跨源访问：来源与本站不一致"}, status_code=403)
     if not token:
-        # 无口令模式（纯本机直连）收紧跨域：拒绝 Origin 与 Host 不一致的请求，
-        # 防止恶意网页经浏览器跨域驱动本机全部 API（烧配额/塞磁盘/读配置）。
-        origin = request.headers.get("origin")
-        if origin:
-            # 显式拒绝 "null" 源（sandbox iframe / file: 页面 / 本地重定向，
-            # urlparse("null").netloc 为空字符串会绕过下方的 netloc 比较）
-            if origin.strip().lower() == "null":
-                return JSONResponse({"detail": "未配置访问口令时禁止跨源访问"}, status_code=403)
-            o_netloc = urlparse(origin).netloc
-            if o_netloc != request.headers.get("host", ""):
-                return JSONResponse({"detail": "未配置访问口令时禁止跨源访问"}, status_code=403)
         return await call_next(request)
-    # CORS 预检（OPTIONS）不带 cookie/Authorization 之外的凭据，统一交给内层
-    # CORSMiddleware 生成预检响应；否则带口令跨域客户端的非简单请求必 401。
+    # CORS 预检（OPTIONS）：只有配置了 cors_allow_origins 才会有内层 CORSMiddleware；
+    # 上面的跨源闸已经放行白名单来源，这里直接交给它生成预检响应。没配白名单时
+    # 跨源预检到不了这里（一律 403），同源浏览器不发预检，走到路由层得 405 也无妨。
     if request.method == "OPTIONS":
         return await call_next(request)
     path = request.url.path
@@ -3256,25 +3325,129 @@ def _record_auth_failure(ip: str, source: str) -> int:
 
 
 def _behind_local_proxy(req: Request) -> bool:
-    """TCP 对端是本机回环/私有网段 => 请求经同机反向代理（ngrok）回源。
+    """TCP 对端是**本机回环** => 请求经同机反向代理（ngrok 等）回源。
 
     这是判断「能不能采信 X-Forwarded-* 头」的唯一依据：只有直连我们的那一跳
-    是自己人时，它追加的头部才可信；公网直连时任何人都能自己塞这些头。"""
+    确实落在同一台机器上时，它追加的头部才可信。
+
+    第十一轮修正：旧实现把「对端在任意私有网段」（is_private）也算作自己人。
+    但服务默认 bind 0.0.0.0，**局域网里任何一台机器**直连过来对端都是私网地址 ——
+    于是它自己塞的 X-Forwarded-For 会被采信，_client_ip 每请求换一个伪造值就换一个
+    限流桶，"8 次失败即锁 10 分钟"的爆破防护变成可无限重试。同机代理的连接必然
+    来自回环，所以判据只保留 is_loopback（ngrok 仍是回环回源，不受影响）。
+    若日后真把反代放到另一台机器上，需要的是显式的可信代理白名单，而不是
+    "私网即自己人"这种一放就是一整个网段的猜测。"""
     host = req.client.host if req.client else ""
     try:
         peer = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return peer.is_loopback or peer.is_private
+    return peer.is_loopback
 
 
 # 本机管理/元数据面：任何"用户自填 URL"都不该被服务端取用。
 # 4040 是 ngrok 自己的管理 API（AGENTS.md 明文记录它的存在，返回 JSON 隧道列表），
 # 169.254.169.254 是云厂商元数据服务；两者都是典型的 SSRF 提权靶点，
 # 且都**不可能是**一个 OpenAI 兼容的对话网关地址，误伤风险为零。
-_URL_BLOCKED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]"})
+#
+# 回环的**域名**写法在这里列；IP 字面量一律不靠字符串比对，走 _host_to_ip 归一化
+# 后判型 —— 否则 2130706433 / [::ffff:127.0.0.1] 这类写法会整片漏过去。
 _URL_BLOCKED_PORTS = frozenset({4040, 4041})
 _METADATA_HOST = "169.254.169.254"
+_URL_BLOCKED_NAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost"})
+_LOOPBACK_REASON = ("拒绝把服务端指向本机回环地址（SSRF 防护）：请改填 config.json 里的 provider "
+                    "地址，或使用局域网 IP")
+_METADATA_REASON = "拒绝访问链路本地/云元数据地址（SSRF 防护）"
+
+
+def _host_to_ip(host: str):
+    """把 hostname 归一成 ipaddress 对象；不是 IP 字面量时返回 None。
+
+    第十一轮审计：旧实现直接拿 urlparse 出来的字符串和 {"127.0.0.1","localhost",...}
+    比，再用 startswith("127.") 兜一下。可 URL 里表示「本机」的写法远不止这两种，
+    而这些写法 **httpx 全都会真的连过去**：
+
+        2130706433         十进制整型 IPv4     旧实现放行
+        0x7f000001         十六进制整型        旧实现放行
+        017700000001       八进制整型          旧实现放行
+        127.1              短式 IPv4          旧实现只是碰巧被 startswith("127.") 拦住
+        [::ffff:127.0.0.1] IPv4-mapped IPv6   旧实现当成普通域名放行
+        127.0.0.1.         尾部点（FQDN 绝对式） 旧实现字符串不相等 -> 放行
+
+    收敛办法：`ipaddress.ip_address` 先直解；失败再用 `socket.inet_aton` 兜底 ——
+    后者恰好接受整型/十六进制/八进制/短式这四种旧写法，且越界值与纯域名都会拒绝。
+    两者都失败才认定"这是个域名"。IPv4-mapped IPv6 取内层 IPv4 再判，否则
+    `is_loopback` 对 ::ffff:127.0.0.1 恒为 False（它对内层地址一无所知）。"""
+    h = (host or "").strip().strip("[]").lower().rstrip(".")
+    # IPv6 作用域 id（fe80::1%eth0，URL 里写作 %25eth0）不属于地址本身
+    h = h.split("%", 1)[0]
+    if not h:
+        return None
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        try:
+            ip = ipaddress.ip_address(socket.inet_aton(h))
+        except (OSError, ValueError):
+            return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _ip_is_internal(ip) -> bool:
+    """回环 / 未指定(0.0.0.0, ::) / 链路本地(169.254.x, fe80::) —— 都不该是对话网关。
+
+    刻意**不**包含 is_private：本项目支持把 cloud.base_url 指到局域网里的自建
+    ollama/llama.cpp，把私网一并拦掉会误伤真实用法（第九轮就是这个取舍）。"""
+    return ip.is_loopback or ip.is_unspecified or ip.is_link_local
+
+
+async def _getaddrinfo(host: str):
+    """域名解析（线程池内执行，不阻塞事件循环）。单独成函数是为了给测试留替换缝。"""
+    return await asyncio.get_running_loop().getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+
+
+async def _url_resolves_to_internal(raw: str, cfg_base: str = "", timeout: float = 3.0) -> str:
+    """域名**解析后**再判一次：`127.0.0.1.nip.io` 这类「公网域名解析到本机」的写法。
+
+    没有这一步，_host_to_ip 的归一化只要加一个域名就能绕过 —— 挂个免费 wildcard DNS
+    就能把 127.0.0.1 藏在合法域名后面（DNS rebinding 的静态版本，`nip.io`/`sslip.io`
+    这类服务是现成的）。项目自带的 verify_chain.py 早就在用「先解析再 ipaddress 判型」
+    的口径，这里与它对齐。
+
+    用 `loop.getaddrinfo` 而不是同步 `socket.getaddrinfo`：后者在解析器无响应的机器上
+    会把事件循环整个卡住数秒，SSE 全跟着停。再套 wait_for 兜住线程池里那次调用。
+
+    解析失败/超时一律**放行**（返回空串）：真正的报错交给随后那次真实请求，
+    这里不该因为"DNS 一时不通"就把用户的正常域名判死。"""
+    url = (raw or "").strip()
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "http://" + url
+    if cfg_base and url.rstrip("/") == cfg_base.rstrip("/"):
+        return ""  # 机主自己配的地址不拦（与同步路径同一口径）
+    try:
+        host = (urlparse(url).hostname or "").strip().rstrip(".")
+    except ValueError:
+        return ""
+    if not host or _host_to_ip(host) is not None:
+        return ""  # 空 / IP 字面量：上面的字面量闸已经判过，无需再解析
+    try:
+        addrs = await asyncio.wait_for(_getaddrinfo(host), timeout=timeout)
+    except (OSError, asyncio.TimeoutError, UnicodeError):
+        return ""
+    for _family, _type, _proto, _canon, sockaddr in addrs:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except (ValueError, IndexError):
+            continue
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        if _ip_is_internal(ip):
+            return f"拒绝访问解析到本机/链路的地址（{host} → {sockaddr[0]}，SSRF 防护）"
+    return ""
 
 
 def _url_is_blocked_target(raw: str, cfg_base: str = "") -> str:
@@ -3288,11 +3461,14 @@ def _url_is_blocked_target(raw: str, cfg_base: str = "") -> str:
     设计上刻意**不**一刀切禁私网：本项目支持本地 LLM（ollama/llama.cpp，见 llm/），
     用户把 cloud.base_url 配成本机地址是正常用法。因此这里只拒绝：
       1) 非 http(s) 协议（file:// / gopher:// 等）；
-      2) 本机管理面（127.0.0.1 / localhost）—— 本机 LLM 请按第 3 条用局域网 IP，
-         或直接把它配成 config 里的 provider URL；
+      2) 端口不合法（`:99999` / `:abc`）—— 旧实现直接读 parsed.port，手填地址一写错
+         就抛 ValueError 冒到端点，用户看到的是「服务器内部错误」而不是"端口不合法"；
       3) 本机管理端口 4040/4041（ngrok 管理 API）；
-      4) 云元数据地址 169.254.169.254。
-    """
+      4) 本机回环地址与回环域名（含 2130706433 / [::ffff:127.0.0.1] 等全部等价写法）；
+      5) 链路本地/云元数据地址（169.254.0.0/16、fe80::/10）。
+
+    只做**字面量**判定（纯函数、无网络）；"域名解析后是不是本机"由
+    `_url_resolves_to_internal` 负责，两个端点会依次调用。"""
     url = (raw or "").strip()
     if not url:
         return ""
@@ -3308,17 +3484,22 @@ def _url_is_blocked_target(raw: str, cfg_base: str = "") -> str:
     host = (parsed.hostname or "").strip().lower()
     if not host:
         return "API 地址缺少主机名"
-    if host == _METADATA_HOST:
-        return "拒绝访问云元数据地址（SSRF 防护）"
-    port = parsed.port
+    if host.rstrip(".") == _METADATA_HOST:
+        return _METADATA_REASON
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        return f"API 地址端口不合法：{exc}"
     if port in _URL_BLOCKED_PORTS:
         return f"拒绝访问本机管理端口 {port}（ngrok 管理面，SSRF 防护）"
     # 配置里本来就是这个地址时不额外拦（那是机主自己的选择，且探测早就天天在发）
     if cfg_base and url.rstrip("/") == cfg_base.rstrip("/"):
         return ""
-    if host in _URL_BLOCKED_HOSTS or host.startswith("127."):
-        return ("拒绝把服务端指向本机回环地址（SSRF 防护）：请改填 config.json 里的 provider "
-                "地址，或使用局域网 IP")
+    if host.rstrip(".") in _URL_BLOCKED_NAMES:
+        return _LOOPBACK_REASON
+    ip = _host_to_ip(host)
+    if ip is not None and _ip_is_internal(ip):
+        return _METADATA_REASON if ip.is_link_local else _LOOPBACK_REASON
     return ""
 
 
@@ -4660,8 +4841,11 @@ async def llm_models(req: dict):
         raise HTTPException(400, "请先填写云端 API 地址")
     # SSRF 防护（第九轮）：只有「显式覆盖地址」才需要过闸；沿用 config 的地址不拦，
     # 那是机主自己的配置，且本地 LLM（ollama/llama.cpp）地址本来就可能是回环。
+    # 第十一轮补上解析后判定：字面量闸挡不住 `127.0.0.1.nip.io` 这类域名。
     if req_base:
         blocked = _url_is_blocked_target(req_base, cfg_base)
+        if not blocked:
+            blocked = await _url_resolves_to_internal(req_base, cfg_base)
         if blocked:
             raise HTTPException(400, blocked)
     try:
@@ -4717,6 +4901,8 @@ async def llm_quota(req: QuotaRequest):
     # 就从 llm-models 转移到这个端点（可打内网 / 本机 ngrok 管理面 4040）。
     if req_base:
         blocked = _url_is_blocked_target(req_base, cfg_base)
+        if not blocked:
+            blocked = await _url_resolves_to_internal(req_base, cfg_base)
         if blocked:
             raise HTTPException(400, blocked)
     api_key = req.api_key or ""

@@ -20,11 +20,13 @@ import asyncio
 import copy
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
 from pathlib import Path
 from pathlib import Path as _P
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # 直跑本文件（python test_backend_hardening.py，不经过 run_tests.bat/conftest）
@@ -695,6 +697,93 @@ def test_url_guard_blocks_internal_targets():
     check("空串放行", not g(""), "wrongly blocked")
 
 
+def test_url_guard_normalizes_equivalent_hosts():
+    """第十一轮：URL 里「本机」的等价写法必须全拦。
+
+    旧实现只做字符串比对（127.0.0.1 / localhost / startswith("127.")），下面这些
+    写法**httpx 真的会连过去**却整片放行 —— 填 http://2130706433:4040/ 就能把 ngrok
+    管理面读回来，填 http://2130706433/ 则等于让服务端打自己。
+
+    归一化办法：ipaddress 直解 + socket.inet_aton 兜底（接受整型/十六进制/八进制/
+    短式四种旧写法），IPv4-mapped IPv6 取内层 IPv4 再判型。"""
+    g = server._url_is_blocked_target
+    check("拦十进制整型 2130706433", bool(g("http://2130706433/v1")), "not blocked")
+    check("拦十六进制 0x7f000001", bool(g("http://0x7f000001/v1")), "not blocked")
+    check("拦八进制 017700000001", bool(g("http://017700000001/v1")), "not blocked")
+    check("拦短式 127.1", bool(g("http://127.1/v1")), "not blocked")
+    check("拦 IPv4-mapped IPv6 [::ffff:127.0.0.1]", bool(g("http://[::ffff:127.0.0.1]/v1")), "not blocked")
+    check("拦带尾部点的 localhost.", bool(g("http://localhost./v1")), "not blocked")
+    check("拦未指定地址 [::]", bool(g("http://[::]:9000/v1")), "not blocked")
+    check("拦 fe80:: 链路本地", bool(g("http://[fe80::1]/v1")), "not blocked")
+    check("拦带作用域 id 的 fe80::1%25eth0",
+          bool(g("http://[fe80::1%25eth0]/v1")), "not blocked")
+    check("拦整数写法 + 管理端口", bool(g("http://2130706433:4040/api")), "not blocked")
+    # 归一化不得误伤正常用法
+    check("仍放行局域网自建网关", not g("http://192.168.1.50:11434/v1"), "wrongly blocked")
+    check("仍放行公网域名（名字里像 127 也不行）",
+          not g("https://127-0-0-1.example.com/v1"), "wrongly blocked")
+    check("仍放行域名里含 localhost 的第三方",
+          not g("https://notlocalhost.example.com/v1"), "wrongly blocked")
+
+
+def test_url_guard_bad_port_returns_reason_not_exception():
+    """第十一轮：端口写错（:99999 / :abc）曾经把端点打成 500。
+
+    旧实现在 try/except **之外**直接读 `parsed.port`：urlparse 能解析 URL，但 .port
+    抛 ValueError，一路冒到端点 → 未捕获异常 → 用户看到「服务器内部错误」+ 一整条
+    traceback，而不是"端口不合法"。手填地址时这是最常见的笔误之一。"""
+    g = server._url_is_blocked_target
+    check("越界端口返回拒绝原因", bool(g("http://example.com:99999/v1")), "not blocked")
+    check("非数字端口返回拒绝原因", bool(g("http://h:abc/v1")), "not blocked")
+    for c in ("http://example.com:99999/v1", "http://h:abc/v1", "http://[::1/v1",
+              "http://x:0/v1", "http://x:-1/v1"):
+        try:
+            g(c)
+            check(f"不抛异常：{c}", True)
+        except Exception as exc:  # noqa: BLE001
+            check(f"不抛异常：{c}", False, f"{type(exc).__name__}: {exc}")
+
+
+def test_url_resolves_to_internal_blocks_dns_rebound_host():
+    """第十一轮：`127.0.0.1.nip.io` 这类「公网域名解析到本机」必须拦。
+
+    只做字面量归一化，挂个免费 wildcard DNS（nip.io / sslip.io）就能把回环藏在一个
+    合法域名后面 —— DNS rebinding 的静态版本。离线用例不该真发 DNS 查询，
+    所以替换掉 _getaddrinfo 这个缝。"""
+    orig = server._getaddrinfo
+
+    async def stub(host):
+        table = {
+            "evil.nip.io": "127.0.0.1",
+            "meta.example": "169.254.169.254",
+            "v6loop.example": "::1",
+            "lan.gateway": "192.168.1.50",
+        }
+        if host in table:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (table[host], 0))]
+        raise OSError("no dns here")
+
+    def run(url, cfg=""):
+        return asyncio.run(server._url_resolves_to_internal(url, cfg))
+
+    server._getaddrinfo = stub
+    try:
+        check("解析到 127.0.0.1 的域名被拦", "SSRF" in run("http://evil.nip.io/v1"),
+              repr(run("http://evil.nip.io/v1")))
+        check("解析到 ::1 的域名被拦", "SSRF" in run("http://v6loop.example/v1"))
+        check("解析到云元数据地址的域名被拦", "SSRF" in run("http://meta.example/v1"))
+        check("解析到局域网网关的域名仍放行（本地 LLM 场景）",
+              not run("http://lan.gateway:11434/v1"))
+        check("解析失败时放行（交由真实请求报错，不因 DNS 一时不通判死）",
+              not run("http://unresolvable.example/v1"))
+        check("IP 字面量不触发 DNS 查询（字面量闸已判过）",
+              not run("http://8.8.8.8/v1"))
+        check("机主自己配的地址不拦",
+              not run("http://evil.nip.io/v1", "http://evil.nip.io/v1"))
+    finally:
+        server._getaddrinfo = orig
+
+
 def test_llm_models_ssrf_endpoint(client):
     """端点层：自填内网地址必须 400 拒绝，且**不能**真的发出请求。"""
     with sandbox():
@@ -729,6 +818,132 @@ def test_llm_quota_ssrf_endpoint(client):
             "base_url": "https://api.minimaxi.com/v1", "billing_mode": "payg"})
         check("公网地址不被 SSRF 闸误拦（报错是缺密钥而非 SSRF）",
               r3.status_code == 400 and "SSRF" not in r3.text, f"status={r3.status_code} {r3.text[:120]}")
+
+
+def test_url_guard_errors_are_400_not_500(client):
+    """第十一轮：端点层确认——端口笔误是 400 提示，不是 500 内部错误。"""
+    with sandbox():
+        r = client.post("/api/llm-models", json={"base_url": "http://example.com:99999/v1"})
+        check("越界端口 -> 400（旧实现 500）", r.status_code == 400, f"status={r.status_code}")
+        check("提示是端口问题", "端口" in r.text, r.text[:120])
+        r2 = client.post("/api/llm-quota", json={"base_url": "http://h:abc/v1", "api_key": "k"})
+        check("非数字端口 -> 400（旧实现 500）", r2.status_code == 400, f"status={r2.status_code}")
+        r3 = client.post("/api/llm-quota", json={"base_url": "http://2130706433/v1", "api_key": "k"})
+        check("整型写法在端点层也被 SSRF 闸拦下", r3.status_code == 400 and "SSRF" in r3.text,
+              f"status={r3.status_code} {r3.text[:120]}")
+
+
+# ------------------------------------------------- 18. XFF 可信度（第十一轮）
+def _fake_req(peer, headers=None):
+    return SimpleNamespace(url=SimpleNamespace(scheme="http"),
+                           client=SimpleNamespace(host=peer),
+                           headers=headers or {})
+
+
+def test_xff_untrusted_from_lan_peer():
+    """第十一轮：局域网直连对端伪造 X-Forwarded-For 不得换到新的限流桶。
+
+    旧实现把「对端在任意私有网段」(is_private) 也算自己人。可服务默认 bind 0.0.0.0，
+    局域网里**任何一台机器**直连过来对端都是私网地址，于是它自己塞的 XFF 被采信，
+    _client_ip 每请求换一个伪造值就换一个限流桶 —— "8 次失败锁 10 分钟"变成无限重试。
+    同机代理（ngrok）的连接必然来自回环，所以判据只该看 is_loopback。"""
+    ips = {server._client_ip(_fake_req("192.168.1.50", {"x-forwarded-for": f"10.0.0.{i}"}))
+           for i in range(1, 40)}
+    check("局域网对端轮换 XFF 拿不到多个限流桶", ips == {"192.168.1.50"}, str(ips))
+    check("同机代理（回环）仍采信 XFF 末跳（ngrok 不受影响）",
+          server._client_ip(_fake_req("127.0.0.1", {"x-forwarded-for": "1.2.3.4, 5.6.7.8"})) == "5.6.7.8")
+    check("IPv6 回环同样算同机",
+          server._client_ip(_fake_req("::1", {"x-forwarded-for": "1.2.3.4"})) == "1.2.3.4")
+    check("回环对端无 XFF 时用对端自身",
+          server._client_ip(_fake_req("127.0.0.1", {})) == "127.0.0.1")
+    check("公网直连不采信 XFF",
+          server._client_ip(_fake_req("8.8.8.8", {"x-forwarded-for": "1.2.3.4"})) == "8.8.8.8")
+    check("局域网对端不算 behind_local_proxy", not server._behind_local_proxy(_fake_req("10.0.0.7")))
+    check("回环对端算 behind_local_proxy", server._behind_local_proxy(_fake_req("127.0.0.1")))
+
+
+def test_lan_peer_cannot_brute_force_by_rotating_xff():
+    """第十一轮（真实门禁、真实请求）：局域网对端连发错误口令 + 每请求换 XFF。
+
+    旧实现下这 5 次请求落在 5 个不同的限流桶里，永远攒不到上限（全 401）；
+    修好后 3 次即触发 429，且桶里只有真实对端那一个 IP。"""
+    from fastapi.testclient import TestClient  # noqa: E402
+
+    saved_tok = server._access_token
+    saved_max = server._LOGIN_FAIL_MAX
+    saved_backoff = server._LOGIN_BACKOFF_SECONDS
+    saved_track = dict(server._login_track)
+    try:
+        server._access_token = lambda: "correct-token-xyzzy"
+        server._LOGIN_FAIL_MAX = 3
+        server._LOGIN_BACKOFF_SECONDS = 0
+        server._login_track.clear()
+        lan = TestClient(server.app, client=("192.168.1.50", 1234), raise_server_exceptions=False)
+        codes = [lan.post("/api/login", json={"token": f"guess-{i}"},
+                          headers={"X-Forwarded-For": f"10.0.0.{i}"}).status_code
+                 for i in range(5)]
+        check("累积到上限后转 429（旧实现永远 401）", 429 in codes, str(codes))
+        check("第一个失败仍是 401（没提前把正常路径锁死）", codes[0] == 401, str(codes))
+        check("限流桶里只有真实对端 IP，没有伪造的那些",
+              list(server._login_track.keys()) == ["192.168.1.50"], str(server._login_track))
+    finally:
+        server._access_token = saved_tok
+        server._LOGIN_FAIL_MAX = saved_max
+        server._LOGIN_BACKOFF_SECONDS = saved_backoff
+        server._login_track.clear()
+        server._login_track.update(saved_track)
+
+
+# ------------------------------------------------- 19. 跨源闸（第十一轮）
+def test_cross_origin_rejected_in_token_mode(client):
+    """第十一轮：配了口令时跨源请求也必须被拒，且**不给** CORS 放行头。
+
+    旧实现把跨源安全寄托在"有口令保护"上（`allow_origins=["*"]`），但 /api/login
+    的跨源响应里带着 `Access-Control-Allow-Origin: *`，而口令校验在该端点**之后**：
+    恶意页面可以跨源 POST 猜口令，并凭 ACAO:* 读懂 200 还是 401 —— 一个分布式口令
+    oracle。每个访客浏览器都是一个不同出口 IP，按 IP 计数的锁定完全跟不上。
+    改完：跨源一律 403、无 ACAO；同源（Origin == Host）完全不受影响。"""
+    saved_tok = server._access_token
+    saved_backoff = server._LOGIN_BACKOFF_SECONDS
+    saved_track = dict(server._login_track)
+    try:
+        server._access_token = lambda: "correct-token-xyzzy"
+        server._LOGIN_BACKOFF_SECONDS = 0
+        server._login_track.clear()
+        evil = {"Origin": "https://evil.example"}
+        r = client.post("/api/login", json={"token": "guess"}, headers=evil)
+        check("跨源登录被 403 拒绝", r.status_code == 403, f"status={r.status_code}")
+        check("跨源响应不再带 ACAO:*",
+              r.headers.get("access-control-allow-origin") is None,
+              str(r.headers.get("access-control-allow-origin")))
+        r2 = client.options("/api/login", headers={**evil, "Access-Control-Request-Method": "POST"})
+        check("跨源预检同样被拒（旧实现 200 + ACAO:*）",
+              r2.status_code == 403 and r2.headers.get("access-control-allow-origin") is None,
+              f"status={r2.status_code} acao={r2.headers.get('access-control-allow-origin')}")
+        check("跨源读业务 API 同样被拒",
+              client.get("/api/status", headers=evil).status_code == 403)
+        check("Origin: null 不可信",
+              client.get("/api/status", headers={"Origin": "null"}).status_code == 403)
+        r3 = client.post("/api/login", json={"token": "guess"}, headers={"Origin": "http://testserver"})
+        check("同源请求不受影响（仍是口令错误 401）", r3.status_code == 401, f"status={r3.status_code}")
+        check("无 Origin 头不受影响（curl / PWA / SSE）",
+              client.get("/api/health").status_code == 200)
+        # 归一化：默认端口 / 大小写 / 尾部点不该把自己人拦掉
+        def origin_ok(host_header, origin, scheme="http"):
+            req = SimpleNamespace(url=SimpleNamespace(scheme=scheme),
+                                  client=SimpleNamespace(host="127.0.0.1"),
+                                  headers={"host": host_header})
+            return server._origin_is_trusted(req, origin)
+
+        check("Origin 省略默认端口仍算同源", origin_ok("example.com:80", "http://example.com"))
+        check("Host 带尾部点仍算同源", origin_ok("example.com.:8000", "http://example.com:8000"))
+        check("同源但端口不同 -> 拒绝", not origin_ok("example.com:8000", "http://example.com:5173"))
+        check("来源不同域名 -> 拒绝", not origin_ok("example.com:8000", "http://evil.com:8000"))
+    finally:
+        server._access_token = saved_tok
+        server._LOGIN_BACKOFF_SECONDS = saved_backoff
+        server._login_track.clear()
+        server._login_track.update(saved_track)
 
 
 # ------------------------------------------------------------ 17. 白名单端点按鉴权收敛
@@ -969,8 +1184,15 @@ def main():
         test_access_token_failsafe_on_degraded_config(client)
         test_gate_auth_failures_are_counted(client)
         test_url_guard_blocks_internal_targets()
+        test_url_guard_normalizes_equivalent_hosts()
+        test_url_guard_bad_port_returns_reason_not_exception()
+        test_url_resolves_to_internal_blocks_dns_rebound_host()
         test_llm_models_ssrf_endpoint(client)
         test_llm_quota_ssrf_endpoint(client)
+        test_url_guard_errors_are_400_not_500(client)
+        test_xff_untrusted_from_lan_peer()
+        test_lan_peer_cannot_brute_force_by_rotating_xff()
+        test_cross_origin_rejected_in_token_mode(client)
         test_whitelist_endpoints_redact_when_locked(client)
         test_sessions_cap_truncation_reported(client)
         test_sessions_nonfinite_never_poisons_api(client)
